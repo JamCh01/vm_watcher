@@ -1,11 +1,11 @@
 //! Two-screen TUI: IP Range Overview (default) and per-IP Range Detail.
 
+use std::io::IsTerminal;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use futures_util::StreamExt;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -145,21 +145,38 @@ pub async fn run(
     refresh_tx: mpsc::Sender<()>,
     cfg: &ValidatedConfig,
 ) -> Result<()> {
+    if !input_source_available() {
+        bail!(
+            "cannot open terminal input: stdin is not a terminal and /dev/tty is unavailable. \
+             Run this program from an interactive terminal (e.g. ssh with a PTY)."
+        );
+    }
+
     let mut terminal = ratatui::init();
     let mut app = App::new(cfg);
-    let mut events = EventStream::new();
+
+    // crossterm's EventStream panics with "reader source not set" when its input source
+    // cannot be initialized; a plain blocking read on a dedicated thread degrades to a
+    // graceful error instead (and drops the futures dependency).
+    let (event_tx, mut event_rx) = mpsc::channel::<Event>(16);
+    std::thread::spawn(move || {
+        while let Ok(event) = crossterm::event::read() {
+            if event_tx.blocking_send(event).is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         terminal.draw(|f| draw(f, &mut app))?;
         tokio::select! {
-            maybe_event = events.next() => match maybe_event {
-                Some(Ok(Event::Key(key))) => {
+            maybe_event = event_rx.recv() => match maybe_event {
+                Some(Event::Key(key)) => {
                     if handle_key(&mut app, key, &refresh_tx) {
                         break;
                     }
                 }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => bail!("terminal event error: {e}"),
+                Some(_) => {}
                 None => break,
             },
             snapshot = snap_rx.recv() => match snapshot {
@@ -169,6 +186,16 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Mirrors crossterm's tty_fd(): stdin must be a terminal, or /dev/tty must be openable.
+fn input_source_available() -> bool {
+    std::io::stdin().is_terminal()
+        || std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_ok()
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
