@@ -176,11 +176,12 @@ Limited 数；顶栏显示 bridge、TAP 数、`Config generation`、最近一次
 
 ## 实现要点
 
-- **每个 TAP 一个 eBPF 对象实例**：`aya` 的 `TcContext` 拿不到 `skb->ifindex`，每个
-  TAP 单独加载一份对象，用 `override_global("IFINDEX", ...)` 烙进 `.rodata`；
-  四份 map（白名单、计数、限速策略、GCRA 状态）通过 bpffs pin 共享。
-- 挂载/卸载由 `AttachManager` 负责：丢弃实例即移除**且仅移除**本程序创建的 TC filter；
-  不动 `fq_codel`/`noqueue`，不清理其他程序的 filter。
+- **单一 eBPF 对象，挂载到所有 TAP**：对象只加载一次（验证器只跑一遍），
+  `tc_ingress`/`tc_egress` 直接从 `__sk_buff` 上下文读取 ifindex，同一对程序以
+  TCX/netlink 链接挂到每个 TAP；四份 map（白名单、计数、限速策略、GCRA 状态）
+  全部为 BTF 定义、天然共享，不 pin，随 daemon 生命周期存在。
+- 挂载/卸载由 `AttachManager` 负责：丢弃某个链接即移除**且仅移除**本程序创建的
+  TC filter；不动 `fq_codel`/`noqueue`，不清理其他程序的 filter。
 - 计数为单调累计值，用户态按相邻采样差值计算速率；计数回绕/复位或 TAP 重建时该周期
   记 0，绝不产生负带宽或虚假触发。
 - 单一 "engine" 任务持有全部可变状态（map、TAP、collector、limiter），IPC/监听/信号
