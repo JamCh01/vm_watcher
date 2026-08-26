@@ -91,9 +91,7 @@ impl RollingWindow {
 
     /// Clear all samples (used when a limit expires or the window config changes).
     pub fn reset(&mut self) {
-        for slot in &mut self.ring {
-            *slot = 0;
-        }
+        self.ring.fill(0);
         self.total = 0;
         self.observed = 0;
         self.head = 0;

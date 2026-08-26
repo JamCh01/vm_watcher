@@ -67,15 +67,15 @@ pub struct GcraPolicy {
 
 /// Runtime GCRA state per (IPv4, direction): the Theoretical Arrival Time (TAT).
 ///
-/// `lock` is a `struct bpf_spin_lock` as far as the kernel is concerned. It must
-/// only ever be touched through `bpf_spin_lock` / `bpf_spin_unlock`; userspace never
-/// reads this map (spin-lock maps are write/delete-only from userspace) and resets a
-/// limiter by deleting the entry.
+/// In the kernel this value also carries a `struct bpf_spin_lock` (declared in the eBPF
+/// object so BTF describes it to the verifier); the userspace view only ever writes it
+/// (install/reset) or deletes it, so the lock field is simply carried as zeroed bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcraState {
     pub tat_ns: u64,
     pub lock: u32,
+    pub _pad: u32,
 }
 
 #[cfg(feature = "user")]

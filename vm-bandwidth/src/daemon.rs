@@ -118,8 +118,19 @@ impl Engine {
                     };
                     match self.limit_policies.insert(key, policy, 0) {
                         Ok(()) => {
-                            // Reset GCRA runtime state so the new rate starts from a fresh TAT.
-                            let _ = self.gcra_state.remove(&key);
+                            // (Re)create the runtime state so the new rate starts from a
+                            // fresh TAT; the data path never creates lock-bearing values.
+                            let fresh = GcraState {
+                                tat_ns: 0,
+                                lock: 0,
+                                _pad: 0,
+                            };
+                            if let Err(e) = self.gcra_state.insert(key, fresh, 0) {
+                                log::error!(
+                                    "failed to init GCRA state for {}: {e}",
+                                    std::net::Ipv4Addr::from(*ipv4)
+                                );
+                            }
                             log::info!(
                                 "LIMITED {} dir={} at {} bps (burst {} B)",
                                 std::net::Ipv4Addr::from(*ipv4),

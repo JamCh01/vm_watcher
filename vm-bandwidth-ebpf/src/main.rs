@@ -9,9 +9,16 @@
 //! maps are pinned, so every per-interface instance shares the same whitelist, counters
 //! and limiter state.
 //!
-//! Every path — parse failure, IP not whitelisted, map full, missing or invalid policy —
-//! ends in `TC_ACT_PIPE`: traffic is never dropped unless the GCRA policer explicitly
-//! classifies a packet as non-conforming while a valid limit is active.
+//! Every path — parse failure, IP not whitelisted, map pressure, missing or invalid
+//! policy, arithmetic anomaly — ends in `TC_ACT_PIPE`: traffic is never dropped unless
+//! the GCRA policer explicitly classifies a packet as non-conforming while a valid limit
+//! is active.
+//!
+//! GCRA concurrency: the per-flow TAT lives in a shared (NOT per-CPU) map guarded by a
+//! `bpf_spin_lock`. The timestamp is read before taking the lock, only the TAT field is
+//! touched while the lock is held, no helpers are called inside the critical section, and
+//! every path releases the lock. Entries are created/removed by the daemon when it
+//! installs/removes a limit policy, so the data path never constructs a lock-bearing value.
 #![no_std]
 #![no_main]
 
@@ -26,7 +33,7 @@ use network_types::{
     eth::{EthHdr, EtherType},
     ip::Ipv4Hdr,
 };
-use vm_bandwidth_common::{GcraKey, GcraPolicy, GcraState, TrafficKey, TrafficValue};
+use vm_bandwidth_common::{GcraKey, GcraPolicy, TrafficKey, TrafficValue};
 
 /// ifindex of the TAP interface this object instance is attached to.
 /// Overridden from userspace with `EbpfLoader::override_global` before load.
@@ -36,6 +43,13 @@ static IFINDEX: u32 = 0;
 /// Compile-time floor; userspace overrides `max_entries` at load time
 /// (`EbpfLoader::map_max_entries`) before the maps are created.
 const MAP_CAPACITY: u32 = 8192;
+
+/// Packets larger than this are never policed (fail open); it also keeps the
+/// time-increment arithmetic provably inside `u64`.
+const MAX_POLICED_LEN: u64 = 65535;
+
+const NS_PER_SEC: u64 = 1_000_000_000;
+const BITS_PER_BYTE: u64 = 8;
 
 /// Whitelist: only IPv4 addresses present here are ever counted.
 #[map]
@@ -50,14 +64,21 @@ static TRAFFIC: PerCpuHashMap<TrafficKey, TrafficValue> = PerCpuHashMap::pinned(
 #[map]
 static LIMIT_POLICIES: HashMap<GcraKey, GcraPolicy> = HashMap::pinned(MAP_CAPACITY, 0);
 
-/// (ipv4, direction) -> GCRA runtime state (TAT). Shared (NOT per-CPU) so all CPUs and
-/// all TAPs enforce one common rate budget per flow; protected by a bpf_spin_lock.
-#[map]
-static GCRA_STATE: HashMap<GcraKey, GcraState> = HashMap::pinned(MAP_CAPACITY, 0);
+/// GCRA runtime state for one (IPv4, direction) flow: the Theoretical Arrival Time.
+///
+/// The `lock` field is a real `struct bpf_spin_lock` so the map's BTF tells the verifier
+/// exactly where the lock lives. The kernel owns the struct layout inside the map; the
+/// userspace view (common::GcraState) is byte-compatible and only ever writes or deletes.
+#[repr(C)]
+struct GcraStateVal {
+    tat_ns: u64,
+    lock: SpinLockTy,
+}
 
-/// Nanoseconds in one second, used to turn a bit rate into a per-byte time increment.
-const NS_PER_SEC: u64 = 1_000_000_000;
-const BITS_PER_BYTE: u64 = 8;
+/// (ipv4, direction) -> GCRA runtime state. Shared (NOT per-CPU) so all CPUs and all TAPs
+/// enforce one common rate budget per flow.
+#[map]
+static GCRA_STATE: HashMap<GcraKey, GcraStateVal> = HashMap::pinned(MAP_CAPACITY, 0);
 
 /// TAP ingress: the VM is sending. The VM's address is the IPv4 source.
 #[classifier]
@@ -73,44 +94,39 @@ pub fn tc_egress(ctx: TcContext) -> i32 {
 
 #[inline(always)]
 fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
-    match process(ctx, is_tx) {
-        // The only DROP path is an explicit GCRA non-conformance verdict.
-        Ok(action) => action,
-        // Any error (short packet, non-IPv4, not whitelisted, map pressure, missing
-        // policy, arithmetic anomaly) must fail open and let the packet through.
-        Err(_) => TC_ACT_PIPE,
-    }
-}
-
-fn process(ctx: &TcContext, is_tx: bool) -> Result<i32, ()> {
-    let eth: EthHdr = ctx.load(0).map_err(|_| ())?;
+    let eth: EthHdr = match ctx.load(0) {
+        Ok(e) => e,
+        Err(_) => return TC_ACT_PIPE,
+    };
     match eth.ether_type() {
         Ok(EtherType::Ipv4) => {}
         // ARP, IPv6, LLDP, STP, VLAN, ... are not counted in v1.
-        _ => return Ok(TC_ACT_PIPE),
+        _ => return TC_ACT_PIPE,
     }
-
-    let ip: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+    let ip: Ipv4Hdr = match ctx.load(EthHdr::LEN) {
+        Ok(i) => i,
+        Err(_) => return TC_ACT_PIPE,
+    };
     let ipv4 = u32::from_be_bytes(if is_tx { ip.src_addr } else { ip.dst_addr });
 
     unsafe {
         if MONITORED_IPS.get(ipv4).is_none() {
-            return Ok(TC_ACT_PIPE);
+            return TC_ACT_PIPE;
         }
 
         count(ctx, ipv4, is_tx);
 
-        // Police this flow. `police` returns `true` when the packet must be dropped.
         let direction = if is_tx {
             vm_bandwidth_common::DIR_TX
         } else {
             vm_bandwidth_common::DIR_RX
         };
+        // Police this flow. `police` returns `true` only to DROP a non-conforming packet.
         if police(ipv4, direction, ctx.len() as u64) {
-            return Ok(TC_ACT_SHOT);
+            return TC_ACT_SHOT;
         }
     }
-    Ok(TC_ACT_PIPE)
+    TC_ACT_PIPE
 }
 
 /// Accumulate byte/packet counters for a whitelisted flow. Never fails the packet.
@@ -161,12 +177,16 @@ unsafe fn count(ctx: &TcContext, ipv4: u32, is_tx: bool) {
 
 /// GCRA policer. Returns `true` to DROP (non-conforming), `false` to PASS.
 ///
-/// Any uncertainty fails open (returns `false`): no policy, disabled policy, zero
-/// rate, missing/locked state, or arithmetic that cannot be proven safe.
+/// Any uncertainty fails open (returns `false`): no policy, disabled policy, zero rate,
+/// oversized packet, or missing runtime state (the daemon creates it when installing the
+/// policy; until then policing cannot be proven safe, so traffic passes).
 #[inline(always)]
 unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
-    let key = GcraKey::new(ipv4, direction);
+    if len_bytes == 0 || len_bytes > MAX_POLICED_LEN {
+        return false;
+    }
 
+    let key = GcraKey::new(ipv4, direction);
     let policy = match LIMIT_POLICIES.get(key) {
         Some(p) => *p,
         None => return false,
@@ -175,61 +195,45 @@ unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
         return false;
     }
 
-    // Time cost of this packet: len * 8 bits * 1e9 ns / rate_bps.
-    // len is bounded by the MTU/skb length, so the products fit in u64; saturating
-    // arithmetic guards against any future change making that untrue.
+    // Time cost of this packet: len * 8 * 1e9 / rate. The operands are bounded so the
+    // products fit in u64 (MAX_POLICED_LEN * 8 * 1e9 ≈ 5.2e14 << u64::MAX); wrapping
+    // arithmetic avoids any overflow-check helper calls that BPF cannot link.
     let increment_ns = len_bytes
-        .saturating_mul(BITS_PER_BYTE)
-        .saturating_mul(NS_PER_SEC)
+        .wrapping_mul(BITS_PER_BYTE)
+        .wrapping_mul(NS_PER_SEC)
         / policy.rate_bps;
-
-    // Burst tolerance in ns: burst_bytes * 8 * 1e9 / rate_bps.
     let tolerance_ns = policy
         .burst_bytes
-        .saturating_mul(BITS_PER_BYTE)
-        .saturating_mul(NS_PER_SEC)
+        .wrapping_mul(BITS_PER_BYTE)
+        .wrapping_mul(NS_PER_SEC)
         / policy.rate_bps;
 
+    // Timestamp taken before the lock: the critical section holds no helper calls.
     let now = bpf_ktime_get_ns();
 
-    match GCRA_STATE.get_ptr_mut(key) {
-        Some(ptr) => {
-            let state = &mut *ptr;
-            // Only the `lock` field may be passed to the helpers; `tat_ns` is accessed
-            // strictly between lock/unlock. All paths below release the lock.
-            let lock_ptr = &mut state.lock as *mut u32 as *mut SpinLockTy;
-            bpf_spin_lock(lock_ptr);
+    let state = match GCRA_STATE.get_ptr_mut(key) {
+        Some(ptr) => &mut *ptr,
+        // No runtime state: the daemon creates it together with the policy. Fail open.
+        None => return false,
+    };
 
-            let base = if now > state.tat_ns {
-                now
-            } else {
-                state.tat_ns
-            };
-            let candidate_tat = base.saturating_add(increment_ns);
-            let deadline = now.saturating_add(tolerance_ns);
-            let conform = candidate_tat <= deadline;
-            if conform {
-                state.tat_ns = candidate_tat;
-            }
+    let lock_ptr = &mut state.lock as *mut SpinLockTy;
+    bpf_spin_lock(lock_ptr);
 
-            bpf_spin_unlock(lock_ptr);
-            !conform
-        }
-        None => {
-            // First packet for this flow: initialize state and always conform. If the
-            // insert loses a race with another CPU or the map is full, fail open.
-            #[allow(clippy::needless_borrows_for_generic_args)]
-            let _ = GCRA_STATE.insert(
-                &key,
-                &GcraState {
-                    tat_ns: now.saturating_add(increment_ns),
-                    lock: 0,
-                },
-                0,
-            );
-            false
-        }
+    let base = if now > state.tat_ns {
+        now
+    } else {
+        state.tat_ns
+    };
+    let candidate_tat = base.wrapping_add(increment_ns);
+    let deadline = now.wrapping_add(tolerance_ns);
+    let conform = candidate_tat <= deadline;
+    if conform {
+        state.tat_ns = candidate_tat;
     }
+
+    bpf_spin_unlock(lock_ptr);
+    !conform
 }
 
 #[cfg(not(test))]
