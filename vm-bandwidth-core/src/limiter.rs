@@ -265,10 +265,17 @@ impl Limiter {
                 continue;
             };
             let cur = totals.get(&ip).copied().unwrap_or_default();
-            let prev = self.prev_totals.get(&ip).copied().unwrap_or_default();
-            // saturating_sub turns counter resets / TAP rebuilds into a zero delta (§6).
-            let rx_delta = cur.rx_bytes.saturating_sub(prev.rx_bytes);
-            let tx_delta = cur.tx_bytes.saturating_sub(prev.tx_bytes);
+            // First observation of an IP (e.g. a policy hot-added to a flow that already
+            // has traffic): record a baseline and start measuring from now — never treat
+            // the accumulated history as a single-tick delta (§6, §21).
+            let (rx_delta, tx_delta) = match self.prev_totals.get(&ip).copied() {
+                None => (0, 0),
+                // saturating_sub turns counter resets / TAP rebuilds into a zero delta (§6).
+                Some(prev) => (
+                    cur.rx_bytes.saturating_sub(prev.rx_bytes),
+                    cur.tx_bytes.saturating_sub(prev.tx_bytes),
+                ),
+            };
             self.prev_totals.insert(ip, cur);
 
             self.eval_dir(ip, DIR_RX, policy.rx, rx_delta, now, &mut actions);
@@ -434,7 +441,9 @@ mod tests {
 
     fn drive_to_limited(l: &mut Limiter) -> u64 {
         let mut cumulative = 0u64;
-        for t in 1..=3 {
+        // Tick 1 is the baseline observation (zero delta); the window then needs a full
+        // ring of real traffic before it may trigger.
+        for t in 1..=4 {
             cumulative += BYTES_PER_TICK;
             l.tick(t, &totals(IP, cumulative, 0));
         }
@@ -449,7 +458,7 @@ mod tests {
 
         let mut cumulative = 0u64;
         let mut actions = Vec::new();
-        for t in 1..=3 {
+        for t in 1..=4 {
             cumulative += BYTES_PER_TICK;
             actions.extend(l.tick(t, &totals(IP, cumulative, 0)));
         }
@@ -492,8 +501,8 @@ mod tests {
         l.apply_config(&cfg, 0).unwrap();
         let cumulative = drive_to_limited(&mut l);
         assert!(l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
-        // limited at t=3 with duration 10 → until t=13.
-        let actions = l.tick(13, &totals(IP, cumulative, 0));
+        // limited at t=4 with duration 10 → until t=14.
+        let actions = l.tick(14, &totals(IP, cumulative, 0));
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], GcraAction::Remove { .. }));
         assert!(!l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
@@ -511,10 +520,10 @@ mod tests {
         l.tick(1, &totals(IP, 1_000_000, 0));
         let actions = l.tick(2, &totals(IP, 0, 0));
         assert!(actions.is_empty(), "{actions:?}");
-        // The reset yields a zero delta; the window still holds only the bytes actually
-        // seen before the reset (never a wrapped ~2^64 delta). 1 MB over 2 observed secs.
+        // Tick 1 is the baseline (zero delta) and the backwards counter on tick 2 also
+        // yields a zero delta: the window stays empty — never a wrapped ~2^64 spike.
         let avg = l.window_avg_bps(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX);
-        assert!((avg - 4_000_000.0).abs() < 1e-6, "avg={avg}");
+        assert!(avg.abs() < 1e-9, "avg={avg}");
     }
 
     #[test]
@@ -587,10 +596,10 @@ mod tests {
         let mut l = Limiter::new(1);
         l.apply_config(&cfg, 0).unwrap();
         drive_to_limited(&mut l);
-        // limited_since = 3, duration 10 → until 13; at now=5 that is 8s left.
+        // limited_since = 4, duration 10 → until 14; at now=5 that is 9s left.
         assert_eq!(
             l.remaining_secs(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX, 5),
-            8
+            9
         );
 
         let mut pf = policy_fields();
