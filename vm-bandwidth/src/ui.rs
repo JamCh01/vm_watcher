@@ -369,33 +369,39 @@ fn fetch_trend(app: &mut UiState) {
         .unwrap_or(0);
     let start = end - span as i64;
     let ip = std::net::Ipv4Addr::from(trend.ip);
-    let metric = match trend.kind {
-        TrendKind::Bandwidth => "vmbw_rx_bytes_total|vmbw_tx_bytes_total",
-        TrendKind::Packets => "vmbw_rx_packets_total|vmbw_tx_packets_total",
+    // Two separate queries: rate() drops the metric name, so a single
+    // {__name__=~"rx|tx"} selector would produce two series with identical
+    // label sets, which VictoriaMetrics rejects as duplicate output timeseries.
+    let (rx_metric, tx_metric) = match trend.kind {
+        TrendKind::Bandwidth => ("vmbw_rx_bytes_total", "vmbw_tx_bytes_total"),
+        TrendKind::Packets => ("vmbw_rx_packets_total", "vmbw_tx_packets_total"),
     };
-    let mut query = format!(
-        "rate({{__name__=~\"{metric}\",ip=\"{ip}\"}}[{}s])",
-        app.rate_window_secs
-    );
-    if matches!(trend.kind, TrendKind::Bandwidth) {
-        query.push_str(" * 8");
-    }
-    let url = format!(
-        "{}/api/v1/query_range?query={}&start={start}&end={end}&step={step}",
-        app.metrics_url,
-        crate::http::percent_encode(&query)
-    );
+    let scale = match trend.kind {
+        TrendKind::Bandwidth => " * 8",
+        TrendKind::Packets => "",
+    };
+    let query_url = |metric: &str| {
+        let query = format!(
+            "rate({metric}{{ip=\"{ip}\"}}[{}s]){scale}",
+            app.rate_window_secs
+        );
+        format!(
+            "{}/api/v1/query_range?query={}&start={start}&end={end}&step={step}",
+            app.metrics_url,
+            crate::http::percent_encode(&query)
+        )
+    };
 
-    match crate::http::get(&url) {
-        Ok(body) => match parse_query_range(&body) {
-            Ok((rx, tx)) => {
-                trend.data = Some(tui::TrendData { rx, tx });
-            }
-            Err(e) => {
-                trend.error = Some(format!("{e:#}"));
-                trend.data = None;
-            }
-        },
+    let rx = match crate::http::get(&query_url(rx_metric)).and_then(|b| parse_series(&b)) {
+        Ok(s) => s,
+        Err(e) => {
+            trend.error = Some(format!("{e:#}"));
+            trend.data = None;
+            return;
+        }
+    };
+    match crate::http::get(&query_url(tx_metric)).and_then(|b| parse_series(&b)) {
+        Ok(tx) => trend.data = Some(tui::TrendData { rx, tx }),
         Err(e) => {
             trend.error = Some(format!("{e:#}"));
             trend.data = None;
@@ -403,18 +409,14 @@ fn fetch_trend(app: &mut UiState) {
     }
 }
 
-/// Extract RX and TX series from a VictoriaMetrics `query_range` reply.
-fn parse_query_range(body: &str) -> Result<(Series, Series)> {
+/// Extract the (single) series from a VictoriaMetrics `query_range` reply.
+fn parse_series(body: &str) -> Result<Series> {
     let v: serde_json::Value = serde_json::from_str(body).context("bad JSON from metrics")?;
     if v["status"] != "success" {
         anyhow::bail!("metrics query failed: {}", v["error"]);
     }
-    let mut rx = Vec::new();
-    let mut tx = Vec::new();
+    let mut out = Vec::new();
     for series in v["data"]["result"].as_array().into_iter().flatten() {
-        let name = series["metric"]["__name__"].as_str().unwrap_or("");
-        let is_rx = name.contains("rx_");
-        let target = if is_rx { &mut rx } else { &mut tx };
         for point in series["values"].as_array().into_iter().flatten() {
             let ts = point[0].as_f64().unwrap_or(0.0) as i64;
             let val: f64 = point[1]
@@ -422,9 +424,9 @@ fn parse_query_range(body: &str) -> Result<(Series, Series)> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0);
             if val.is_finite() {
-                target.push((ts, val));
+                out.push((ts, val));
             }
         }
     }
-    Ok((rx, tx))
+    Ok(out)
 }

@@ -294,7 +294,7 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
     // Wide terminals get every column; narrower ones drop to progressively compact
     // layouts instead of overlapping cells. Widths sum + gaps + border must fit.
     let cols = match chunks[1].width {
-        w if w >= 132 => DetailCols::Wide,
+        w if w >= 134 => DetailCols::Wide,
         w if w >= 100 => DetailCols::Mid,
         _ => DetailCols::Min,
     };
@@ -302,12 +302,12 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
         DetailCols::Wide => (
             &[
                 Constraint::Length(15),
+                Constraint::Length(11),
+                Constraint::Length(11),
                 Constraint::Length(10),
                 Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
+                Constraint::Length(11),
+                Constraint::Length(11),
                 Constraint::Length(9),
                 Constraint::Length(9),
                 Constraint::Length(8),
