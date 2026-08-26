@@ -44,6 +44,38 @@ const PIN_MONITORED_IPS: &str = "/sys/fs/bpf/MONITORED_IPS";
 const PIN_TRAFFIC: &str = "/sys/fs/bpf/TRAFFIC";
 const LOCK_PATH: &str = "/run/vm-bandwidth-monitor.lock";
 
+/// aya keeps roughly a dozen file descriptors open per attached TAP (program, map and
+/// link fds), so a bridge with many VMs easily exceeds the default 1024 soft limit.
+/// When the limit runs out the TUI input thread's epoll creation fails with EMFILE and
+/// the monitor exits silently. Claim the hard limit up front so large hosts work.
+fn raise_fd_limit() -> u64 {
+    let mut rlim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let (cur, max) = unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) != 0 {
+            return 0;
+        }
+        let r = rlim.assume_init();
+        (r.rlim_cur, r.rlim_max)
+    };
+    let want = max.min(1 << 20);
+    if cur >= want {
+        return cur;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: want,
+        rlim_max: max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        log::info!("raised open-file limit from {cur} to {want}");
+        want
+    } else {
+        log::warn!(
+            "open-file limit is {cur} and could not be raised; large hosts may exhaust it"
+        );
+        cur
+    }
+}
+
 fn main() {
     if let Err(e) = tokio_main() {
         eprintln!("error: {e:#}");
@@ -62,6 +94,7 @@ fn tokio_main() -> Result<()> {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let fd_limit = raise_fd_limit();
 
     // 1. Read and validate the configuration. Refuse to start on any problem.
     let cfg = config::load(&cli.config).map_err(anyhow::Error::msg)?;
@@ -137,7 +170,7 @@ async fn run() -> Result<()> {
         default_hook(info);
     }));
 
-    let result = run_pipeline(cfg, base, traffic, object).await;
+    let result = run_pipeline(cfg, base, traffic, object, fd_limit).await;
 
     // 6. Cleanup: dropping attachments (inside run_pipeline) detached our TC filters;
     //    remove the pins so the next start gets fresh counters.
@@ -152,12 +185,23 @@ async fn run_pipeline(
     _base: Ebpf,
     traffic: PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
     object: &'static [u8],
+    fd_limit: u64,
 ) -> Result<()> {
     // Discover TAPs and attach before the TUI comes up.
     let mut manager = tc::AttachManager::new();
     let taps_shared: Arc<RwLock<Vec<Tap>>> = Arc::new(RwLock::new(Vec::new()));
     match interface::discover_taps(&cfg.bridge) {
         Ok(found) => {
+            // ~12 fds stay open per attached TAP; running out mid-attach silently kills
+            // the TUI input thread. Refuse early with an actionable error instead.
+            let need = found.len() as u64 * 16 + 256;
+            if fd_limit != 0 && fd_limit < need {
+                bail!(
+                    "open-file limit {fd_limit} is too low for {} TAP interfaces (need ~{need}); \
+                     raise it (e.g. `ulimit -n 65536`) and restart",
+                    found.len()
+                );
+            }
             let (added, failed) = manager.reconcile(&found, object);
             log::info!("initial scan: {} TAP(s) attached, {} failed", added, failed);
             *taps_shared.write().unwrap() = manager.taps();
