@@ -152,6 +152,16 @@ pub async fn run(
         );
     }
 
+    // Sessions without a real window (some web consoles, non-interactive PTYs) report
+    // a 0x0 size; ratatui then draws invisible frames forever. Fail loudly instead.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+    if cols == 0 || rows == 0 {
+        bail!(
+            "terminal reports a size of {cols}x{rows}; cannot render the TUI. \
+             Run from a terminal that reports its window size (e.g. `ssh -t`)."
+        );
+    }
+
     let mut terminal = ratatui::init();
     let mut app = App::new(cfg);
 
