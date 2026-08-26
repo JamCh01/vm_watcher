@@ -69,9 +69,7 @@ fn raise_fd_limit() -> u64 {
         log::info!("raised open-file limit from {cur} to {want}");
         want
     } else {
-        log::warn!(
-            "open-file limit is {cur} and could not be raised; large hosts may exhaust it"
-        );
+        log::warn!("open-file limit is {cur} and could not be raised; large hosts may exhaust it");
         cur
     }
 }
