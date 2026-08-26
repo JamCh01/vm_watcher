@@ -176,13 +176,16 @@ impl Engine {
                 return;
             }
         };
-        // Spurious triggers (touch, identical re-save): nothing to do.
-        if bytes == self.last_config_bytes {
-            log::debug!("config unchanged; nothing to reload");
-            return;
-        }
         let stamp = format_unix_utc(now_unix());
         self.last_reload_at = stamp.clone();
+        // Spurious triggers (touch, identical re-save): nothing to apply. Refresh the
+        // status so a previous FAILED does not linger after the file is back to normal.
+        if bytes == self.last_config_bytes {
+            self.last_reload_ok = true;
+            self.last_reload_error.clear();
+            log::info!("config unchanged; nothing to reload");
+            return;
+        }
 
         let new_cfg = match String::from_utf8(bytes.clone())
             .map_err(|e| format!("config is not valid UTF-8: {e}"))
