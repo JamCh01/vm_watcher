@@ -1,0 +1,13 @@
+[package]
+name = "vm-bandwidth-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+vm-bandwidth-common = { path = "../vm-bandwidth-common" }
+
+[lib]
+path = "src/lib.rs"

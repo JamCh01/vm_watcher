@@ -18,6 +18,11 @@ impl IpRange {
         u64::from(self.end - self.start) + 1
     }
 
+    /// A valid range always contains at least one address; required by clippy.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
     /// `10.30.8.1-10.30.8.16`
     pub fn display(&self) -> String {
         format!(
@@ -111,6 +116,8 @@ mod tests {
         IpRangeEntry {
             name: name.to_string(),
             range: range.to_string(),
+            policy: None,
+            overrides: Vec::new(),
         }
     }
 

@@ -1,216 +1,66 @@
-//! Two-screen TUI: IP Range Overview (default) and per-IP Range Detail.
+//! Ratatui presentation for the `--ui` client. Pure rendering: all data arrives as IPC
+//! [`Status`] / [`RangeDetail`] values; this module never touches eBPF or the network.
+//!
+//! Screens: Overview (per-range bandwidth, limited count, reload status) and Detail
+//! (per-IP window averages, effective policy, NORMAL/LIMITED and remaining time, §31).
 
-use std::io::IsTerminal;
-use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
-use tokio::sync::mpsc;
 
-use crate::bandwidth::{format_bps, format_bytes, format_count};
-use crate::collector::Snapshot;
-use crate::config::{SortMode, ValidatedConfig};
+use vm_bandwidth_core::bandwidth::{format_bps, format_bytes};
+use vm_bandwidth_core::config::SortMode;
+use vm_bandwidth_core::ipc::{IpDetail, RangeDetail, Status};
 
-enum Screen {
+pub enum Screen {
     Overview,
     Detail,
 }
 
-struct DetailState {
-    range: usize,
-    sort: SortMode,
-    table: TableState,
+/// Everything the UI needs to render one frame.
+pub struct UiState {
+    pub bridge: String,
+    pub refresh_interval: Duration,
+
+    pub status: Option<Status>,
+    pub detail: Option<RangeDetail>,
+    /// Range index the current detail view was requested for.
+    pub detail_index: Option<usize>,
+    /// Last IPC error (daemon unreachable, bad reply, ...).
+    pub error: Option<String>,
+
+    pub screen: Screen,
+    pub overview: TableState,
+    pub detail_table: TableState,
+    pub sort: SortMode,
+    pub show_help: bool,
 }
 
-struct App {
-    bridge: String,
-    refresh_interval: Duration,
-    show_interface: bool,
-    show_packets: bool,
-    snapshot: Option<Snapshot>,
-    screen: Screen,
-    overview: TableState,
-    detail: DetailState,
-    show_help: bool,
-}
-
-impl App {
-    fn new(cfg: &ValidatedConfig) -> Self {
+impl UiState {
+    pub fn new(bridge: String, refresh_interval: Duration, sort: SortMode) -> Self {
         Self {
-            bridge: cfg.bridge.clone(),
-            refresh_interval: Duration::from_millis(cfg.refresh_interval_ms),
-            show_interface: cfg.show_interface,
-            show_packets: cfg.show_packets,
-            snapshot: None,
+            bridge,
+            refresh_interval,
+            status: None,
+            detail: None,
+            detail_index: None,
+            error: None,
             screen: Screen::Overview,
             overview: TableState::default(),
-            detail: DetailState {
-                range: 0,
-                sort: cfg.default_sort,
-                table: TableState::default(),
-            },
+            detail_table: TableState::default(),
+            sort,
             show_help: false,
         }
     }
-
-    fn range_count(&self) -> usize {
-        self.snapshot.as_ref().map(|s| s.ranges.len()).unwrap_or(0)
-    }
-
-    fn ip_count(&self) -> usize {
-        self.snapshot
-            .as_ref()
-            .and_then(|s| s.ranges.get(self.detail.range))
-            .map(|r| r.ips.len())
-            .unwrap_or(0)
-    }
 }
 
-/// Returns `true` to quit.
-fn handle_key(app: &mut App, key: KeyEvent, refresh_tx: &mpsc::Sender<()>) -> bool {
-    if key.kind != KeyEventKind::Press {
-        return false;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return true;
-    }
-    if app.show_help {
-        app.show_help = false;
-        return false;
-    }
-
-    match key.code {
-        KeyCode::Char('q') => return true,
-        KeyCode::Char('h') if matches!(app.screen, Screen::Overview) => {
-            app.show_help = true;
-            return false;
-        }
-        KeyCode::Char('r') => {
-            let _ = refresh_tx.try_send(());
-            return false;
-        }
-        _ => {}
-    }
-
-    match app.screen {
-        Screen::Overview => {
-            let len = app.range_count();
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => move_selection(&mut app.overview, len, -1),
-                KeyCode::Down | KeyCode::Char('j') => move_selection(&mut app.overview, len, 1),
-                KeyCode::Enter => {
-                    if let Some(selected) = app.overview.selected() {
-                        if selected < len {
-                            app.detail.range = selected;
-                            app.detail.table = TableState::default();
-                            app.screen = Screen::Detail;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Screen::Detail => {
-            let len = app.ip_count();
-            match key.code {
-                KeyCode::Esc | KeyCode::Backspace => app.screen = Screen::Overview,
-                KeyCode::Char('s') => app.detail.sort = app.detail.sort.next(),
-                KeyCode::Up | KeyCode::Char('k') => move_selection(&mut app.detail.table, len, -1),
-                KeyCode::Down | KeyCode::Char('j') => move_selection(&mut app.detail.table, len, 1),
-                _ => {}
-            }
-        }
-    }
-    false
-}
-
-fn move_selection(state: &mut TableState, len: usize, delta: i32) {
-    if len == 0 {
-        state.select(None);
-        return;
-    }
-    let current = state.selected().unwrap_or(0) as i32;
-    let next = (current + delta).clamp(0, len as i32 - 1) as usize;
-    state.select(Some(next));
-}
-
-pub async fn run(
-    mut snap_rx: mpsc::Receiver<Snapshot>,
-    refresh_tx: mpsc::Sender<()>,
-    cfg: &ValidatedConfig,
-) -> Result<()> {
-    if !input_source_available() {
-        bail!(
-            "cannot open terminal input: stdin is not a terminal and /dev/tty is unavailable. \
-             Run this program from an interactive terminal (e.g. ssh with a PTY)."
-        );
-    }
-
-    // Sessions without a real window (some web consoles, non-interactive PTYs) report
-    // a 0x0 size; ratatui then draws invisible frames forever. Fail loudly instead.
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
-    if cols == 0 || rows == 0 {
-        bail!(
-            "terminal reports a size of {cols}x{rows}; cannot render the TUI. \
-             Run from a terminal that reports its window size (e.g. `ssh -t`)."
-        );
-    }
-
-    let mut terminal = ratatui::init();
-    let mut app = App::new(cfg);
-
-    // crossterm's EventStream panics with "reader source not set" when its input source
-    // cannot be initialized; a plain blocking read on a dedicated thread degrades to a
-    // graceful error instead (and drops the futures dependency).
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(16);
-    std::thread::spawn(move || {
-        while let Ok(event) = crossterm::event::read() {
-            if event_tx.blocking_send(event).is_err() {
-                break;
-            }
-        }
-    });
-
-    loop {
-        terminal.draw(|f| draw(f, &mut app))?;
-        tokio::select! {
-            maybe_event = event_rx.recv() => match maybe_event {
-                Some(Event::Key(key)) => {
-                    if handle_key(&mut app, key, &refresh_tx) {
-                        break;
-                    }
-                }
-                Some(_) => {}
-                None => break,
-            },
-            snapshot = snap_rx.recv() => match snapshot {
-                Some(s) => app.snapshot = Some(s),
-                None => break,
-            },
-        }
-    }
-    Ok(())
-}
-
-/// Mirrors crossterm's tty_fd(): stdin must be a terminal, or /dev/tty must be openable.
-fn input_source_available() -> bool {
-    std::io::stdin().is_terminal()
-        || std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .is_ok()
-}
-
-fn draw(f: &mut Frame, app: &mut App) {
+pub fn draw(f: &mut Frame, app: &mut UiState) {
     let chunks = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
@@ -228,9 +78,26 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let tap_count = app.snapshot.as_ref().map(|s| s.taps.len()).unwrap_or(0);
-    let text = vec![
+fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
+    let status = app.status.as_ref();
+    let tap_count = status.map(|s| s.tap_count).unwrap_or(0);
+    let generation = status.map(|s| s.generation).unwrap_or(0);
+    let reload_line = match status {
+        Some(s) if !s.last_reload_at.is_empty() => {
+            let state = if s.last_reload_ok { "OK" } else { "FAILED" };
+            let mut line = format!(
+                "Config generation: {}    Last reload: {}    Status: {}",
+                generation, s.last_reload_at, state
+            );
+            if !s.last_reload_ok && !s.last_reload_error.is_empty() {
+                line.push_str(&format!("    Error: {}", s.last_reload_error));
+            }
+            line
+        }
+        _ => format!("Config generation: {generation}"),
+    };
+
+    let mut lines = vec![
         Line::from(Span::styled(
             "VM Bandwidth Monitor",
             Style::default().add_modifier(Modifier::BOLD),
@@ -241,17 +108,26 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             tap_count,
             format_duration(app.refresh_interval)
         )),
+        Line::from(reload_line),
     ];
-    f.render_widget(Paragraph::new(text).block(Block::bordered()), area);
+    if let Some(err) = &app.error {
+        lines.push(Line::from(Span::styled(
+            format!("daemon: {err}"),
+            Style::default()
+                .fg(ratatui::style::Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines).block(Block::bordered()), area);
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &UiState, area: Rect) {
     let keys = match app.screen {
         Screen::Overview => "↑/↓ select   Enter detail   r refresh   h help   q quit",
         Screen::Detail => "↑/↓ select   s sort   r refresh   Esc back   q quit",
     };
     let sort_hint = match app.screen {
-        Screen::Detail => format!("   [sort: {}]", app.detail.sort.label()),
+        Screen::Detail => format!("   [sort: {}]", app.sort.label()),
         Screen::Overview => String::new(),
     };
     f.render_widget(
@@ -261,13 +137,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_overview(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(snapshot) = &app.snapshot else {
+fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
+    let Some(status) = &app.status else {
         f.render_widget(waiting_widget("IP Range Overview"), area);
         return;
     };
 
-    let rows: Vec<Row> = snapshot
+    let rows: Vec<Row> = status
         .ranges
         .iter()
         .map(|r| {
@@ -278,154 +154,169 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(format_bps(r.tx_bps)),
                 Cell::from(format_bytes(r.rx_bytes)),
                 Cell::from(format_bytes(r.tx_bytes)),
+                Cell::from(r.ip_count.to_string()),
+                style_limited(r.limited),
             ])
         })
         .collect();
 
     let widths = [
-        Constraint::Min(16),
-        Constraint::Min(24),
+        Constraint::Min(14),
+        Constraint::Min(22),
         Constraint::Length(12),
         Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
+        Constraint::Length(11),
+        Constraint::Length(11),
+        Constraint::Length(6),
+        Constraint::Length(8),
     ];
     let table = Table::new(rows, widths)
         .header(header_row([
-            "Name", "IP Range", "RX", "TX", "RX Total", "TX Total",
+            "Name", "IP Range", "RX", "TX", "RX Total", "TX Total", "IPs", "Limited",
         ]))
         .block(Block::bordered().title("IP Range Overview"))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_spacing(HighlightSpacing::Always);
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
-    clamp_selection(&mut app.overview, snapshot.ranges.len());
+    clamp_selection(&mut app.overview, status.ranges.len());
     f.render_stateful_widget(table, area, &mut app.overview);
 }
 
-fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
-    if app.snapshot.is_none() {
+fn style_limited(n: usize) -> Cell<'static> {
+    let cell = Cell::from(n.to_string());
+    if n > 0 {
+        cell.style(
+            Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        cell
+    }
+}
+
+fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
+    let Some(detail) = &app.detail else {
         f.render_widget(waiting_widget("IP Range Detail"), area);
         return;
-    }
-    if !app
-        .snapshot
-        .as_ref()
-        .is_some_and(|s| s.ranges.get(app.detail.range).is_some())
-    {
-        app.screen = Screen::Overview;
-        return;
-    }
-    let snapshot = app.snapshot.as_ref().unwrap();
-    let range = &snapshot.ranges[app.detail.range];
+    };
 
     let chunks = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(area);
 
     let header = vec![
         Line::from(vec![
             Span::styled("Range: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(range.name.clone()),
-            Span::raw(format!("    {}", range.range)),
+            Span::raw(detail.name.clone()),
+            Span::raw(format!("    {}", detail.range)),
         ]),
         Line::from(format!(
             "Range RX: {}    Range TX: {}    RX Total: {}    TX Total: {}",
-            format_bps(range.rx_bps),
-            format_bps(range.tx_bps),
-            format_bytes(range.rx_bytes),
-            format_bytes(range.tx_bytes),
+            format_bps(detail.rx_bps),
+            format_bps(detail.tx_bps),
+            format_bytes(detail.rx_bytes),
+            format_bytes(detail.tx_bytes),
         )),
     ];
     f.render_widget(Paragraph::new(header).block(Block::bordered()), chunks[0]);
 
-    // Every configured IP is shown, sorted per the current sort mode.
-    let mut ips = range.ips.clone();
-    match app.detail.sort {
-        SortMode::Ip => ips.sort_by_key(|(ip, _)| *ip),
-        SortMode::Rx => ips.sort_by(|a, b| {
-            b.1.rx_bps
-                .partial_cmp(&a.1.rx_bps)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        }),
-        SortMode::Tx => ips.sort_by(|a, b| {
-            b.1.tx_bps
-                .partial_cmp(&a.1.tx_bps)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        }),
-        SortMode::Total => ips.sort_by(|a, b| {
-            let ta = a.1.rx_bps + a.1.tx_bps;
-            let tb = b.1.rx_bps + b.1.tx_bps;
-            tb.partial_cmp(&ta)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        }),
-    }
+    // Sort the IPs per the current sort mode.
+    let mut ips = detail.ips.clone();
+    sort_ips(&mut ips, app.sort);
 
-    let names: Vec<(u32, &str)> = snapshot
-        .taps
-        .iter()
-        .map(|t| (t.ifindex, t.name.as_str()))
-        .collect();
-
-    let mut widths = vec![
+    let widths = [
         Constraint::Length(16),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
+        Constraint::Length(11),
+        Constraint::Length(11),
+        Constraint::Length(11),
+        Constraint::Length(11),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(9),
     ];
-    let mut header_cells = vec!["IPv4", "RX", "TX", "RX Total", "TX Total"];
-    if app.show_interface {
-        header_cells.push("Ifaces");
-        widths.push(Constraint::Min(12));
-    }
-    if app.show_packets {
-        header_cells.push("RX Pkts");
-        header_cells.push("TX Pkts");
-        widths.push(Constraint::Length(10));
-        widths.push(Constraint::Length(10));
-    }
-
-    let rows: Vec<Row> = ips
-        .iter()
-        .map(|(ip, stats)| {
-            let mut cells = vec![
-                Cell::from(Ipv4Addr::from(*ip).to_string()),
-                Cell::from(format_bps(stats.rx_bps)),
-                Cell::from(format_bps(stats.tx_bps)),
-                Cell::from(format_bytes(stats.rx_bytes)),
-                Cell::from(format_bytes(stats.tx_bytes)),
-            ];
-            if app.show_interface {
-                let ifaces: Vec<String> = stats
-                    .interfaces
-                    .iter()
-                    .map(|ifindex| {
-                        names
-                            .iter()
-                            .find(|(i, _)| i == ifindex)
-                            .map(|(_, name)| name.to_string())
-                            .unwrap_or_else(|| ifindex.to_string())
-                    })
-                    .collect();
-                cells.push(Cell::from(ifaces.join(",")));
-            }
-            if app.show_packets {
-                cells.push(Cell::from(format_count(stats.rx_packets)));
-                cells.push(Cell::from(format_count(stats.tx_packets)));
-            }
-            Row::new(cells)
-        })
-        .collect();
-
+    let rows: Vec<Row> = ips.iter().map(ip_row).collect();
     let table = Table::new(rows, widths)
-        .header(header_row(header_cells))
+        .header(header_row([
+            "IPv4", "RX", "TX", "RX win", "TX win", "RX limit", "TX limit", "RX st", "TX st",
+            "Remain",
+        ]))
         .block(Block::bordered().title("IP Range Detail"))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_spacing(HighlightSpacing::Always);
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
-    clamp_selection(&mut app.detail.table, ips.len());
-    f.render_stateful_widget(table, chunks[1], &mut app.detail.table);
+    clamp_selection(&mut app.detail_table, ips.len());
+    f.render_stateful_widget(table, area, &mut app.detail_table);
+}
+
+fn ip_row(ip: &IpDetail) -> Row<'static> {
+    let limited_style = Style::default()
+        .fg(ratatui::style::Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let state_cell = |limited: bool| -> Cell<'static> {
+        let label = if limited { "LIMITED" } else { "NORMAL" };
+        let cell = Cell::from(label.to_string());
+        if limited {
+            cell.style(limited_style)
+        } else {
+            cell
+        }
+    };
+    let fmt_pol = |v: u64| -> String {
+        if v == 0 {
+            "-".to_string()
+        } else {
+            format_bps(v as f64)
+        }
+    };
+    let fmt_remain = |rx: u64, tx: u64| -> String {
+        match (rx, tx) {
+            (0, 0) => "-".to_string(),
+            (a, 0) => format!("rx {}s", a),
+            (0, b) => format!("tx {}s", b),
+            (a, b) => format!("{}s/{}s", a, b),
+        }
+    };
+    let rx_limited = ip.rx_state == "LIMITED";
+    let tx_limited = ip.tx_state == "LIMITED";
+
+    Row::new(vec![
+        Cell::from(std::net::Ipv4Addr::from(ip.ip).to_string()),
+        Cell::from(format_bps(ip.rx_bps)),
+        Cell::from(format_bps(ip.tx_bps)),
+        Cell::from(format_bps(ip.rx_window_bps)),
+        Cell::from(format_bps(ip.tx_window_bps)),
+        Cell::from(fmt_pol(ip.rx_limit)),
+        Cell::from(fmt_pol(ip.tx_limit)),
+        state_cell(rx_limited),
+        state_cell(tx_limited),
+        Cell::from(fmt_remain(ip.rx_remaining, ip.tx_remaining)),
+    ])
+}
+
+fn sort_ips(ips: &mut [IpDetail], sort: SortMode) {
+    match sort {
+        SortMode::Ip => ips.sort_by_key(|i| i.ip),
+        SortMode::Rx => ips.sort_by(|a, b| {
+            b.rx_bps
+                .partial_cmp(&a.rx_bps)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.ip.cmp(&b.ip))
+        }),
+        SortMode::Tx => ips.sort_by(|a, b| {
+            b.tx_bps
+                .partial_cmp(&a.tx_bps)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.ip.cmp(&b.ip))
+        }),
+        SortMode::Total => ips.sort_by(|a, b| {
+            let ta = a.rx_bps + a.tx_bps;
+            let tb = b.rx_bps + b.tx_bps;
+            tb.partial_cmp(&ta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.ip.cmp(&b.ip))
+        }),
+    }
 }
 
 fn header_row<'a>(cells: impl IntoIterator<Item = &'a str>) -> Row<'a> {
@@ -447,7 +338,7 @@ fn clamp_selection(state: &mut TableState, len: usize) {
 }
 
 fn waiting_widget(title: &'static str) -> Paragraph<'static> {
-    Paragraph::new("Waiting for first sample…")
+    Paragraph::new("Waiting for daemon data…")
         .alignment(Alignment::Center)
         .block(Block::bordered().title(title))
 }

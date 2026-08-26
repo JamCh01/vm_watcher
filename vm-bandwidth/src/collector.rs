@@ -4,14 +4,14 @@
 //! deltas over the actual sampling interval. A key whose counter went backwards (reset)
 //! contributes a zero delta for that interval — bandwidth is never negative.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use aya::maps::{MapData, PerCpuHashMap};
 use vm_bandwidth_common::{TrafficKey, TrafficValue};
 
-use crate::interface::Tap;
-use crate::ip_range::IpRange;
+use vm_bandwidth_core::ip_range::IpRange;
+use vm_bandwidth_core::limiter::IpTotals;
 
 #[derive(Debug, Clone, Default)]
 pub struct IpStats {
@@ -21,8 +21,6 @@ pub struct IpStats {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
-    /// ifindexes that ever produced traffic for this IP.
-    pub interfaces: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,7 +40,14 @@ pub struct RangeStats {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub ranges: Vec<RangeStats>,
-    pub taps: Vec<Tap>,
+}
+
+/// One collector poll: the TUI-facing snapshot plus per-IP cumulative totals
+/// (aggregated across all TAPs) for the limiter's rolling-window deltas.
+#[derive(Debug)]
+pub struct PollResult {
+    pub snapshot: Snapshot,
+    pub totals: HashMap<u32, IpTotals>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -83,12 +88,18 @@ impl Collector {
         }
     }
 
+    /// Drop state for IPs that are no longer configured (§33: no stale entries linger
+    /// after a range is removed by a hot reload).
+    pub fn prune_ips(&mut self, keep: &HashSet<u32>) {
+        self.totals.retain(|ip, _| keep.contains(ip));
+        self.prev.retain(|key, _| keep.contains(&key.ipv4));
+    }
+
     pub fn poll(
         &mut self,
         traffic: &PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
-        taps: &[Tap],
         ranges: &[IpRange],
-    ) -> Snapshot {
+    ) -> PollResult {
         let now = Instant::now();
         // 0.0 on the first poll: no previous sample, all rates zero.
         let elapsed_secs = self
@@ -151,14 +162,6 @@ impl Collector {
                 stats.tx_bps = 0.0;
             }
         }
-        // Remember which interfaces carried traffic for each IP.
-        for key in self.prev.keys() {
-            self.totals
-                .entry(key.ipv4)
-                .or_default()
-                .interfaces
-                .insert(key.ifindex);
-        }
 
         // Per-range aggregation over every configured IP, traffic or not.
         let mut snap_ranges = Vec::with_capacity(ranges.len());
@@ -181,9 +184,25 @@ impl Collector {
             snap_ranges.push(rs);
         }
 
-        Snapshot {
-            ranges: snap_ranges,
-            taps: taps.to_vec(),
+        let totals = self
+            .totals
+            .iter()
+            .map(|(ip, s)| {
+                (
+                    *ip,
+                    IpTotals {
+                        rx_bytes: s.rx_bytes,
+                        tx_bytes: s.tx_bytes,
+                    },
+                )
+            })
+            .collect();
+
+        PollResult {
+            snapshot: Snapshot {
+                ranges: snap_ranges,
+            },
+            totals,
         }
     }
 }
