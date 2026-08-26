@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 # GitHub-hosted runners only ship Ubuntu; the jobs below run inside a
@@ -13,6 +14,7 @@ on:
 #               eBPF compile (needs nightly + bpf-linker), so this job stays fast.
 #   ebpf      - full build including the eBPF object: pinned nightly (whose LLVM
 #               matches bpf-linker's LLVM 22), rust-src, and llvm-22 from apt.llvm.org.
+#   release   - tag pushes only: publishes the ebpf job's binary as a GitHub release.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -115,3 +117,28 @@ jobs:
         with:
           name: vm-bandwidth-monitor-linux-x86_64
           path: target/release/vm-bandwidth-monitor
+
+  release:
+    name: Publish release
+    needs: ebpf
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-bandwidth-monitor-linux-x86_64
+          path: dist
+
+      # Include the tag in the file name so releases stay distinguishable.
+      - name: Rename binary
+        run: mv dist/vm-bandwidth-monitor "dist/vm-bandwidth-monitor-${GITHUB_REF_NAME}-linux-x86_64"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vm-bandwidth-monitor-*
+          generate_release_notes: true
