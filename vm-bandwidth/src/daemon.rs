@@ -19,14 +19,15 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use vm_bandwidth_common::{
-    GcraKey, GcraPolicy, GcraState, TrafficKey, TrafficValue, DIR_RX, DIR_TX,
+    LimitKey, LimitPolicy, LimitState, SwlRing, TrafficKey, TrafficValue, ALGO_SLIDING_WINDOW_LOG,
+    DIR_RX, DIR_TX,
 };
 
 use vm_bandwidth_core::config::{self, ValidatedConfig};
 use vm_bandwidth_core::ipc::{
     self, IpDetail, RangeDetail, RangeSummary, Request, Response, Status,
 };
-use vm_bandwidth_core::limiter::{GcraAction, Limiter};
+use vm_bandwidth_core::limiter::{LimitAction, Limiter};
 use vm_bandwidth_core::timefmt::{format_unix_utc, now_unix};
 
 use crate::collector::{Collector, PollResult};
@@ -70,8 +71,11 @@ struct Engine {
 
     monitored: AyaHashMap<MapData, u32, u8>,
     #[allow(dead_code)] // kept alive so its map fd stays open
-    limit_policies: AyaHashMap<MapData, GcraKey, GcraPolicy>,
-    gcra_state: AyaHashMap<MapData, GcraKey, GcraState>,
+    limit_policies: AyaHashMap<MapData, LimitKey, LimitPolicy>,
+    limit_state: AyaHashMap<MapData, LimitKey, LimitState>,
+    /// Bounded sliding-window-log rings; only populated for flows limited with
+    /// the `sliding_window_log` algorithm.
+    swl_log: AyaHashMap<MapData, LimitKey, SwlRing>,
     traffic: PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
 
     epoch: std::time::Instant,
@@ -87,7 +91,7 @@ impl Engine {
         let PollResult { snapshot, totals } = self.collector.poll(&self.traffic, &ranges);
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
-        self.apply_gcra_actions(&actions);
+        self.apply_limit_actions(&actions);
         self.last_totals = totals;
         self.last_snapshot = Some(snapshot);
     }
@@ -158,43 +162,62 @@ impl Engine {
         }
     }
 
-    fn apply_gcra_actions(&mut self, actions: &[GcraAction]) {
+    fn apply_limit_actions(&mut self, actions: &[LimitAction]) {
         for action in actions {
             match action {
-                GcraAction::Install {
+                LimitAction::Install {
                     ipv4,
                     direction,
                     rate_bps,
                     burst_bytes,
+                    algorithm,
+                    window_ns,
                 } => {
-                    let key = GcraKey::new(*ipv4, *direction);
-                    let policy = GcraPolicy {
+                    let key = LimitKey::new(*ipv4, *direction);
+                    // When the flow was previously limited with the sliding-window-log
+                    // algorithm and now switches away from it, its log ring is dead weight.
+                    let was_swl = self
+                        .limit_policies
+                        .get(&key, 0)
+                        .map(|p: LimitPolicy| p.algorithm == ALGO_SLIDING_WINDOW_LOG)
+                        .unwrap_or(false);
+                    if was_swl && *algorithm != ALGO_SLIDING_WINDOW_LOG {
+                        let _ = self.swl_log.remove(&key);
+                    }
+                    let policy = LimitPolicy {
                         enabled: 1,
-                        _pad: [0; 3],
+                        _pad0: [0; 3],
+                        algorithm: *algorithm,
                         rate_bps: *rate_bps,
                         burst_bytes: *burst_bytes,
+                        window_ns: *window_ns,
                     };
                     match self.limit_policies.insert(key, policy, 0) {
                         Ok(()) => {
-                            // (Re)create the runtime state so the new rate starts from a
-                            // fresh TAT; the data path never creates lock-bearing values.
-                            let fresh = GcraState {
-                                tat_ns: 0,
-                                lock: 0,
-                                _pad: 0,
-                            };
-                            if let Err(e) = self.gcra_state.insert(key, fresh, 0) {
+                            // (Re)create the runtime state so the new policy starts clean;
+                            // the data path never creates lock-bearing values.
+                            let fresh = LimitState::default();
+                            if *algorithm == ALGO_SLIDING_WINDOW_LOG {
+                                if let Err(e) = self.swl_log.insert(key, SwlRing::default(), 0) {
+                                    log::error!(
+                                        "failed to init sliding-window log for {}: {e}",
+                                        std::net::Ipv4Addr::from(*ipv4)
+                                    );
+                                }
+                            } else if let Err(e) = self.limit_state.insert(key, fresh, 0) {
                                 log::error!(
-                                    "failed to init GCRA state for {}: {e}",
+                                    "failed to init limit state for {}: {e}",
                                     std::net::Ipv4Addr::from(*ipv4)
                                 );
                             }
                             log::info!(
-                                "LIMITED {} dir={} at {} bps (burst {} B)",
+                                "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
                                 std::net::Ipv4Addr::from(*ipv4),
                                 direction,
+                                Self::algorithm_name(*algorithm),
                                 rate_bps,
-                                burst_bytes
+                                burst_bytes,
+                                window_ns
                             );
                         }
                         Err(e) => log::error!(
@@ -203,10 +226,11 @@ impl Engine {
                         ),
                     }
                 }
-                GcraAction::Remove { ipv4, direction } => {
-                    let key = GcraKey::new(*ipv4, *direction);
+                LimitAction::Remove { ipv4, direction } => {
+                    let key = LimitKey::new(*ipv4, *direction);
                     let _ = self.limit_policies.remove(&key);
-                    let _ = self.gcra_state.remove(&key);
+                    let _ = self.limit_state.remove(&key);
+                    let _ = self.swl_log.remove(&key);
                     log::info!(
                         "back to NORMAL {} dir={}",
                         std::net::Ipv4Addr::from(*ipv4),
@@ -214,6 +238,20 @@ impl Engine {
                     );
                 }
             }
+        }
+    }
+
+    /// Human-readable algorithm name for log lines.
+    fn algorithm_name(algorithm: u32) -> &'static str {
+        use vm_bandwidth_common::*;
+        match algorithm {
+            ALGO_TOKEN_BUCKET => "token_bucket",
+            ALGO_LEAKY_BUCKET => "leaky_bucket",
+            ALGO_FIXED_WINDOW => "fixed_window",
+            ALGO_SLIDING_WINDOW_COUNTER => "sliding_window_counter",
+            ALGO_SLIDING_WINDOW_LOG => "sliding_window_log",
+            ALGO_GCRA => "gcra",
+            _ => "unknown",
         }
     }
 
@@ -300,7 +338,7 @@ impl Engine {
             .limiter
             .apply_config(&new_cfg, now)
             .map_err(anyhow::Error::msg)?;
-        self.apply_gcra_actions(&actions);
+        self.apply_limit_actions(&actions);
 
         // ... and deletions drop the whitelist last.
         for ip in old_ips.difference(&new_ips) {
@@ -469,7 +507,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         .map_max_entries("TRAFFIC", cfg.map_max_entries)
         .map_max_entries("MONITORED_IPS", whitelist_capacity)
         .map_max_entries("LIMIT_POLICIES", cfg.map_max_entries)
-        .map_max_entries("GCRA_STATE", cfg.map_max_entries)
+        .map_max_entries("LIMIT_STATE", cfg.map_max_entries)
+        .map_max_entries("SWL_LOG", cfg.map_max_entries)
         .load(object)
         .context(
             "failed to load the eBPF object; this program needs root (CAP_BPF + CAP_NET_ADMIN), \
@@ -490,15 +529,20 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     }
     log::info!("whitelisted {total_ips} IPv4 address(es)");
 
-    let limit_policies = AyaHashMap::<_, GcraKey, GcraPolicy>::try_from(
+    let limit_policies = AyaHashMap::<_, LimitKey, LimitPolicy>::try_from(
         base.take_map("LIMIT_POLICIES")
             .context("LIMIT_POLICIES missing")?,
     )
     .context("LIMIT_POLICIES has the wrong type")?;
-    let gcra_state = AyaHashMap::<_, GcraKey, GcraState>::try_from(
-        base.take_map("GCRA_STATE").context("GCRA_STATE missing")?,
+    let limit_state = AyaHashMap::<_, LimitKey, LimitState>::try_from(
+        base.take_map("LIMIT_STATE")
+            .context("LIMIT_STATE missing")?,
     )
-    .context("GCRA_STATE has the wrong type")?;
+    .context("LIMIT_STATE has the wrong type")?;
+    let swl_log = AyaHashMap::<_, LimitKey, SwlRing>::try_from(
+        base.take_map("SWL_LOG").context("SWL_LOG missing")?,
+    )
+    .context("SWL_LOG has the wrong type")?;
     let traffic = PerCpuHashMap::<MapData, TrafficKey, TrafficValue>::try_from(
         base.take_map("TRAFFIC").context("TRAFFIC missing")?,
     )
@@ -533,7 +577,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_totals: std::collections::HashMap::new(),
         monitored,
         limit_policies,
-        gcra_state,
+        limit_state,
+        swl_log,
         traffic,
         epoch: std::time::Instant::now(),
         cfg,

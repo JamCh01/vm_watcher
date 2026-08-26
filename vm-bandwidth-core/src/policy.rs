@@ -5,6 +5,11 @@
 //! followed by a completeness check per direction. eBPF never sees inheritance: the
 //! daemon hands it fully-resolved per-(IP, direction) parameters only.
 
+use vm_bandwidth_common::{
+    ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
+    ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET,
+};
+
 /// Raw, per-direction-optional policy fields. Used for both the range default and an
 /// IP override; every field is optional so a partial override can inherit the rest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,6 +22,10 @@ pub struct PolicyFields {
     pub trigger_ratio_pct: Option<u8>,
     pub limit_duration_secs: Option<u64>,
     pub burst_bytes: Option<u64>,
+    /// One of the `vm_bandwidth_common::ALGO_*` constants; absent = GCRA (default).
+    pub algorithm: Option<u32>,
+    /// Window length for the window-based algorithms.
+    pub limit_window_secs: Option<u64>,
 }
 
 impl PolicyFields {
@@ -35,8 +44,25 @@ impl PolicyFields {
             trigger_ratio_pct: other.trigger_ratio_pct.or(self.trigger_ratio_pct),
             limit_duration_secs: other.limit_duration_secs.or(self.limit_duration_secs),
             burst_bytes: other.burst_bytes.or(self.burst_bytes),
+            algorithm: other.algorithm.or(self.algorithm),
+            limit_window_secs: other.limit_window_secs.or(self.limit_window_secs),
         }
     }
+}
+
+/// True for token bucket / leaky bucket / GCRA: algorithms that need `burst` and
+/// have no window of their own.
+fn is_bucket_algo(algorithm: u32) -> bool {
+    matches!(algorithm, ALGO_TOKEN_BUCKET | ALGO_LEAKY_BUCKET | ALGO_GCRA)
+}
+
+/// True for fixed window / sliding window counter / sliding window log: algorithms
+/// that need `limit_window` and ignore `burst`.
+fn is_window_algo(algorithm: u32) -> bool {
+    matches!(
+        algorithm,
+        ALGO_FIXED_WINDOW | ALGO_SLIDING_WINDOW_COUNTER | ALGO_SLIDING_WINDOW_LOG
+    )
 }
 
 /// A fully-specified limiter for one direction. Only built when every parameter exists.
@@ -48,6 +74,10 @@ pub struct DirPolicy {
     pub trigger_ratio_pct: u8,
     pub limit_duration_secs: u64,
     pub burst_bytes: u64,
+    /// One of the `vm_bandwidth_common::ALGO_*` constants.
+    pub algorithm: u32,
+    /// Window length for window-based algorithms; 0 for bucket/GCRA algorithms.
+    pub limit_window_secs: u64,
 }
 
 impl DirPolicy {
@@ -76,10 +106,11 @@ impl EffectivePolicy {
 
 /// Merge `range` with an optional `override_fields` and resolve into an effective policy.
 ///
-/// A direction is policed only when its threshold, its limit and all four shared
-/// parameters (window, trigger_ratio, limit_duration, burst) are present after the merge.
-/// Specifying only some of them is a configuration error, reported with `what` naming the
-/// offending range or IP.
+/// A direction is policed only when its threshold, its limit and all shared parameters
+/// are present after the merge. Which shared parameters are required depends on the
+/// algorithm: bucket/GCRA algorithms need `burst`, window algorithms need `limit_window`,
+/// and a field that does not apply to the selected algorithm is a configuration error.
+/// `algorithm` itself defaults to GCRA. Errors name the offending range or IP via `what`.
 pub fn resolve(
     range: &PolicyFields,
     override_fields: Option<&PolicyFields>,
@@ -141,8 +172,27 @@ fn build_dir(
     if merged.limit_duration_secs.is_none() {
         missing_fields.push("limit_duration".to_string());
     }
-    if merged.burst_bytes.is_none() {
-        missing_fields.push("burst".to_string());
+    let algorithm = merged.algorithm.unwrap_or(ALGO_GCRA);
+    if is_bucket_algo(algorithm) {
+        if merged.burst_bytes.is_none() {
+            missing_fields.push("burst".to_string());
+        }
+        if merged.limit_window_secs.is_some() {
+            return Err(format!(
+                "policy for {what}: limit_window does not apply to this algorithm"
+            ));
+        }
+    } else if is_window_algo(algorithm) {
+        if merged.limit_window_secs.is_none() {
+            missing_fields.push("limit_window".to_string());
+        }
+        if merged.burst_bytes.is_some() {
+            return Err(format!(
+                "policy for {what}: burst does not apply to this algorithm"
+            ));
+        }
+    } else {
+        return Err(format!("policy for {what}: unknown algorithm {algorithm}"));
     }
     if !missing_fields.is_empty() {
         return Err(format!(
@@ -157,7 +207,9 @@ fn build_dir(
         window_secs: merged.window_secs.unwrap(),
         trigger_ratio_pct: merged.trigger_ratio_pct.unwrap(),
         limit_duration_secs: merged.limit_duration_secs.unwrap(),
-        burst_bytes: merged.burst_bytes.unwrap(),
+        burst_bytes: merged.burst_bytes.unwrap_or(0),
+        algorithm,
+        limit_window_secs: merged.limit_window_secs.unwrap_or(0),
     }))
 }
 
@@ -175,6 +227,7 @@ mod tests {
             trigger_ratio_pct: Some(80),
             limit_duration_secs: Some(1800),
             burst_bytes: Some(4 * 1024 * 1024),
+            ..Default::default()
         }
     }
 
@@ -246,5 +299,79 @@ mod tests {
         let merged = base.merged_with(&ov);
         assert_eq!(merged.window_secs, Some(600));
         assert_eq!(merged.rx_threshold_bps, base.rx_threshold_bps);
+    }
+
+    fn window_fields() -> PolicyFields {
+        let mut p = full();
+        p.algorithm = Some(vm_bandwidth_common::ALGO_FIXED_WINDOW);
+        p.burst_bytes = None;
+        p.limit_window_secs = Some(10);
+        p
+    }
+
+    #[test]
+    fn default_algorithm_is_gcra() {
+        let rx = resolve(&full(), None, "R").unwrap().rx.unwrap();
+        assert_eq!(rx.algorithm, vm_bandwidth_common::ALGO_GCRA);
+        assert_eq!(rx.limit_window_secs, 0);
+    }
+
+    #[test]
+    fn token_bucket_resolves_with_burst() {
+        let mut p = full();
+        p.algorithm = Some(vm_bandwidth_common::ALGO_TOKEN_BUCKET);
+        let rx = resolve(&p, None, "R").unwrap().rx.unwrap();
+        assert_eq!(rx.algorithm, vm_bandwidth_common::ALGO_TOKEN_BUCKET);
+        assert_eq!(rx.burst_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn window_algorithm_resolves_without_burst() {
+        let rx = resolve(&window_fields(), None, "R").unwrap().rx.unwrap();
+        assert_eq!(rx.algorithm, vm_bandwidth_common::ALGO_FIXED_WINDOW);
+        assert_eq!(rx.limit_window_secs, 10);
+        assert_eq!(rx.burst_bytes, 0);
+    }
+
+    #[test]
+    fn window_algorithm_requires_limit_window() {
+        let mut p = window_fields();
+        p.limit_window_secs = None;
+        let err = resolve(&p, None, "R").unwrap_err();
+        assert!(err.contains("limit_window"), "{err}");
+    }
+
+    #[test]
+    fn window_algorithm_ignores_burst() {
+        let mut p = window_fields();
+        p.burst_bytes = Some(1024);
+        let rx = resolve(&p, None, "R").unwrap().rx.unwrap();
+        assert_eq!(rx.burst_bytes, 0);
+    }
+
+    #[test]
+    fn bucket_algorithm_ignores_limit_window() {
+        let mut p = full();
+        p.limit_window_secs = Some(5);
+        let rx = resolve(&p, None, "R").unwrap().rx.unwrap();
+        assert_eq!(rx.limit_window_secs, 0);
+    }
+
+    #[test]
+    fn override_can_switch_algorithm() {
+        // The range keeps burst (GCRA default); the override switches to a window
+        // algorithm and inherits the burst field, which is simply ignored.
+        let ov = PolicyFields {
+            algorithm: Some(vm_bandwidth_common::ALGO_SLIDING_WINDOW_COUNTER),
+            limit_window_secs: Some(2),
+            ..Default::default()
+        };
+        let eff = resolve(&full(), Some(&ov), "10.0.0.3").unwrap();
+        let rx = eff.rx.unwrap();
+        assert_eq!(
+            rx.algorithm,
+            vm_bandwidth_common::ALGO_SLIDING_WINDOW_COUNTER
+        );
+        assert_eq!(rx.limit_window_secs, 2);
     }
 }

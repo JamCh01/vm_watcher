@@ -175,6 +175,13 @@ pub struct PolicyEntry {
     pub limit_duration: Option<String>,
     #[serde(default)]
     pub burst: Option<String>,
+    /// Policing algorithm: `token_bucket`, `leaky_bucket`, `fixed_window`,
+    /// `sliding_window_counter`, `sliding_window_log` or `gcra` (default).
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    /// Window length for the window-based algorithms (`1s`–`60s`).
+    #[serde(default)]
+    pub limit_window: Option<String>,
 }
 
 impl PolicyEntry {
@@ -187,6 +194,8 @@ impl PolicyEntry {
             && self.trigger_ratio.is_none()
             && self.limit_duration.is_none()
             && self.burst.is_none()
+            && self.algorithm.is_none()
+            && self.limit_window.is_none()
     }
 
     /// Parse every present unit into exact integers. `what` names the offending scope.
@@ -216,8 +225,32 @@ impl PolicyEntry {
                 .burst
                 .map(|s| units::parse_bytes(&s).map_err(|e| format!("{what}: {e} (burst)")))
                 .transpose()?,
+            algorithm: self
+                .algorithm
+                .map(|s| parse_algorithm(&s).map_err(|e| format!("{what}: {e}")))
+                .transpose()?,
+            limit_window_secs: dur(self.limit_window, "limit_window")?,
         })
     }
+}
+
+/// Map a config string to one of the `ALGO_*` constants.
+fn parse_algorithm(s: &str) -> Result<u32, String> {
+    use vm_bandwidth_common::*;
+    Ok(match s {
+        "token_bucket" => ALGO_TOKEN_BUCKET,
+        "leaky_bucket" => ALGO_LEAKY_BUCKET,
+        "fixed_window" => ALGO_FIXED_WINDOW,
+        "sliding_window_counter" => ALGO_SLIDING_WINDOW_COUNTER,
+        "sliding_window_log" => ALGO_SLIDING_WINDOW_LOG,
+        "gcra" => ALGO_GCRA,
+        other => {
+            return Err(format!(
+                "unknown algorithm '{other}' (expected token_bucket, leaky_bucket, \
+                 fixed_window, sliding_window_counter, sliding_window_log or gcra)"
+            ))
+        }
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -261,9 +294,13 @@ impl Deref for ValidatedRange {
 /// The eBPF GCRA data path computes `burst_bytes * 8 * 1e9` in `u64`, so `burst` is
 /// capped so that product cannot wrap; rates are bounded to keep every derived number
 /// (increment, tolerance, deadline) provably inside `u64` for any packet length.
+/// The window algorithms compute in MiB and are bounded to a 60s window so their
+/// weighted estimates also stay inside `u64`.
 const MIN_RATE_BPS: u64 = 100_000; // 100 Kbps
 const MAX_RATE_BPS: u64 = 1_000_000_000_000; // 1 Tbps
 const MAX_BURST_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+const MIN_LIMIT_WINDOW_SECS: u64 = 1;
+const MAX_LIMIT_WINDOW_SECS: u64 = 60;
 
 fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> {
     for (name, value) in [
@@ -281,6 +318,11 @@ fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> 
     if let Some(b) = fields.burst_bytes {
         if b > MAX_BURST_BYTES {
             return Err(format!("{what}: burst must be at most 1GiB"));
+        }
+    }
+    if let Some(w) = fields.limit_window_secs {
+        if !(MIN_LIMIT_WINDOW_SECS..=MAX_LIMIT_WINDOW_SECS).contains(&w) {
+            return Err(format!("{what}: limit_window must be between 1s and 60s"));
         }
     }
     Ok(())

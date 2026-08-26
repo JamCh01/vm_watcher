@@ -1,8 +1,8 @@
 //! NORMAL / LIMITED lifecycle for per-(IP, direction) limiters.
 //!
 //! The limiter is pure userspace logic: it owns the rolling windows, evaluates thresholds,
-//! tracks LIMITED expiry, and emits [`GcraAction`]s describing what the runtime must write
-//! into (or remove from) the eBPF `LIMIT_POLICIES` / `GCRA_STATE` maps. It never touches
+//! tracks LIMITED expiry, and emits [`LimitAction`]s describing what the runtime must write
+//! into (or remove from) the eBPF `LIMIT_POLICIES` / `LIMIT_STATE` maps. It never touches
 //! eBPF directly, so the whole state machine is unit-testable.
 
 use std::collections::HashMap;
@@ -28,15 +28,19 @@ pub type FlowKey = (u32, u8);
 
 /// What the runtime must do to the eBPF maps.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GcraAction {
-    /// Install (or update) a limit and reset the GCRA runtime state.
+pub enum LimitAction {
+    /// Install (or update) a limit and reset the algorithm's runtime state.
+    /// `algorithm` is one of the `vm_bandwidth_common::ALGO_*` constants;
+    /// `window_ns` is the policy window for window-based algorithms (0 otherwise).
     Install {
         ipv4: u32,
         direction: u8,
         rate_bps: u64,
         burst_bytes: u64,
+        algorithm: u32,
+        window_ns: u64,
     },
-    /// Remove the limit and any GCRA state; policing stops (fail-open).
+    /// Remove the limit and any runtime state; policing stops (fail-open).
     Remove { ipv4: u32, direction: u8 },
 }
 
@@ -140,7 +144,7 @@ impl Limiter {
         &mut self,
         cfg: &ValidatedConfig,
         now: u64,
-    ) -> Result<Vec<GcraAction>, String> {
+    ) -> Result<Vec<LimitAction>, String> {
         let (new_ranges, new_overrides) = Self::build_index(cfg)?;
         let mut actions = Vec::new();
 
@@ -180,7 +184,7 @@ impl Limiter {
             match new_dir {
                 // §25 / range-or-IP removed: stop policing, back to NORMAL.
                 None => {
-                    actions.push(GcraAction::Remove {
+                    actions.push(LimitAction::Remove {
                         ipv4: ip,
                         direction: dir,
                     });
@@ -193,7 +197,7 @@ impl Limiter {
                     // §24: duration re-anchored to the original limited_since.
                     let limited_until = state.limited_since.saturating_add(np.limit_duration_secs);
                     if limited_until <= now {
-                        actions.push(GcraAction::Remove {
+                        actions.push(LimitAction::Remove {
                             ipv4: ip,
                             direction: dir,
                         });
@@ -203,13 +207,20 @@ impl Limiter {
                         }
                         continue;
                     }
-                    // §22 / §23: rate or burst changed → re-install (runtime resets GCRA).
-                    if np.limit_bps != applied.limit_bps || np.burst_bytes != applied.burst_bytes {
-                        actions.push(GcraAction::Install {
+                    // §22 / §23: rate, burst, algorithm or window changed → re-install
+                    // (the runtime resets the algorithm's state).
+                    if np.limit_bps != applied.limit_bps
+                        || np.burst_bytes != applied.burst_bytes
+                        || np.algorithm != applied.algorithm
+                        || np.limit_window_secs != applied.limit_window_secs
+                    {
+                        actions.push(LimitAction::Install {
                             ipv4: ip,
                             direction: dir,
                             rate_bps: np.limit_bps,
                             burst_bytes: np.burst_bytes,
+                            algorithm: np.algorithm,
+                            window_ns: np.limit_window_secs.saturating_mul(1_000_000_000),
                         });
                     }
                     state.limited_until = limited_until;
@@ -258,7 +269,7 @@ impl Limiter {
 
     /// Advance one tick with the current per-IP cumulative totals. Returns the actions the
     /// runtime must apply (entering / leaving LIMITED).
-    pub fn tick(&mut self, now: u64, totals: &HashMap<u32, IpTotals>) -> Vec<GcraAction> {
+    pub fn tick(&mut self, now: u64, totals: &HashMap<u32, IpTotals>) -> Vec<LimitAction> {
         let mut actions = Vec::new();
 
         // Evaluate every IP that either has traffic or is currently LIMITED.
@@ -301,7 +312,7 @@ impl Limiter {
         dir_policy: Option<DirPolicy>,
         delta: u64,
         now: u64,
-        actions: &mut Vec<GcraAction>,
+        actions: &mut Vec<LimitAction>,
     ) {
         let Some(np) = dir_policy else { return };
         let flow: FlowKey = (ip, dir);
@@ -320,18 +331,20 @@ impl Limiter {
                     state.limited_since = now;
                     state.limited_until = now.saturating_add(np.limit_duration_secs);
                     state.applied = Some(np);
-                    actions.push(GcraAction::Install {
+                    actions.push(LimitAction::Install {
                         ipv4: ip,
                         direction: dir,
                         rate_bps: np.limit_bps,
                         burst_bytes: np.burst_bytes,
+                        algorithm: np.algorithm,
+                        window_ns: np.limit_window_secs.saturating_mul(1_000_000_000),
                     });
                 }
             }
             Phase::Limited => {
                 if now >= state.limited_until {
                     // Duration expired: stop policing, clear the window, re-observe (§7).
-                    actions.push(GcraAction::Remove {
+                    actions.push(LimitAction::Remove {
                         ipv4: ip,
                         direction: dir,
                     });
@@ -416,6 +429,7 @@ mod tests {
             trigger_ratio_pct: Some(80),
             limit_duration_secs: Some(10),
             burst_bytes: Some(1024),
+            ..Default::default()
         }
     }
 
@@ -478,7 +492,7 @@ mod tests {
         }
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
-            GcraAction::Install {
+            LimitAction::Install {
                 ipv4,
                 direction,
                 rate_bps,
@@ -518,7 +532,7 @@ mod tests {
         // limited at t=4 with duration 10 → until t=14.
         let actions = l.tick(14, &totals(IP, cumulative, 0));
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], GcraAction::Remove { .. }));
+        assert!(matches!(actions[0], LimitAction::Remove { .. }));
         assert!(!l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
         assert_eq!(
             l.window_avg_bps(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX),
@@ -577,7 +591,7 @@ mod tests {
         let actions = l.apply_config(&cfg_without, 5).unwrap();
         assert!(actions
             .iter()
-            .any(|a| matches!(a, GcraAction::Remove { direction, .. } if *direction == DIR_RX)));
+            .any(|a| matches!(a, LimitAction::Remove { direction, .. } if *direction == DIR_RX)));
         assert!(!l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
     }
 
@@ -595,10 +609,10 @@ mod tests {
         let actions = l.apply_config(&cfg2, 5).unwrap();
         let install = actions
             .iter()
-            .find(|a| matches!(a, GcraAction::Install { direction, .. } if *direction == DIR_RX))
+            .find(|a| matches!(a, LimitAction::Install { direction, .. } if *direction == DIR_RX))
             .expect("re-install action");
         match install {
-            GcraAction::Install { rate_bps, .. } => assert_eq!(*rate_bps, 300_000_000),
+            LimitAction::Install { rate_bps, .. } => assert_eq!(*rate_bps, 300_000_000),
             _ => unreachable!(),
         }
         assert!(l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
@@ -622,7 +636,7 @@ mod tests {
         let actions = l.apply_config(&cfg2, 5).unwrap();
         assert!(actions
             .iter()
-            .any(|a| matches!(a, GcraAction::Remove { direction, .. } if *direction == DIR_RX)));
+            .any(|a| matches!(a, LimitAction::Remove { direction, .. } if *direction == DIR_RX)));
         assert!(!l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
     }
 

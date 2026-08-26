@@ -3,7 +3,8 @@
 [![CI](https://github.com/JamCh01/vm_watcher/actions/workflows/ci.yml/badge.svg)](https://github.com/JamCh01/vm_watcher/actions/workflows/ci.yml)
 
 实时统计 Linux Bridge（`br0`）下虚拟机按 IPv4 地址划分的网络带宽，并可对 IP 段 / 单个
-IP 做 **GCRA 限速**。eBPF (TC/SchedClassifier, Aya) 采集与执行，长期运行 daemon +
+IP 做**限速**——限速算法可按段选择：令牌桶、漏桶、固定窗口、滑动窗口计数器、
+滑动窗口日志、GCRA（默认）。eBPF (TC/SchedClassifier, Aya) 采集与执行，长期运行 daemon +
 只读 `--ui` 终端界面，`config.toml` 热加载。默认无数据库、无 HTTP 服务；可选把
 累计流量推送到 VictoriaMetrics，在 `--ui` 里查看任意 IP 的历史趋势。
 
@@ -12,10 +13,11 @@ IP 做 **GCRA 限速**。eBPF (TC/SchedClassifier, Aya) 采集与执行，长期
 - TAP 识别不依赖接口名（支持纯数字接口名），按 `tun_flags` 判定；周期重扫，
   新增/删除 VM 无需重启。
 - **限速**：每个 `(IP, 方向)` 维护滑动窗口平均，达到 `threshold × trigger_ratio`
-  后进入 LIMITED，向 eBPF 下发 GCRA 策略；持续 `limit_duration` 后自动恢复。
+  后进入 LIMITED，向 eBPF 下发限速策略（所选算法 + 参数）；持续 `limit_duration` 后
+  自动恢复。
 - **热加载**：修改 `config.toml` 自动生效（文件监听 + `SIGHUP`），先完整校验再一次性
   应用；非法配置被拒绝且保持上一次成功配置（last-known-good）。
-- eBPF 数据面只做观察计数与 GCRA policing，任何异常路径一律放行（fail-open）。
+- eBPF 数据面只做观察计数与限速 policing，任何异常路径一律放行（fail-open）。
 - **历史趋势**（可选）：`[metrics]` 启用后，daemon 周期推送每 IP 的累计字节/包数
   到 VictoriaMetrics；`--ui` 详情页选中 IP 按 `Enter` 查看 1h / 24h / 7d / 30d 的
   带宽与发包量趋势。
@@ -24,8 +26,8 @@ IP 做 **GCRA 限速**。eBPF (TC/SchedClassifier, Aya) 采集与执行，长期
 
 | crate | 说明 |
 | --- | --- |
-| `vm-bandwidth-common` | eBPF 与用户态共享的 `#[repr(C)]` 类型（`TrafficKey/Value`、`GcraKey/Policy/State`、方向常量） |
-| `vm-bandwidth-ebpf` | TC classifier：计数 + GCRA policer（no_std，nightly 编译） |
+| `vm-bandwidth-common` | eBPF 与用户态共享的 `#[repr(C)]` 类型（`TrafficKey/Value`、`LimitKey/Policy/State`、`SwlRing`、算法常量、方向常量） |
+| `vm-bandwidth-ebpf` | TC classifier：计数 + 多算法 policer（no_std，nightly 编译） |
 | `vm-bandwidth-core` | 纯逻辑：单位解析、配置解析/校验、策略继承、滑动窗口、限速状态机、IPC 类型。不依赖 aya，任意平台可单测 |
 | `vm-bandwidth` | 运行时：daemon、eBPF 装载、IPC 服务、热加载、`--ui` 客户端（bin `vm-bandwidth-monitor`） |
 
@@ -93,7 +95,7 @@ bridge = "br0"
 [collector]
 refresh_interval_ms = 1000        # 采样周期，也是滑动窗口的采样粒度
 interface_scan_interval_secs = 5  # TAP 重扫周期
-map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / GCRA_STATE 容量
+map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / LIMIT_STATE / SWL_LOG 容量
 
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
@@ -159,8 +161,109 @@ range = "10.30.8.1-10.30.8.16"
   burst          = "4MiB"     # 允许的瞬时突发量（约 4MiB 的积压额度）
 ```
 
+默认算法是 **GCRA**（v2 行为完全不变）。想换算法就加一行 `algorithm = "..."`，
+见下文《限速算法》。
+
 **不写 `[ip_ranges.policy]` = 该段只监控、不限速。** 想关闭限速，把 policy 块删掉保存即可，
 热加载会立即移除该段所有流的限速并恢复 NORMAL。
+
+### 限速算法
+
+`algorithm` 决定触发后数据面用哪种算法执行。六种算法覆盖经典限速模型；所有算法共用
+同一套触发层（`threshold` / `window` / `trigger_ratio` / `limit_duration`），只在
+"如何判定单个包"上不同。`rx_limit`/`tx_limit` 在每种算法里都是**持续速率上限**。
+
+| 算法 | `algorithm` 值 | 额外参数 | 突发处理 | 平滑度 | 数据面开销 | 适合场景 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 令牌桶 Token Bucket | `token_bucket` | `burst` | 允许 ≤ `burst` 的突发，之后按速率放行 | 中 | 极低（每包 2 个计数器） | 通用默认之一：容忍突发、长期均速，最接近常见云厂商带宽语义 |
+| 漏桶 Leaky Bucket | `leaky_bucket` | `burst` | 突发进入"队列水位"，超容量即丢 | 高（输出最平滑） | 极低（每包 2 个计数器） | 要求速率曲线平滑、压制突发尖峰（如保护下游脆弱链路） |
+| 固定窗口计数器 Fixed Window | `fixed_window` | `limit_window` | 窗口边界处最多可通过 2 倍速率（临界突发） | 低 | 极低（每包 2 个计数器） | 与计费/配额周期对齐的粗粒度管控；实现最简 |
+| 滑动窗口计数器 Sliding Window Counter | `sliding_window_counter` | `limit_window` | 无真正突发概念，窗口内按字节配额 | 较高 | 极低（每包 3 个计数器） | 固定窗口的平滑版：消除窗口边界 2 倍突发；MiB 统计粒度 |
+| 滑动窗口日志 Sliding Window Log | `sliding_window_log` | `limit_window` | 无；精确统计窗口内字节 | 最高（精确） | 高（每包扫描 64 条日志） | 低包率、要求精确窗口语义的流；高包率下日志环溢出会偏宽松 |
+| GCRA（默认） | `gcra` | `burst` | ≤ `burst` 的突发容忍（以时间容忍度表达） | 高 | 极低（每包 1 个 TAT） | ATM/电信经典算法；对突发敏感、要求严格长期速率的场景 |
+
+**选型建议**：拿不准就用默认的 `gcra` 或 `token_bucket`——前者突发容忍以时间表达、
+对持续超速最敏感，后者以字节表达、语义最直观。要平滑压峰选 `leaky_bucket`；
+窗口配额语义（"每 N 秒最多 X 字节"）选 `sliding_window_counter`；`fixed_window`
+接受边界突发换取最简实现；`sliding_window_log` 只建议用于低包率的精确管控。
+
+各算法配置示例（只列与默认不同的字段；`rx_threshold`/`window`/`trigger_ratio`/
+`limit_duration` 等触发层字段所有算法相同，见上文快速开始）：
+
+**令牌桶**——桶容量 `burst`，按 `rx_limit` 速率回填：
+
+```toml
+  [ip_ranges.policy]
+  algorithm = "token_bucket"
+  rx_limit  = "500Mbps"   # 令牌回填速率（= 持续速率上限）
+  tx_limit  = "200Mbps"
+  burst     = "4MiB"      # 桶容量（字节）：空闲积累的突发额度
+  # + 触发层字段：rx_threshold / tx_threshold / window / trigger_ratio / limit_duration
+```
+
+**漏桶**——水位按 `rx_limit` 速率漏出，容量 `burst`：
+
+```toml
+  [ip_ranges.policy]
+  algorithm = "leaky_bucket"
+  rx_limit  = "500Mbps"   # 漏出速率
+  tx_limit  = "200Mbps"
+  burst     = "2MiB"      # 桶容量：容量越小，对突发越严格
+```
+
+**固定窗口计数器**——每个 `limit_window` 内放行 `limit × 窗口` 字节：
+
+```toml
+  [ip_ranges.policy]
+  algorithm    = "fixed_window"
+  rx_limit     = "500Mbps"  # 窗口配额 = 500Mbps × 5s = 312.5MB / 窗口
+  tx_limit     = "200Mbps"
+  limit_window = "5s"       # 窗口从该流触发后的首包开始对齐
+```
+
+**滑动窗口计数器**——同上但用加权双窗口消除边界突发：
+
+```toml
+  [ip_ranges.policy]
+  algorithm    = "sliding_window_counter"
+  rx_limit     = "500Mbps"
+  tx_limit     = "200Mbps"
+  limit_window = "5s"
+```
+
+**滑动窗口日志**——精确记录窗口内每个包的到达时间与长度（环形 64 条）：
+
+```toml
+  [ip_ranges.policy]
+  algorithm    = "sliding_window_log"
+  rx_limit     = "100Mbps"   # 精确窗口语义适合较低的速率/包率
+  tx_limit     = "50Mbps"
+  limit_window = "10s"
+```
+
+**GCRA（默认，不写 `algorithm` 即此算法）**：
+
+```toml
+  [ip_ranges.policy]
+  algorithm = "gcra"      # 可省略
+  rx_limit  = "500Mbps"   # 虚拟调度的发射速率
+  tx_limit  = "200Mbps"
+  burst     = "4MiB"      # 突发容忍量（换算为时间容忍度）
+```
+
+实现细节与精度说明：
+
+- 桶类状态以"字节 × 10⁹"存储，低速率的亚字节回填不会丢失精度。
+- 窗口类算法的配额计算用 `limit × 整数秒`，统计按 MiB 粒度取整：极小配额
+  （窗口配额 < 1MiB）会退化为接近固定窗口行为。
+- 滑动窗口日志的环形缓冲固定 64 条：包率高于约 `64 / limit_window` 条/秒时
+  旧条目被覆盖、窗口字节统计偏低（判定偏宽松）。该算法同时为每条流额外占用
+  约 1KB 的 `SWL_LOG` map 空间。
+- 固定/滑动窗口的时间窗锚定在触发后该流的首个包，不与墙上时钟对齐。
+- 未知 `algorithm` 值在配置校验期即被拒绝；数据面遇到未知算法标签一律放行
+  （fail-open）。
+- RFC 2697/2698 的 srTCM/trTCM（两速率三色标记）不在选项之列：它们输出
+  绿/黄/红三色标记而非"放行/丢弃"二值判定，与本项目 policing 模型不符。
 
 ### 字段说明
 
@@ -171,8 +274,12 @@ range = "10.30.8.1-10.30.8.16"
 | `window` | 两方向共用 | 滑动观察窗口长度 | `30s`/`5m`/`1h` | > 0；窗口 > 3600 个采样时截断到 3600 个采样 |
 | `trigger_ratio` | 两方向共用 | 触发线占阈值的百分比 | `80%` | 1% – 100% |
 | `limit_duration` | 两方向共用 | 触发后限速持续多久，到期自动解除 | `30s`/`30m`/`1h` | > 0 |
-| `burst` | 两方向共用 | GCRA 突发容忍量（字节） | `1MiB`/`4MiB` 等（二进制） | ≤ 1GiB |
+| `burst` | 两方向共用 | 突发容量（字节）：桶类算法的桶容量、GCRA 的容忍量；窗口类算法不使用 | `1MiB`/`4MiB` 等（二进制） | ≤ 1GiB |
+| `algorithm` | 两方向共用 | 限速算法，缺省 `gcra` | `token_bucket` / `leaky_bucket` / `fixed_window` / `sliding_window_counter` / `sliding_window_log` / `gcra` | 六选一 |
+| `limit_window` | 两方向共用 | 窗口类算法的窗口长度；桶类与 GCRA 不使用 | `1s` – `60s` | 1s – 60s |
 
+- 字段与算法的适用关系：桶类 / GCRA 需要 `burst`，窗口类需要 `limit_window`；
+  不适用于所选算法的字段会被忽略（允许 override 从段策略继承而来）。
 - 所有值一律整数，不接受浮点（`1.5Gbps` 会被拒绝，请写 `1500Mbps`）。
 - 某方向只写了部分字段（例如有 `rx_threshold` 却没有 `rx_limit` 或 `window`）视为不完整策略，
   整份配置被拒绝加载并保持旧配置。
@@ -188,16 +295,18 @@ range = "10.30.8.1-10.30.8.16"
 3. **只有窗口观察满整个 `window` 之后**，且窗口平均 ≥ 触发线，才进入 LIMITED。
    瞬时尖峰、窗口未满都不会触发。
 4. 计数回绕 / TAP 重建 / 策略刚挂上：按零差值处理，不会产生虚假触发。
-5. 触发后立即向 eBPF 下发该 `(IP, 方向)` 的 GCRA 策略（`rx_limit`/`tx_limit` + `burst`），
-   并记录 `limited_since` / `limited_until`（`--ui` 详情页可见状态与剩余秒数）。
+5. 触发后立即向 eBPF 下发该 `(IP, 方向)` 的限速策略（所选算法 + `rx_limit`/`tx_limit`
+   + `burst` 或 `limit_window`），并记录 `limited_since` / `limited_until`
+   （`--ui` 详情页可见状态与剩余秒数）。
 
 ### 限速语义（触发之后发生什么）
 
-- GCRA 在 TC eBPF 数据面执行 **policing**：符合速率的包放行，超出即**直接丢弃**
+- 所选算法在 TC eBPF 数据面执行 **policing**：符合速率的包放行，超出即**直接丢弃**
   （`TC_ACT_SHOT`）；不做队列整形（没有 HTB/TBF/netem）。被限流的 VM 表现为丢包重传，
   TCP 会收敛到限速值附近（真机实测 500+Mbit/s 的流被精确压在 ~202Mbit/s）。
-- `burst` 是瞬时容忍量：空闲后重新来流量时，可以先放出约 `burst` 大小的数据再进入严格限速。
-- 持续 `limit_duration` 后**自动解除**：移除 GCRA 策略、清空该方向的观察窗口、回到 NORMAL，
+- `burst`（桶类 / GCRA）是瞬时容忍量：空闲后重新来流量时，可以先放出约 `burst` 大小
+  的数据再进入严格限速；窗口类算法则按 `limit_window` 内的字节配额判定。
+- 持续 `limit_duration` 后**自动解除**：移除限速策略、清空该方向的观察窗口、回到 NORMAL，
   从零重新积累满窗口。若流量仍超触发线，会在满窗后再次触发（这是预期行为）。
 - 限速只作用于触发的方向：RX 触发不影响 TX（反之亦然）。
 - 监控计数点在限速点之前：`--ui` 里 LIMITED 流的窗口均值反映的是“需求量”，
@@ -228,13 +337,13 @@ IP 默认继承所属段的 `policy`。需要给个别机器不同待遇时，�
 
 | 修改 | 行为 |
 | --- | --- |
-| LIMITED 中改 `rx_limit`/`tx_limit` | 立即按新速率限速，同时重置该方向 GCRA 的 TAT（旧速率的状态不污染新参数） |
-| LIMITED 中改 `burst` | 立即生效 + 重置 GCRA 状态 |
+| LIMITED 中改 `rx_limit`/`tx_limit` | 立即按新速率限速，同时重置该方向算法运行状态（如 GCRA 的 TAT；旧速率的状态不污染新参数） |
+| LIMITED 中改 `burst` / `limit_window` / `algorithm` | 立即生效 + 重置算法状态 |
 | LIMITED 中改 `limit_duration` | 从原始 `limited_since` 重算 `limited_until`；若算出已过期则**立即解除** |
 | 改 `window` | 该流的观察窗口清空、重新积累满窗（旧窗口数据不迁移） |
 | 改 `threshold` / `trigger_ratio` | 保留当前窗口，下一次评估用新触发线 |
 | 删除 policy / override | 立即移除对应限速、恢复 NORMAL；override 删除则回落继承 |
-| 新增段 / 删除段 | 同步增删白名单与监控状态；删除段会清理其限速、GCRA 状态和窗口 |
+| 新增段 / 删除段 | 同步增删白名单与监控状态；删除段会清理其限速、算法状态和窗口 |
 | 改 `network.bridge` | **不支持热加载**，校验直接拒绝，需要重启进程 |
 | 任何非法配置 | 整份拒绝：保持上一次成功配置（last-known-good），不中断监控与限速，`--ui` 顶栏显示 FAILED 与原因 |
 
@@ -302,7 +411,8 @@ range = "10.30.9.1-10.30.9.32"
    ```bash
    apt-get install -y bpftool            # 若未安装（仅诊断用，不影响运行中的 daemon）
    bpftool map dump name LIMIT_POLICIES   # 生效中的限速策略；[] = 无
-   bpftool map dump name GCRA_STATE       # GCRA 运行状态（TAT）；[] = 无
+   bpftool map dump name LIMIT_STATE      # 算法运行状态（TAT/令牌/窗口等）；[] = 无
+   bpftool map dump name SWL_LOG          # 滑动窗口日志环（仅该算法在用时非空）
    ```
 
    配置里没有 `[ip_ranges.policy]` 时，这两张 map 必然为空：限速器只给带策略的流下发，
@@ -314,10 +424,10 @@ range = "10.30.9.1-10.30.9.32"
 
 | 想解除的范围 | 做法 |
 | --- | --- |
-| 某段的全部限速 | 删掉该段的 `[ip_ranges.policy]` 块，保存。热加载后该段所有 LIMITED 流立即恢复 NORMAL，GCRA 策略与状态一并移除 |
+| 某段的全部限速 | 删掉该段的 `[ip_ranges.policy]` 块，保存。热加载后该段所有 LIMITED 流立即恢复 NORMAL，限速策略与状态一并移除 |
 | 单台机器的限速 | 给该 IP 加一条 `[[ip_ranges.overrides]]`，把 `rx_limit`/`tx_limit` 设成极高值（如 `1Tbps`，校验上限）；或把该段拆出来不设 policy；无法用 override “删除”继承来的策略 |
 | 缩短剩余时长 | 把 `limit_duration` 改小：`limited_until` 从原始 `limited_since` 重算，算出已过期则**立即解除** |
-| 全部清零重来 | `systemctl restart vm-bandwidth-monitor`：所有窗口、限速状态、GCRA 状态清空，从基线重新观察；配置本身不变，满窗后仍可能再次触发（治标手段，不是禁用） |
+| 全部清零重来 | `systemctl restart vm-bandwidth-monitor`：所有窗口、限速状态清空，从基线重新观察；配置本身不变，满窗后仍可能再次触发（治标手段，不是禁用） |
 | 永久禁用限速 | 配置中不保留任何 `[ip_ranges.policy]`（默认 `config.toml` 就是这种状态） |
 | 等待自动解除 | 什么都不做：`limit_duration` 到期自动恢复并重新观察 |
 
@@ -326,21 +436,25 @@ range = "10.30.9.1-10.30.9.32"
 解除后想确认干净，用上面「查看」的第 3 条验证两张 map 均为 `[]` 即可。
 
 
-## 限速（GCRA）
+## 限速（数据面实现）
 
-- 唯一限速算法是 GCRA，TC eBPF 内做 policing：conforming 放行，non-conforming 丢弃
-  （`TC_ACT_SHOT`）。不引入 HTB/TBF/IFB/netem，不做队列整形。
-- 每个 `(IP, 方向)` 维护 TAT（Theoretical Arrival Time）。`increment = len×8×1e9/rate`
-  （可变包长按比特率、整数运算、防溢出）；`tolerance = burst×8×1e9/rate`。
-  `candidate = max(now, TAT) + increment`；`candidate ≤ now + tolerance` 则放行并更新
-  TAT，否则丢弃。首包初始化即放行。
-- GCRA key 只含 `(IPv4, 方向)`，不含 ifindex——同一 IP+方向在**所有 CPU、所有 TAP**
-  上共享同一速率额度。状态存于共享 `GCRA_STATE`（非 per-CPU），用 `bpf_spin_lock`
-  防止多 CPU 并发丢失更新；时间戳在加锁前取得，所有路径都释放锁。
+- 六种算法统一抽象：策略带算法标签写入 `LIMIT_POLICIES`，TC eBPF 数据面每包按
+  标签分发到对应判定逻辑；conforming 放行，non-conforming 丢弃（`TC_ACT_SHOT`）。
+  不引入 HTB/TBF/IFB/netem，不做队列整形。
+- 运行状态统一存 `LIMIT_STATE`（共享、非 per-CPU），每流三个通用 `u64` 字段，
+  各算法含义不同：令牌桶 = 令牌数/上次回填时间，漏桶 = 水位/上次漏出时间，
+  固定窗口 = 已用字节/窗口起点，滑动窗口计数器 = 前窗字节/当前窗字节/窗口起点，
+  GCRA = TAT。滑动窗口日志单独使用 `SWL_LOG`（定长 64 条的时间戳+长度环）。
+- GCRA 判定：`increment = len×8×1e9/rate`（可变包长按比特率、整数运算、防溢出）；
+  `tolerance = burst×8×1e9/rate`；`candidate = max(now, TAT) + increment`；
+  `candidate ≤ now + tolerance` 则放行并更新 TAT，否则丢弃。首包初始化即放行。
+- 限速 key 只含 `(IPv4, 方向)`，不含 ifindex——同一 IP+方向在**所有 CPU、所有 TAP**
+  上共享同一速率额度。状态用 `bpf_spin_lock` 防止多 CPU 并发丢失更新；时间戳在
+  加锁前取得，锁内不做任何 helper 调用，所有路径都释放锁。
 - 策略全部由用户态决定：eBPF 不知道 IP 段、继承、窗口、百分比、时长、热加载，只认
-  `LIMIT_POLICIES` 里当前 `(IP, 方向)` 是否启用及其 `rate`/`burst`。
-- 进入/离开 LIMITED、安装/移除策略、更新速率均记录日志；任何 map/校验异常都
-  fail-open（不影响 VM 网络）。
+  `LIMIT_POLICIES` 里当前 `(IP, 方向)` 是否启用、什么算法、什么参数。
+- 进入/离开 LIMITED、安装/移除策略、更新速率、切换算法均记录日志；任何 map/校验
+  异常都 fail-open（不影响 VM 网络）。
 
 ## 热加载
 
@@ -351,7 +465,8 @@ range = "10.30.9.1-10.30.9.32"
   删白名单）→ 切换 active config 并递增 `config_generation`。
 - 校验失败：拒绝该次 reload，完整保留上一次成功配置，不清空、不中断、不退出，
   `--ui` 顶栏显示 `FAILED` 及原因，`generation` 不变。
-- LIMITED 状态下修改：`rate`/`burst` 变更立即生效并重置该方向 GCRA 状态；
+- LIMITED 状态下修改：`rate`/`burst`/`limit_window`/`algorithm` 变更立即生效并
+  重置该方向限速状态；
   `limit_duration` 变更按原 `limited_since` 重算 `limited_until`（可能立即解除）；
   删除限速配置立即恢复 NORMAL；`window` 变更清空窗口重新积累。
 - 新增/删除 IP 段同步增删 `MONITORED_IPS`，并清理对应的窗口/限速/计数器状态。
@@ -405,8 +520,8 @@ push_interval_secs = 60
 
 - **单一 eBPF 对象，挂载到所有 TAP**：对象只加载一次（验证器只跑一遍），
   `tc_ingress`/`tc_egress` 直接从 `__sk_buff` 上下文读取 ifindex，同一对程序以
-  TCX/netlink 链接挂到每个 TAP；四份 map（白名单、计数、限速策略、GCRA 状态）
-  全部为 BTF 定义、天然共享，不 pin，随 daemon 生命周期存在。
+  TCX/netlink 链接挂到每个 TAP；五份 map（白名单、计数、限速策略、限速状态、
+  滑窗日志）全部为 BTF 定义、天然共享，不 pin，随 daemon 生命周期存在。
 - 挂载/卸载由 `AttachManager` 负责：丢弃某个链接即移除**且仅移除**本程序创建的
   TC filter；不动 `fq_codel`/`noqueue`，不清理其他程序的 filter。
 - 计数为单调累计值，用户态按相邻采样差值计算速率；计数回绕/复位或 TAP 重建时该周期
@@ -423,6 +538,6 @@ push_interval_secs = 60
 - `map_max_entries` 耗尽时新的计数键不再计数、新的限速策略无法安装（数据包仍放行，
   记日志）。
 - 累计流量自本次启动起计（每次启动重建 map）。
-- GCRA 是 policing：超限直接丢包，不做缓冲/整形；对被限流方表现为丢包重传。
+- 限速是 policing：超限直接丢包，不做缓冲/整形；对被限流方表现为丢包重传。
 - 窗口采样粒度 = `refresh_interval_ms`；窗口长度超过 `3600 × 采样粒度` 时会截断到该
   上限（极长窗口场景）。

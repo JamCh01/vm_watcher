@@ -4,7 +4,7 @@ bridge = "br0"
 [collector]
 refresh_interval_ms = 1000        # 采样周期（也是限速窗口的采样粒度）
 interface_scan_interval_secs = 5  # TAP 重扫周期
-map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / GCRA_STATE map 容量
+map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / LIMIT_STATE / SWL_LOG map 容量
 
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
