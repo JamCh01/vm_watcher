@@ -54,6 +54,8 @@ struct Engine {
     last_reload_at: String,
     last_reload_ok: bool,
     last_reload_error: String,
+    /// Raw bytes of the last successfully applied config (dedup spurious triggers).
+    last_config_bytes: Vec<u8>,
 
     bridge: String,
     manager: AttachManager,
@@ -162,10 +164,30 @@ impl Engine {
     /// A rejected config leaves the previous one fully in place (§28).
     fn reload(&mut self, path: &Path) {
         log::info!("config reload requested");
+
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.last_reload_at = format_unix_utc(now_unix());
+                self.last_reload_ok = false;
+                self.last_reload_error = format!("cannot read {}: {e}", path.display());
+                log::warn!("config reload rejected: {e}");
+                return;
+            }
+        };
+        // Spurious triggers (touch, identical re-save): nothing to do.
+        if bytes == self.last_config_bytes {
+            log::debug!("config unchanged; nothing to reload");
+            return;
+        }
         let stamp = format_unix_utc(now_unix());
         self.last_reload_at = stamp.clone();
 
-        let new_cfg = match config::load(path) {
+        let new_cfg = match String::from_utf8(bytes.clone())
+            .map_err(|e| format!("config is not valid UTF-8: {e}"))
+            .and_then(|text| {
+                config::parse(&text).map_err(|e| format!("{e} (in {})", path.display()))
+            }) {
             Ok(cfg) => cfg,
             Err(e) => {
                 self.last_reload_ok = false;
@@ -189,6 +211,7 @@ impl Engine {
         self.last_reload_ok = true;
         self.last_reload_error.clear();
         self.config_loaded_at = stamp;
+        self.last_config_bytes = bytes;
         log::info!("config reload succeeded; generation {}", self.generation);
     }
 
@@ -338,6 +361,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
 
     // 1. Load and validate the initial config. Refuse to start on any problem.
     let cfg = config::load(&config_path).map_err(anyhow::Error::msg)?;
+    let initial_config_bytes = std::fs::read(&config_path)?;
     log::info!(
         "loaded {} IP range(s) for bridge {}",
         cfg.ranges.len(),
@@ -432,6 +456,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_reload_at: String::new(),
         last_reload_ok: true,
         last_reload_error: String::new(),
+        last_config_bytes: initial_config_bytes,
         bridge: cfg.bridge.clone(),
         manager,
         taps,
@@ -615,9 +640,20 @@ fn spawn_watcher(path: PathBuf, reload_tx: mpsc::Sender<()>) -> Result<Recommend
             if !touches_config {
                 continue;
             }
-            // Debounce: absorb the burst of events a single save produces.
-            std::thread::sleep(Duration::from_millis(RELOAD_DEBOUNCE_MS));
-            while rx.try_recv().is_ok() {}
+            // Trailing-edge debounce: keep absorbing events as long as they keep
+            // arriving within the window, then fire one reload once things go quiet.
+            // A single save (open/write/close, atomic rename, multi-chunk writes)
+            // collapses to one reload.
+            loop {
+                std::thread::sleep(Duration::from_millis(RELOAD_DEBOUNCE_MS));
+                let mut more = false;
+                while rx.try_recv().is_ok() {
+                    more = true;
+                }
+                if !more {
+                    break;
+                }
+            }
             if reload_tx.blocking_send(()).is_err() {
                 break;
             }
