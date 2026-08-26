@@ -125,6 +125,149 @@ range = "10.30.8.1-10.30.8.16"
 - 触发线 = `threshold × trigger_ratio`。判定的是**过去完整 `window` 的平均带宽**，
   不是瞬时采样；窗口观察满后才允许首次触发。
 
+## 限速策略配置详解
+
+### 快速开始：给一个段启用限速
+
+在对应的 `[[ip_ranges]]` 下加一个 `[ip_ranges.policy]` 块，保存即热生效（无需重启）：
+
+```toml
+[[ip_ranges]]
+name = "VM-Network-1"
+range = "10.30.8.1-10.30.8.16"
+
+  [ip_ranges.policy]
+  rx_threshold   = "1Gbps"    # RX 持续超过触发线就限速（阈值）
+  tx_threshold   = "500Mbps"  # TX 同理，两个方向完全独立判定
+  window         = "5m"       # 观察窗口：用过去完整 5 分钟的平均带宽判断
+  trigger_ratio  = "80%"      # 触发线 = threshold × 80%（RX 即 800Mbps）
+  rx_limit       = "500Mbps"  # 触发后 RX 被 GCRA 限制到的速率
+  tx_limit       = "200Mbps"  # 触发后 TX 被限制到的速率
+  limit_duration = "30m"      # 限速持续 30 分钟，到期自动恢复并重新观察
+  burst          = "4MiB"     # 允许的瞬时突发量（约 4MiB 的积压额度）
+```
+
+**不写 `[ip_ranges.policy]` = 该段只监控、不限速。** 想关闭限速，把 policy 块删掉保存即可，
+热加载会立即移除该段所有流的限速并恢复 NORMAL。
+
+### 字段说明
+
+| 字段 | 归属 | 含义 | 单位 | 约束 |
+| --- | --- | --- | --- | --- |
+| `rx_threshold` / `tx_threshold` | 方向独立 | 阈值，与 `trigger_ratio` 相乘得到触发线 | `100Mbps`/`1Gbps` 等 | 100Kbps – 1Tbps |
+| `rx_limit` / `tx_limit` | 方向独立 | 触发后被限制到的速率（GCRA policer 的目标速率） | 同上 | 100Kbps – 1Tbps |
+| `window` | 两方向共用 | 滑动观察窗口长度 | `30s`/`5m`/`1h` | > 0；窗口 > 3600 个采样时截断到 3600 个采样 |
+| `trigger_ratio` | 两方向共用 | 触发线占阈值的百分比 | `80%` | 1% – 100% |
+| `limit_duration` | 两方向共用 | 触发后限速持续多久，到期自动解除 | `30s`/`30m`/`1h` | > 0 |
+| `burst` | 两方向共用 | GCRA 突发容忍量（字节） | `1MiB`/`4MiB` 等（二进制） | ≤ 1GiB |
+
+- 所有值一律整数，不接受浮点（`1.5Gbps` 会被拒绝，请写 `1500Mbps`）。
+- 某方向只写了部分字段（例如有 `rx_threshold` 却没有 `rx_limit` 或 `window`）视为不完整策略，
+  整份配置被拒绝加载并保持旧配置。
+- 速率与突发的上下界是为了保证 eBPF 数据面的整数运算永不回绕，超出会被校验拒绝。
+
+### 触发语义（何时进入限速）
+
+对每个 `(IP, 方向)` 独立判定（RX 与 TX 互不影响，绝不用 RX+TX 合计）：
+
+1. 触发线 = `threshold × trigger_ratio`（如 `1Gbps × 80% = 800Mbps`）。
+2. daemon 每秒采样一次字节增量，维护该流的环形滑动窗口；
+   窗口平均 = `窗口内总字节 × 8 ÷ 实际观察时长`。
+3. **只有窗口观察满整个 `window` 之后**，且窗口平均 ≥ 触发线，才进入 LIMITED。
+   瞬时尖峰、窗口未满都不会触发。
+4. 计数回绕 / TAP 重建 / 策略刚挂上：按零差值处理，不会产生虚假触发。
+5. 触发后立即向 eBPF 下发该 `(IP, 方向)` 的 GCRA 策略（`rx_limit`/`tx_limit` + `burst`），
+   并记录 `limited_since` / `limited_until`（`--ui` 详情页可见状态与剩余秒数）。
+
+### 限速语义（触发之后发生什么）
+
+- GCRA 在 TC eBPF 数据面执行 **policing**：符合速率的包放行，超出即**直接丢弃**
+  （`TC_ACT_SHOT`）；不做队列整形（没有 HTB/TBF/netem）。被限流的 VM 表现为丢包重传，
+  TCP 会收敛到限速值附近（真机实测 500+Mbit/s 的流被精确压在 ~202Mbit/s）。
+- `burst` 是瞬时容忍量：空闲后重新来流量时，可以先放出约 `burst` 大小的数据再进入严格限速。
+- 持续 `limit_duration` 后**自动解除**：移除 GCRA 策略、清空该方向的观察窗口、回到 NORMAL，
+  从零重新积累满窗口。若流量仍超触发线，会在满窗后再次触发（这是预期行为）。
+- 限速只作用于触发的方向：RX 触发不影响 TX（反之亦然）。
+- 监控计数点在限速点之前：`--ui` 里 LIMITED 流的窗口均值反映的是“需求量”，
+  实际交付速率请看限速值或抓包。
+
+### IP 级覆盖（单台机器例外）
+
+IP 默认继承所属段的 `policy`。需要给个别机器不同待遇时，用
+`[[ip_ranges.overrides]]`（必须写在它所属的 `[[ip_ranges]]` 块内部）：
+
+```toml
+  # 10.30.8.3 是付费升级用户：阈值和限速更高，窗口/时长/突发继承段策略
+  [[ip_ranges.overrides]]
+  ip = "10.30.8.3"
+  rx_threshold = "2Gbps"
+  rx_limit = "800Mbps"
+
+  # 10.30.8.7 是问题机器：完全不参与限速（注意：覆盖里无法“关掉继承”，
+  # 若要豁免单台，把它的段拆出来单独不设 policy，或把 threshold 调高）
+```
+
+- 合并规则：**字段级合并，写了的覆盖、没写的继承**（段 policy 为底，override 逐字段覆盖）。
+- override 的 IP 必须落在所属段范围内，同一段内同一 IP 不可重复。
+- 删除某个 override 后，该 IP 立即回落为继承段策略（热加载生效）。
+- 段没有 `policy` 时，单独的 override 无法补齐共用字段，会被拒绝（不完整策略）。
+
+### 热加载时修改限速参数的行为（运行中直接改，无需重启）
+
+| 修改 | 行为 |
+| --- | --- |
+| LIMITED 中改 `rx_limit`/`tx_limit` | 立即按新速率限速，同时重置该方向 GCRA 的 TAT（旧速率的状态不污染新参数） |
+| LIMITED 中改 `burst` | 立即生效 + 重置 GCRA 状态 |
+| LIMITED 中改 `limit_duration` | 从原始 `limited_since` 重算 `limited_until`；若算出已过期则**立即解除** |
+| 改 `window` | 该流的观察窗口清空、重新积累满窗（旧窗口数据不迁移） |
+| 改 `threshold` / `trigger_ratio` | 保留当前窗口，下一次评估用新触发线 |
+| 删除 policy / override | 立即移除对应限速、恢复 NORMAL；override 删除则回落继承 |
+| 新增段 / 删除段 | 同步增删白名单与监控状态；删除段会清理其限速、GCRA 状态和窗口 |
+| 改 `network.bridge` | **不支持热加载**，校验直接拒绝，需要重启进程 |
+| 任何非法配置 | 整份拒绝：保持上一次成功配置（last-known-good），不中断监控与限速，`--ui` 顶栏显示 FAILED 与原因 |
+
+### 参数设置建议与完整示例
+
+- **先观察再设阈值**：先不设 policy 运行一段时间，用 `--ui` 看各段的常态流量，
+  把 `threshold` 设在“正常水位的上限”，`trigger_ratio` 用 80% 留余量。
+- `limit` 通常设在 `threshold × trigger_ratio` 以下（触发线附近或更低），
+  否则限了也看不出效果。
+- `window` 越短响应越快、越容易误伤突发业务；越长越稳。通用起点 `5m`。
+- `limit_duration` 是“处罚时长”，不是整形时长；想长期压住就把时长设长，
+  或配合告警人工处理。
+- `burst` 给 1–4MiB 即可：太小会误伤正常突发（如 HTTP 请求头、心跳），太大则限速手感变软。
+- 验证效果：`--ui` 详情页看状态/剩余时间，配合宿主机上对该机器 TAP 抓包测交付速率。
+
+一个混合示例（段级策略 + 单 IP 例外 + 纯监控段）：
+
+```toml
+[[ip_ranges]]
+name = "Standard"
+range = "10.30.8.1-10.30.8.64"
+
+  [ip_ranges.policy]
+  rx_threshold = "800Mbps"
+  tx_threshold = "400Mbps"
+  window = "5m"
+  trigger_ratio = "80%"
+  rx_limit = "400Mbps"
+  tx_limit = "200Mbps"
+  limit_duration = "30m"
+  burst = "4MiB"
+
+  # 单台高配机器放宽
+  [[ip_ranges.overrides]]
+  ip = "10.30.8.10"
+  rx_threshold = "2Gbps"
+  tx_threshold = "1Gbps"
+  rx_limit = "1Gbps"
+  tx_limit = "500Mbps"
+
+[[ip_ranges]]
+name = "Internal"
+range = "10.30.9.1-10.30.9.32"
+# 不写 policy：只监控，不限速
+
 ## 限速（GCRA）
 
 - 唯一限速算法是 GCRA，TC eBPF 内做 policing：conforming 放行，non-conforming 丢弃

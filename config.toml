@@ -2,49 +2,40 @@
 bridge = "br0"
 
 [collector]
-refresh_interval_ms = 1000        # 采样/刷新周期（也是限速窗口的采样粒度）
+refresh_interval_ms = 1000        # 采样周期（也是限速窗口的采样粒度）
 interface_scan_interval_secs = 5  # TAP 重扫周期
 map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / GCRA_STATE map 容量
 
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
 
-# ============ IP 段 + 限速策略 ============
+# ============================================================
+# 默认配置：仅监控带宽，不启用任何限速策略（各段都不写 [ip_ranges.policy]）。
 #
-# policy 可选：不写 = 只监控不限速。
-# 单位：速率 100Mbps/1Gbps；时长 5m/30m/1h；百分比 80%；突发 4MiB。
-# rx_threshold/tx_threshold、rx_limit/tx_limit 按方向独立；
-# window、trigger_ratio、limit_duration、burst 两个方向共用。
-# 只配置部分字段（不完整）会被拒绝加载。
+# 需要限速时，给对应段加上 [ip_ranges.policy] 块并保存即可热生效（无需重启）：
 #
-# [[ip_ranges.overrides]] 覆盖单个 IP：未写的字段继承所属段的 policy；
-# override 的 IP 必须位于所属段范围内。
+#   [[ip_ranges]]
+#   name = "VM-Network-1"
+#   range = "10.30.8.1-10.30.8.16"
+#
+#     [ip_ranges.policy]
+#     rx_threshold   = "1Gbps"    # 阈值（方向独立）
+#     tx_threshold   = "500Mbps"
+#     window         = "5m"       # 滑动观察窗口（两方向共用）
+#     trigger_ratio  = "80%"      # 触发线 = threshold × ratio
+#     rx_limit       = "500Mbps"  # 触发后限制到的速率（方向独立）
+#     tx_limit       = "200Mbps"
+#     limit_duration = "30m"      # 限速持续时间，到期自动恢复
+#     burst          = "4MiB"     # GCRA 瞬时突发容忍量
+#
+# 单台机器例外用 [[ip_ranges.overrides]]（写在所属段内部，未写字段继承段策略）。
+# 完整字段说明、触发语义、热加载行为见 README「限速策略配置详解」。
+# ============================================================
 
 [[ip_ranges]]
 name = "VM-Network-1"
 range = "10.30.8.1-10.30.8.16"
 
-  [ip_ranges.policy]
-  rx_threshold = "1Gbps"        # RX 阈值（窗口平均达到 trigger 线即触发）
-  tx_threshold = "500Mbps"      # TX 阈值
-  window = "5m"                 # 滑动观察窗口
-  trigger_ratio = "80%"         # 触发线 = threshold × 80%
-  rx_limit = "500Mbps"          # 触发后 GCRA 限速值
-  tx_limit = "200Mbps"
-  limit_duration = "30m"        # 限速持续时间，到期自动恢复
-  burst = "4MiB"                # GCRA 突发容忍量
-
-  # 单 IP 覆盖示例：10.30.8.3 用更高的阈值/限速，其余字段继承段策略
-  [[ip_ranges.overrides]]
-  ip = "10.30.8.3"
-  rx_threshold = "2Gbps"
-  rx_limit = "800Mbps"
-
 [[ip_ranges]]
 name = "VM-Network-2"
 range = "10.30.9.1-10.30.9.32"
-# 无 policy：仅监控带宽，不限速
-
-[[ip_ranges]]
-name = "VM-Network-3"
-range = "192.168.100.10-192.168.100.50"
