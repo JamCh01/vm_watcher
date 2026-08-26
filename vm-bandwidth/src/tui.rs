@@ -294,20 +294,20 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
     // Wide terminals get every column; narrower ones drop to progressively compact
     // layouts instead of overlapping cells. Widths sum + gaps + border must fit.
     let cols = match chunks[1].width {
-        w if w >= 134 => DetailCols::Wide,
-        w if w >= 100 => DetailCols::Mid,
+        w if w >= 138 => DetailCols::Wide,
+        w if w >= 101 => DetailCols::Mid,
         _ => DetailCols::Min,
     };
     let (widths, headers): (&[Constraint], &[&str]) = match cols {
         DetailCols::Wide => (
             &[
                 Constraint::Length(15),
-                Constraint::Length(11),
-                Constraint::Length(11),
+                Constraint::Length(12),
+                Constraint::Length(12),
                 Constraint::Length(10),
                 Constraint::Length(10),
-                Constraint::Length(11),
-                Constraint::Length(11),
+                Constraint::Length(12),
+                Constraint::Length(12),
                 Constraint::Length(9),
                 Constraint::Length(9),
                 Constraint::Length(8),
@@ -322,8 +322,8 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
         DetailCols::Mid => (
             &[
                 Constraint::Length(15),
-                Constraint::Length(10),
-                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(12),
                 Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Length(9),
@@ -338,8 +338,8 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
         DetailCols::Min => (
             &[
                 Constraint::Length(15),
-                Constraint::Length(10),
-                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(12),
                 Constraint::Length(6),
             ],
             &["IPv4", "RX", "TX", "St"],
@@ -524,7 +524,9 @@ fn sparkline(points: &[(i64, f64)], width: usize) -> (String, f64, f64, f64) {
         .max(1e-9);
     let min = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let avg = points.iter().map(|p| p.1).sum::<f64>() / points.len() as f64;
-    let n = width.max(1);
+    // One bucket per point when the series is shorter than the chart width, so
+    // bars stay contiguous instead of scattering across empty space.
+    let n = width.max(1).min(points.len().max(1));
     let mut cols = vec![0.0f64; n];
     let mut cnt = vec![0u32; n];
     for (i, p) in points.iter().enumerate() {
