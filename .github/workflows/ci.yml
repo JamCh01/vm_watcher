@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# GitHub-hosted runners only ship Ubuntu; the jobs below run inside a
+# debian:trixie container, so every step executes on Debian trixie.
+#
+# Two jobs:
+#   userspace - fmt / clippy / tests with stable Rust. AYA_BUILD_SKIP=1 skips the
+#               eBPF compile (needs nightly + bpf-linker), so this job stays fast.
+#   ebpf      - full build including the eBPF object: pinned nightly (whose LLVM
+#               matches bpf-linker's LLVM 22), rust-src, and llvm-22 from apt.llvm.org.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  userspace:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    timeout-minutes: 30
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates xz-utils build-essential pkg-config
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Must run after the toolchain is selected (keys include the rustc version).
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: AYA_BUILD_SKIP=1 cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: AYA_BUILD_SKIP=1 cargo test
+
+  ebpf:
+    name: eBPF build
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    timeout-minutes: 60
+    steps:
+      - name: Install system dependencies and LLVM 22
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates xz-utils wget gnupg lsb-release \
+            build-essential pkg-config
+          # apt.llvm.org hosts LLVM 22 for trixie; the pinned nightly's LLVM
+          # (22.1.x) must not be newer than bpf-linker's LLVM or the bitcode
+          # fails to link ("Invalid record").
+          wget -qO- https://apt.llvm.org/llvm.sh | bash -s -- 22
+          apt-get install -y --no-install-recommends \
+            llvm-22-dev libclang-22-dev libpolly-22-dev
+
+      - uses: actions/checkout@v7
+
+      # Pinned nightly: its LLVM version must stay compatible with bpf-linker.
+      - uses: dtolnay/rust-toolchain@nightly-2026-06-15
+        with:
+          components: rust-src, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache bpf-linker
+        id: cache-bpf-linker
+        uses: actions/cache@v4
+        with:
+          path: /root/.cargo/bin/bpf-linker
+          key: bpf-linker-0.11.0-llvm22-${{ runner.arch }}
+
+      - name: Install bpf-linker
+        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          # Default features track the newest LLVM; pin llvm-22 to match apt's LLVM 22.
+          LLVM_PREFIX=/usr/lib/llvm-22 cargo +stable install bpf-linker \
+            --version 0.11.0 --locked --no-default-features --features llvm-22
+
+      - name: Clippy eBPF crate (deny warnings)
+        run: |
+          cargo +nightly-2026-06-15 clippy -p vm-bandwidth-ebpf \
+            --target bpfel-unknown-none -Z build-std=core -- -D warnings
+
+      - name: Build release binary (including eBPF object)
+        run: VM_BW_EBPF_TOOLCHAIN=nightly-2026-06-15 cargo build --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-bandwidth-monitor-linux-x86_64
+          path: target/release/vm-bandwidth-monitor

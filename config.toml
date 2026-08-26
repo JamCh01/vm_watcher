@@ -1,0 +1,24 @@
+[network]
+bridge = "br0"
+
+[collector]
+refresh_interval_ms = 1000
+interface_scan_interval_secs = 5
+map_max_entries = 8192
+
+[display]
+show_interface = false
+show_packets = false
+default_sort = "ip"
+
+[[ip_ranges]]
+name = "VM-Network-1"
+range = "10.30.8.1-10.30.8.16"
+
+[[ip_ranges]]
+name = "VM-Network-2"
+range = "10.30.9.1-10.30.9.32"
+
+[[ip_ranges]]
+name = "VM-Network-3"
+range = "192.168.100.10-192.168.100.50"

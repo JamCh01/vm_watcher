@@ -1,0 +1,12 @@
+[workspace]
+members = ["vm-bandwidth", "vm-bandwidth-common", "vm-bandwidth-ebpf"]
+resolver = "2"
+default-members = ["vm-bandwidth", "vm-bandwidth-common"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release.package.vm-bandwidth-ebpf]
+debug = 2
+codegen-units = 1

@@ -1,0 +1,16 @@
+[package]
+name = "vm-bandwidth-ebpf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aya-ebpf = "0.2"
+network-types = "0.2"
+vm-bandwidth-common = { path = "../vm-bandwidth-common" }
+
+[build-dependencies]
+which = { version = "8", default-features = false, features = ["real-sys"] }
+
+[[bin]]
+name = "vm-bandwidth"
+path = "src/main.rs"
