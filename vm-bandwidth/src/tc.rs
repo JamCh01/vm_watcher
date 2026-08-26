@@ -127,16 +127,32 @@ impl AttachManager {
             .attach(&tap.name, TcAttachType::Ingress)
             .with_context(|| format!("attaching TC ingress on {}", tap.name))?;
 
-        let egress: &mut SchedClassifier = self
+        // If anything below fails, the ingress link must not be left attached
+        // unrecorded: a retry would attach a second one and double-count the TAP.
+        let egress_result = self
             .bpf
             .program_mut(PROGRAM_EGRESS)
-            .context("tc_egress missing")?
-            .try_into()?;
-        let egress_link = egress
-            .attach(&tap.name, TcAttachType::Egress)
-            .with_context(|| format!("attaching TC egress on {}", tap.name))?;
-
-        Ok((ingress_link, egress_link))
+            .context("tc_egress missing")
+            .and_then(|p| -> anyhow::Result<&mut SchedClassifier> { Ok(p.try_into()?) })
+            .and_then(|egress| {
+                egress
+                    .attach(&tap.name, TcAttachType::Egress)
+                    .with_context(|| format!("attaching TC egress on {}", tap.name))
+            });
+        match egress_result {
+            Ok(egress_link) => Ok((ingress_link, egress_link)),
+            Err(e) => {
+                if let Ok(ingress) = self
+                    .bpf
+                    .program_mut(PROGRAM_INGRESS)
+                    .context("tc_ingress missing")
+                    .and_then(|p| -> anyhow::Result<&mut SchedClassifier> { Ok(p.try_into()?) })
+                {
+                    let _ = ingress.detach(ingress_link);
+                }
+                Err(e)
+            }
+        }
     }
 
     fn detach(&mut self, name: &str) {

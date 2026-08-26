@@ -219,6 +219,36 @@ impl Deref for ValidatedRange {
     }
 }
 
+/// Arithmetic-safe bounds for rates and burst.
+///
+/// The eBPF GCRA data path computes `burst_bytes * 8 * 1e9` in `u64`, so `burst` is
+/// capped so that product cannot wrap; rates are bounded to keep every derived number
+/// (increment, tolerance, deadline) provably inside `u64` for any packet length.
+const MIN_RATE_BPS: u64 = 100_000; // 100 Kbps
+const MAX_RATE_BPS: u64 = 1_000_000_000_000; // 1 Tbps
+const MAX_BURST_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> {
+    for (name, value) in [
+        ("rx_threshold", fields.rx_threshold_bps),
+        ("tx_threshold", fields.tx_threshold_bps),
+        ("rx_limit", fields.rx_limit_bps),
+        ("tx_limit", fields.tx_limit_bps),
+    ] {
+        if let Some(v) = value {
+            if !(MIN_RATE_BPS..=MAX_RATE_BPS).contains(&v) {
+                return Err(format!("{what}: {name} must be between 100Kbps and 1Tbps"));
+            }
+        }
+    }
+    if let Some(b) = fields.burst_bytes {
+        if b > MAX_BURST_BYTES {
+            return Err(format!("{what}: burst must be at most 1GiB"));
+        }
+    }
+    Ok(())
+}
+
 /// Config after full validation; everything downstream consumes this.
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {
@@ -281,7 +311,11 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     for (entry, range) in config.ip_ranges.iter().zip(ranges) {
         let scope = format!("range {}", entry.name);
         let policy = match &entry.policy {
-            Some(p) if !p.is_empty() => p.clone().into_fields(&scope)?,
+            Some(p) if !p.is_empty() => {
+                let fields = p.clone().into_fields(&scope)?;
+                check_policy_bounds(&fields, &scope)?;
+                fields
+            }
             _ => PolicyFields::default(),
         };
 
@@ -313,6 +347,7 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
                 .policy
                 .clone()
                 .into_fields(&format!("{scope} override {}", ov.ip))?;
+            check_policy_bounds(&fields, &format!("{scope} override {}", ov.ip))?;
             // The merged result must be complete (inheritance fills what is missing).
             policy::resolve(&policy, Some(&fields), &format!("{} ip {}", scope, ov.ip))?;
             if overrides.insert(ip, fields).is_some() {
@@ -491,6 +526,26 @@ range = "10.0.0.1-10.0.0.2"
         let text = POLICY_EXAMPLE.replace("1Gbps", "1Xbps");
         let err = load_str(&text).unwrap_err();
         assert!(err.contains("unknown unit"), "{err}");
+    }
+
+    #[test]
+    fn out_of_bounds_rate_rejected() {
+        // 2000Gbps = 2e12 bps > MAX_RATE_BPS (1 Tbps).
+        let text = POLICY_EXAMPLE.replace("rx_limit = \"500Mbps\"", "rx_limit = \"2000Gbps\"");
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("between 100Kbps and 1Tbps"), "{err}");
+
+        // 50Kbps < MIN_RATE_BPS (100 Kbps).
+        let text = POLICY_EXAMPLE.replace("rx_threshold = \"1Gbps\"", "rx_threshold = \"50Kbps\"");
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("between 100Kbps and 1Tbps"), "{err}");
+    }
+
+    #[test]
+    fn oversized_burst_rejected() {
+        let text = POLICY_EXAMPLE.replace("burst = \"4MiB\"", "burst = \"2GiB\"");
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("at most 1GiB"), "{err}");
     }
 
     #[test]

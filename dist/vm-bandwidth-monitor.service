@@ -6,6 +6,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/vm-bandwidth-monitor --config /etc/vm-bandwidth-monitor/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 # One fd set per attached TAP (program/map/link fds); large hosts need headroom.

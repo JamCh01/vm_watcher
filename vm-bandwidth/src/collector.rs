@@ -95,6 +95,12 @@ impl Collector {
         self.prev.retain(|key, _| keep.contains(&key.ipv4));
     }
 
+    /// Drop previous-sample entries for TAPs that no longer exist (pairs that can never
+    /// produce a delta again).
+    pub fn prune_ifindexes(&mut self, live: &HashSet<u32>) {
+        self.prev.retain(|key, _| live.contains(&key.ifindex));
+    }
+
     pub fn poll(
         &mut self,
         traffic: &PerCpuHashMap<MapData, TrafficKey, TrafficValue>,

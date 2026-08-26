@@ -153,6 +153,12 @@ impl Limiter {
         self.ranges = new_ranges;
         self.overrides = new_overrides;
 
+        // Baselines for IPs that no longer have any policy are dead weight (§33). If a
+        // policy comes back for such an IP later it starts from a fresh baseline, which
+        // is the same semantics as any newly added policy.
+        self.prev_totals
+            .retain(|ip, _| lookup(&self.ranges, &self.overrides, *ip).is_some());
+
         for flow in limited {
             let (ip, dir) = flow;
             let new_dir = lookup(&self.ranges, &self.overrides, ip).and_then(|p| match dir {

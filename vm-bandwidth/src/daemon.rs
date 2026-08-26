@@ -96,7 +96,29 @@ impl Engine {
                 if added > 0 || failed > 0 {
                     log::info!("scan: {added} attached, {failed} failed");
                 }
-                self.taps = self.manager.taps();
+                let new_taps = self.manager.taps();
+                let new_ifindexes: std::collections::HashSet<u32> =
+                    new_taps.iter().map(|t| t.ifindex).collect();
+                let old_ifindexes: std::collections::HashSet<u32> =
+                    self.taps.iter().map(|t| t.ifindex).collect();
+                if new_ifindexes != old_ifindexes {
+                    // Drop counters of vanished TAPs so the TRAFFIC map does not fill up
+                    // with dead (ifindex, IP) keys as VMs churn (§33).
+                    let mut stale = Vec::new();
+                    for (key, _) in self.traffic.iter().flatten() {
+                        if !new_ifindexes.contains(&key.ifindex) {
+                            stale.push(key);
+                        }
+                    }
+                    for key in &stale {
+                        let _ = self.traffic.remove(key);
+                    }
+                    if !stale.is_empty() {
+                        log::debug!("pruned {} stale TRAFFIC key(s)", stale.len());
+                    }
+                    self.collector.prune_ifindexes(&new_ifindexes);
+                }
+                self.taps = new_taps;
             }
             Err(e) => log::warn!("TAP scan failed: {e}"),
         }
@@ -221,6 +243,13 @@ impl Engine {
 
     /// Apply an already-validated config: reconcile whitelist, policies and limiter state.
     fn apply_config(&mut self, new_cfg: ValidatedConfig) -> Result<()> {
+        if new_cfg.bridge != self.bridge {
+            anyhow::bail!(
+                "changing network.bridge ({} -> {}) is not supported by hot reload;                  restart the daemon instead",
+                self.bridge,
+                new_cfg.bridge
+            );
+        }
         let now = self.now_secs();
         let old_ips = ip_set(&self.cfg);
         let new_ips = ip_set(&new_cfg);
