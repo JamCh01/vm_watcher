@@ -73,6 +73,12 @@ pub struct UiState {
     pub sort: SortMode,
     pub show_help: bool,
     pub trend: Option<TrendView>,
+    /// Sender for async trend-fetch results: (sequence, result).
+    pub trend_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, Result<TrendData, String>)>>,
+    /// Handle of the small runtime driving the async trend fetches.
+    pub trend_rt: Option<tokio::runtime::Handle>,
+    /// Sequence of the latest in-flight trend fetch; stale results are dropped.
+    pub trend_seq: u64,
     /// `[metrics]` section from config.toml (trend queries go straight to VM).
     pub metrics_enabled: bool,
     pub metrics_url: String,
@@ -94,6 +100,9 @@ impl UiState {
             sort,
             show_help: false,
             trend: None,
+            trend_tx: None,
+            trend_rt: None,
+            trend_seq: 0,
             metrics_enabled: false,
             metrics_url: String::new(),
             rate_window_secs: 120,

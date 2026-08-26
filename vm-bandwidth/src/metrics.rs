@@ -7,11 +7,15 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use vm_bandwidth_core::limiter::IpTotals;
 
-use crate::http;
+const TIMEOUT: Duration = Duration::from_secs(5);
+/// Response bodies above this are refused: replies here are small status/error
+/// documents, and a misbehaving server must not grow memory unbounded.
+const MAX_RESPONSE_BODY: usize = 1 << 20;
 
 /// Escape a Prometheus label value (backslash, double quote, newline).
 fn escape_label(v: &str) -> String {
@@ -59,13 +63,50 @@ pub fn render_prom_lines(
     out
 }
 
+/// Shared HTTP client. reqwest pools connections and recommends reusing one
+/// instance; the daemon builds it once and hands it to every push.
+pub fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .expect("failed to build the HTTP client")
+}
+
+/// Read a response body with a hard cap.
+pub async fn body_capped(mut resp: reqwest::Response) -> Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("reading response body")? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BODY {
+            bail!("response body exceeds {MAX_RESPONSE_BODY} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Push one payload to `{base_url}/api/v1/import/prometheus`.
-pub fn push(base_url: &str, lines: &str) -> Result<()> {
+pub async fn push(client: &reqwest::Client, base_url: &str, lines: &str) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
     let url = format!("{base_url}/api/v1/import/prometheus");
-    http::post(&url, "text/plain; charset=utf-8", lines)
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(lines.to_string())
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = body_capped(resp).await.unwrap_or_default();
+        bail!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(200).collect::<String>()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

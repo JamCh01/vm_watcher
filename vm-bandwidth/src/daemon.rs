@@ -1,5 +1,6 @@
 //! Long-running daemon: eBPF lifecycle, traffic collection, rolling-window threshold
-//! evaluation, GCRA limit enforcement, config hot reload and the read-only IPC server.
+//! evaluation, rate-limit enforcement with selectable algorithms, config hot reload and
+//! the read-only IPC server.
 //!
 //! A single "engine" task owns every mutable piece of state (eBPF maps, TAP attachments,
 //! the collector, the limiter). Everything else — the IPC server, the file watcher, signal
@@ -77,6 +78,8 @@ struct Engine {
     /// the `sliding_window_log` algorithm.
     swl_log: AyaHashMap<MapData, LimitKey, SwlRing>,
     traffic: PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
+    /// Shared HTTP client for the VictoriaMetrics push.
+    http: reqwest::Client,
 
     epoch: std::time::Instant,
 }
@@ -98,7 +101,7 @@ impl Engine {
 
     /// Push cumulative per-IP counters to VictoriaMetrics (no-op when disabled).
     /// A push failure is logged and skipped; the next interval simply retries.
-    fn push_metrics(&self) {
+    async fn push_metrics(&self) {
         if !self.cfg.metrics_enabled {
             return;
         }
@@ -111,7 +114,7 @@ impl Engine {
         if lines.is_empty() {
             return;
         }
-        if let Err(e) = crate::metrics::push(&self.cfg.metrics_url, &lines) {
+        if let Err(e) = crate::metrics::push(&self.http, &self.cfg.metrics_url, &lines).await {
             log::warn!("metrics push to {} failed: {e:#}", self.cfg.metrics_url);
         } else {
             log::debug!("metrics push: {} line(s)", lines.lines().count());
@@ -580,6 +583,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         limit_state,
         swl_log,
         traffic,
+        http: crate::metrics::client(),
         epoch: std::time::Instant::now(),
         cfg,
     };
@@ -664,7 +668,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
                     + Duration::from_secs(engine.cfg.interface_scan_interval_secs.max(1));
             }
             _ = tokio::time::sleep_until(next_push) => {
-                engine.push_metrics();
+                engine.push_metrics().await;
                 next_push = tokio::time::Instant::now()
                     + Duration::from_secs(engine.cfg.metrics_push_interval_secs.max(5));
             }

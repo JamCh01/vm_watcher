@@ -108,6 +108,18 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         }
     });
 
+    // Trend queries run on a one-worker tokio runtime with async reqwest, so the
+    // TUI keeps rendering while a fetch is in flight; results arrive on a channel.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .context("starting the trend fetch runtime")?;
+    let (trend_tx, mut trend_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, Result<tui::TrendData, String>)>();
+    app.trend_tx = Some(trend_tx);
+    app.trend_rt = Some(rt.handle().clone());
+
     let mut client = match Client::connect() {
         Ok(c) => Some(c),
         Err(e) => {
@@ -134,6 +146,23 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
             UiAction::Quit => break Ok(()),
             UiAction::Refresh => next_poll = std::time::Instant::now(),
             UiAction::Nothing => {}
+        }
+        // Collect finished trend fetches; results from superseded fetches are dropped.
+        while let Ok((seq, res)) = trend_rx.try_recv() {
+            if seq == app.trend_seq {
+                if let Some(t) = app.trend.as_mut() {
+                    match res {
+                        Ok(d) => {
+                            t.data = Some(d);
+                            t.error = None;
+                        }
+                        Err(e) => {
+                            t.data = None;
+                            t.error = Some(e);
+                        }
+                    }
+                }
+            }
         }
         if std::time::Instant::now() >= next_poll {
             poll(&mut client, &mut app);
@@ -347,20 +376,27 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
 }
 
 /// Fetch the trend for `app.trend`'s IP/window/kind straight from VictoriaMetrics.
+/// Kick off an async fetch of the trend for `app.trend`'s IP/window/kind from
+/// VictoriaMetrics. The result arrives on the trend channel; the screen shows
+/// "Loading…" while the fetch is in flight.
 fn fetch_trend(app: &mut UiState) {
     let Some(trend) = app.trend.as_mut() else {
         return;
     };
     trend.fetched_at = Some(std::time::Instant::now());
+    trend.data = None;
     trend.error = None;
 
     if !app.metrics_enabled {
         trend.error = Some(
             "metrics disabled: set [metrics] enabled = true in config.toml and restart".to_string(),
         );
-        trend.data = None;
         return;
     }
+    let (Some(res_tx), Some(rt)) = (app.trend_tx.clone(), app.trend_rt.clone()) else {
+        trend.error = Some("trend fetch runtime unavailable".to_string());
+        return;
+    };
 
     let (_, span, step) = TREND_WINDOWS[trend.win];
     let end = std::time::SystemTime::now()
@@ -380,33 +416,111 @@ fn fetch_trend(app: &mut UiState) {
         TrendKind::Bandwidth => " * 8",
         TrendKind::Packets => "",
     };
-    let query_url = |metric: &str| {
-        let query = format!(
-            "rate({metric}{{ip=\"{ip}\"}}[{}s]){scale}",
-            app.rate_window_secs
-        );
-        format!(
-            "{}/api/v1/query_range?query={}&start={start}&end={end}&step={step}",
-            app.metrics_url,
-            crate::http::percent_encode(&query)
-        )
-    };
+    let base = app.metrics_url.clone();
+    let rate_window = app.rate_window_secs;
 
-    let rx = match crate::http::get(&query_url(rx_metric)).and_then(|b| parse_series(&b)) {
-        Ok(s) => s,
-        Err(e) => {
-            trend.error = Some(format!("{e:#}"));
-            trend.data = None;
-            return;
-        }
-    };
-    match crate::http::get(&query_url(tx_metric)).and_then(|b| parse_series(&b)) {
-        Ok(tx) => trend.data = Some(tui::TrendData { rx, tx }),
-        Err(e) => {
-            trend.error = Some(format!("{e:#}"));
-            trend.data = None;
-        }
+    app.trend_seq += 1;
+    let seq = app.trend_seq;
+    rt.spawn(async move {
+        let res = fetch_pair(
+            &base,
+            rate_window,
+            ip,
+            rx_metric,
+            tx_metric,
+            scale,
+            start,
+            end,
+            step,
+        )
+        .await;
+        let _ = res_tx.send((seq, res));
+    });
+}
+
+/// Fetch the RX and TX series for one trend view.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_pair(
+    base: &str,
+    rate_window: u64,
+    ip: std::net::Ipv4Addr,
+    rx_metric: &str,
+    tx_metric: &str,
+    scale: &str,
+    start: i64,
+    end: i64,
+    step: u64,
+) -> Result<tui::TrendData, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    // Both directions in parallel: they are independent queries against the same
+    // connection pool, so the round-trip cost is paid once, not twice.
+    let (rx, tx) = tokio::try_join!(
+        fetch_series(
+            &client,
+            base,
+            rate_window,
+            ip,
+            rx_metric,
+            scale,
+            start,
+            end,
+            step
+        ),
+        fetch_series(
+            &client,
+            base,
+            rate_window,
+            ip,
+            tx_metric,
+            scale,
+            start,
+            end,
+            step
+        ),
+    )?;
+    Ok(tui::TrendData { rx, tx })
+}
+
+/// One VictoriaMetrics `query_range` request, with a capped response body.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_series(
+    client: &reqwest::Client,
+    base: &str,
+    rate_window: u64,
+    ip: std::net::Ipv4Addr,
+    metric: &str,
+    scale: &str,
+    start: i64,
+    end: i64,
+    step: u64,
+) -> Result<Series, String> {
+    let query = format!("rate({metric}{{ip=\"{ip}\"}}[{rate_window}s]){scale}");
+    let resp = client
+        .get(format!("{base}/api/v1/query_range"))
+        .query(&[
+            ("query", query),
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("step", step.to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("metrics GET failed: {e}"))?;
+    let status = resp.status();
+    let body = crate::metrics::body_capped(resp)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(200).collect::<String>()
+        ));
     }
+    parse_series(&body).map_err(|e| format!("{e:#}"))
 }
 
 /// Extract the (single) series from a VictoriaMetrics `query_range` reply.

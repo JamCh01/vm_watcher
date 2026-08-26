@@ -1,12 +1,12 @@
-//! vm-bandwidth-monitor: per-IP bandwidth accounting + GCRA rate limiting for VMs on a
-//! Linux bridge (eBPF/TC), with a long-running daemon and a read-only `--ui` client.
+//! vm-bandwidth-monitor: per-IP bandwidth accounting + rate limiting with selectable
+//! algorithms for VMs on a Linux bridge (eBPF/TC), with a long-running daemon and a
+//! read-only `--ui` client.
 //!
 //! Modes: default runs the daemon (eBPF, collection, limiting, hot reload, IPC server);
 //! `--ui` runs a ratatui client that connects to a running daemon.
 
 mod collector;
 mod daemon;
-mod http;
 mod interface;
 mod metrics;
 mod tc;
