@@ -8,6 +8,7 @@
 //! shared-mutable locking.
 
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -596,6 +597,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     // 5. IPC server.
     let _ = std::fs::remove_file(SOCK_PATH);
     let listener = UnixListener::bind(SOCK_PATH).with_context(|| format!("binding {SOCK_PATH}"))?;
+    // The socket exposes per-customer bandwidth figures: owner-only.
+    std::fs::set_permissions(SOCK_PATH, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {SOCK_PATH}"))?;
     let (ipc_tx, mut ipc_rx) = mpsc::channel::<IpcReq>(32);
     tokio::spawn(async move {
         loop {
