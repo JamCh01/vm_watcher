@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use aya::maps::{HashMap as AyaHashMap, MapData, PerCpuHashMap};
 use futures::{SinkExt, StreamExt};
+use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -633,11 +634,25 @@ fn spawn_watcher(path: PathBuf, reload_tx: mpsc::Sender<()>) -> Result<Recommend
     std::thread::spawn(move || {
         while let Ok(res) = rx.recv() {
             let Ok(event) = res else { continue };
+            // Only real content changes count: in-place writes, atomic renames onto the
+            // target, and (re)creation. Reads (OPEN/CLOSE-read — including this daemon's
+            // own reload reads), metadata touches (ATTRIB) and deletions are ignored;
+            // accepting them would make the daemon's reload re-trigger itself.
+            let content_change = matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+            ) || matches!(
+                event.kind,
+                EventKind::Create(CreateKind::File | CreateKind::Any)
+            ) || matches!(
+                event.kind,
+                EventKind::Access(AccessKind::Close(AccessMode::Write))
+            );
             let touches_config = event
                 .paths
                 .iter()
                 .any(|p| p.file_name().map(|n| n == target_name).unwrap_or(false));
-            if !touches_config {
+            if !content_change || !touches_config {
                 continue;
             }
             // Trailing-edge debounce: keep absorbing events as long as they keep
