@@ -78,8 +78,11 @@ jobs:
       - uses: actions/checkout@v7
 
       # Pinned nightly: its LLVM version must stay compatible with bpf-linker.
-      - uses: dtolnay/rust-toolchain@nightly-2026-06-15
+      # @master + explicit toolchain input because the action only keeps
+      # per-date branches for recent nightlies.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-06-15
           components: rust-src, clippy
 
       - uses: Swatinem/rust-cache@v2
