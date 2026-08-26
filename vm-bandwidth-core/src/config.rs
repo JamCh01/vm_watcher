@@ -48,6 +48,8 @@ pub struct Config {
     pub collector: CollectorConfig,
     #[serde(default)]
     pub display: DisplayConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     #[serde(default, rename = "ip_ranges")]
     pub ip_ranges: Vec<IpRangeEntry>,
 }
@@ -87,6 +89,41 @@ impl Default for CollectorConfig {
             refresh_interval_ms: default_refresh_interval_ms(),
             interface_scan_interval_secs: default_scan_interval_secs(),
             map_max_entries: default_map_max_entries(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Master switch. When disabled the daemon exports nothing and the `--ui` trend
+    /// screen explains that metrics are off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// VictoriaMetrics base URL, e.g. `http://127.0.0.1:8428`. The daemon posts to
+    /// `{url}/api/v1/import/prometheus`; the `--ui` trend screen queries
+    /// `{url}/api/v1/query_range`. Plain HTTP only (the built-in client has no TLS).
+    #[serde(default = "default_metrics_url")]
+    pub url: String,
+    /// How often cumulative per-IP counters are pushed, in seconds.
+    #[serde(default = "default_push_interval_secs")]
+    pub push_interval_secs: u64,
+}
+
+fn default_metrics_url() -> String {
+    "http://127.0.0.1:8428".to_string()
+}
+
+fn default_push_interval_secs() -> u64 {
+    60
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_metrics_url(),
+            push_interval_secs: default_push_interval_secs(),
         }
     }
 }
@@ -259,6 +296,10 @@ pub struct ValidatedConfig {
     pub show_interface: bool,
     pub show_packets: bool,
     pub default_sort: SortMode,
+    /// VictoriaMetrics export (validated `[metrics]` section).
+    pub metrics_enabled: bool,
+    pub metrics_url: String,
+    pub metrics_push_interval_secs: u64,
     pub ranges: Vec<ValidatedRange>,
 }
 
@@ -303,6 +344,26 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
             ))
         }
     };
+
+    // Metrics section: validate only what the built-in HTTP client can actually do.
+    let metrics = &config.metrics;
+    if metrics.enabled {
+        if !metrics.url.starts_with("http://") {
+            return Err(format!(
+                "metrics.url must start with http:// (no TLS support); got {:?}",
+                metrics.url
+            ));
+        }
+        if metrics.url.trim_end_matches('/').len() <= "http://".len() {
+            return Err("metrics.url must include a host".to_string());
+        }
+        if !(5..=3600).contains(&metrics.push_interval_secs) {
+            return Err(format!(
+                "metrics.push_interval_secs must be within 5..=3600; got {}",
+                metrics.push_interval_secs
+            ));
+        }
+    }
 
     let ranges = validate_ranges(&config.ip_ranges)?;
 
@@ -370,6 +431,9 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         show_interface: config.display.show_interface,
         show_packets: config.display.show_packets,
         default_sort,
+        metrics_enabled: metrics.enabled,
+        metrics_url: metrics.url.trim_end_matches('/').to_string(),
+        metrics_push_interval_secs: metrics.push_interval_secs,
         ranges: validated,
     })
 }
@@ -432,6 +496,34 @@ range = "10.0.0.1-10.0.0.2"
         assert_eq!(cfg.map_max_entries, 8192);
         assert!(!cfg.show_interface);
         assert!(!cfg.show_packets);
+    }
+
+    #[test]
+    fn metrics_defaults_and_validation() {
+        let cfg = load_str(EXAMPLE).unwrap();
+        assert!(!cfg.metrics_enabled);
+        assert_eq!(cfg.metrics_push_interval_secs, 60);
+
+        let text = format!(
+            "{EXAMPLE}\n[metrics]\nenabled = true\nurl = \"http://127.0.0.1:8428/\"\npush_interval_secs = 30\n"
+        );
+        let cfg = load_str(&text).unwrap();
+        assert!(cfg.metrics_enabled);
+        // trailing slash normalised
+        assert_eq!(cfg.metrics_url, "http://127.0.0.1:8428");
+        assert_eq!(cfg.metrics_push_interval_secs, 30);
+
+        let text = format!("{EXAMPLE}\n[metrics]\nenabled = true\nurl = \"https://vm:8428\"\n");
+        assert!(load_str(&text).unwrap_err().contains("http://"));
+
+        let text = format!(
+            "{EXAMPLE}\n[metrics]\nenabled = true\nurl = \"http://x\"\npush_interval_secs = 1\n"
+        );
+        assert!(load_str(&text).unwrap_err().contains("push_interval_secs"));
+
+        // disabled section skips all validation
+        let text = format!("{EXAMPLE}\n[metrics]\nenabled = false\nurl = \"nonsense\"\n");
+        assert!(load_str(&text).is_ok());
     }
 
     #[test]

@@ -19,6 +19,40 @@ use vm_bandwidth_core::ipc::{IpDetail, RangeDetail, Status};
 pub enum Screen {
     Overview,
     Detail,
+    /// Historical trend for one IP, served by VictoriaMetrics.
+    Trend,
+}
+
+/// Time windows offered by the trend screen: (label, span seconds, query step seconds).
+pub const TREND_WINDOWS: [(&str, u64, u64); 4] = [
+    ("1h", 3600, 60),
+    ("24h", 86400, 900),
+    ("7d", 7 * 86400, 3600),
+    ("30d", 30 * 86400, 10800),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum TrendKind {
+    Bandwidth,
+    Packets,
+}
+
+/// One fetched trend: per-direction (timestamp seconds, value) points.
+pub type Series = Vec<(i64, f64)>;
+
+#[derive(Default)]
+pub struct TrendData {
+    pub rx: Series,
+    pub tx: Series,
+}
+
+pub struct TrendView {
+    pub ip: u32,
+    pub win: usize,
+    pub kind: TrendKind,
+    pub data: Option<TrendData>,
+    pub fetched_at: Option<std::time::Instant>,
+    pub error: Option<String>,
 }
 
 /// Everything the UI needs to render one frame.
@@ -38,6 +72,11 @@ pub struct UiState {
     pub detail_table: TableState,
     pub sort: SortMode,
     pub show_help: bool,
+    pub trend: Option<TrendView>,
+    /// `[metrics]` section from config.toml (trend queries go straight to VM).
+    pub metrics_enabled: bool,
+    pub metrics_url: String,
+    pub rate_window_secs: u64,
 }
 
 impl UiState {
@@ -54,6 +93,10 @@ impl UiState {
             detail_table: TableState::default(),
             sort,
             show_help: false,
+            trend: None,
+            metrics_enabled: false,
+            metrics_url: String::new(),
+            rate_window_secs: 120,
         }
     }
 }
@@ -70,6 +113,7 @@ pub fn draw(f: &mut Frame, app: &mut UiState) {
     match app.screen {
         Screen::Overview => draw_overview(f, app, chunks[1]),
         Screen::Detail => draw_detail(f, app, chunks[1]),
+        Screen::Trend => draw_trend(f, app, chunks[1]),
     }
     draw_footer(f, app, chunks[2]);
 
@@ -124,11 +168,12 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &UiState, area: Rect) {
     let keys = match app.screen {
         Screen::Overview => "↑/↓ select   Enter detail   r refresh   h help   q quit",
-        Screen::Detail => "↑/↓ select   s sort   r refresh   Esc back   q quit",
+        Screen::Detail => "↑/↓ select   Enter trend   s sort   r refresh   Esc back   q quit",
+        Screen::Trend => "←/→ window   b bandwidth   p packets   r refresh   Esc back   q quit",
     };
     let sort_hint = match app.screen {
         Screen::Detail => format!("   [sort: {}]", app.sort.label()),
-        Screen::Overview => String::new(),
+        Screen::Overview | Screen::Trend => String::new(),
     };
     f.render_widget(
         Paragraph::new(format!("{keys}{sort_hint}"))
@@ -143,7 +188,7 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
         return;
     };
 
-    let rows: Vec<Row> = status
+    let mut rows: Vec<Row> = status
         .ranges
         .iter()
         .map(|r| {
@@ -159,6 +204,29 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
             ])
         })
         .collect();
+
+    // Grand-total row across all ranges (cumulative totals are since daemon start).
+    let (rx_bps, tx_bps) = status
+        .ranges
+        .iter()
+        .fold((0.0f64, 0.0f64), |(r, t), x| (r + x.rx_bps, t + x.tx_bps));
+    let (rx_bytes, tx_bytes) = status.ranges.iter().fold((0u64, 0u64), |(r, t), x| {
+        (r.saturating_add(x.rx_bytes), t.saturating_add(x.tx_bytes))
+    });
+    let limited_total: usize = status.ranges.iter().map(|r| r.limited).sum();
+    rows.push(
+        Row::new(vec![
+            Cell::from("Σ All ranges"),
+            Cell::from(""),
+            Cell::from(format_bps(rx_bps)),
+            Cell::from(format_bps(tx_bps)),
+            Cell::from(format_bytes(rx_bytes)),
+            Cell::from(format_bytes(tx_bytes)),
+            Cell::from(""),
+            Cell::from(limited_total.to_string()),
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
+    );
 
     let widths = [
         Constraint::Min(14),
@@ -223,33 +291,82 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
     let mut ips = detail.ips.clone();
     sort_ips(&mut ips, app.sort);
 
-    let widths = [
-        Constraint::Length(16),
-        Constraint::Length(11),
-        Constraint::Length(11),
-        Constraint::Length(11),
-        Constraint::Length(11),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(9),
-    ];
-    let rows: Vec<Row> = ips.iter().map(ip_row).collect();
+    // Wide terminals get every column; narrower ones drop to progressively compact
+    // layouts instead of overlapping cells. Widths sum + gaps + border must fit.
+    let cols = match chunks[1].width {
+        w if w >= 132 => DetailCols::Wide,
+        w if w >= 100 => DetailCols::Mid,
+        _ => DetailCols::Min,
+    };
+    let (widths, headers): (&[Constraint], &[&str]) = match cols {
+        DetailCols::Wide => (
+            &[
+                Constraint::Length(15),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(8),
+            ],
+            &[
+                "IPv4", "RX", "TX", "RX Total", "TX Total", "RX win", "TX win", "RX limit",
+                "TX limit", "RX st", "TX st", "Remain",
+            ],
+        ),
+        DetailCols::Mid => (
+            &[
+                Constraint::Length(15),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(6),
+                Constraint::Length(8),
+            ],
+            &[
+                "IPv4", "RX", "TX", "RX Total", "TX Total", "RX limit", "TX limit", "St", "Remain",
+            ],
+        ),
+        DetailCols::Min => (
+            &[
+                Constraint::Length(15),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(6),
+            ],
+            &["IPv4", "RX", "TX", "St"],
+        ),
+    };
+
+    // Column layout adapts to the available width instead of smearing cells together.
+    let rows: Vec<Row> = ips.iter().map(|ip| ip_row(ip, cols)).collect();
     let table = Table::new(rows, widths)
-        .header(header_row([
-            "IPv4", "RX", "TX", "RX win", "TX win", "RX limit", "TX limit", "RX st", "TX st",
-            "Remain",
-        ]))
+        .header(header_row(headers.iter().copied()))
         .block(Block::bordered().title("IP Range Detail"))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
     clamp_selection(&mut app.detail_table, ips.len());
-    f.render_stateful_widget(table, area, &mut app.detail_table);
+    f.render_stateful_widget(table, chunks[1], &mut app.detail_table);
 }
 
-fn ip_row(ip: &IpDetail) -> Row<'static> {
+/// Column density of the detail table, chosen from the available width.
+#[derive(Clone, Copy)]
+enum DetailCols {
+    Wide,
+    Mid,
+    Min,
+}
+
+fn ip_row(ip: &IpDetail, cols: DetailCols) -> Row<'static> {
     let limited_style = Style::default()
         .fg(ratatui::style::Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -280,21 +397,71 @@ fn ip_row(ip: &IpDetail) -> Row<'static> {
     let rx_limited = ip.rx_state == "LIMITED";
     let tx_limited = ip.tx_state == "LIMITED";
 
-    Row::new(vec![
-        Cell::from(std::net::Ipv4Addr::from(ip.ip).to_string()),
-        Cell::from(format_bps(ip.rx_bps)),
-        Cell::from(format_bps(ip.tx_bps)),
-        Cell::from(format_bps(ip.rx_window_bps)),
-        Cell::from(format_bps(ip.tx_window_bps)),
-        Cell::from(fmt_pol(ip.rx_limit)),
-        Cell::from(fmt_pol(ip.tx_limit)),
-        state_cell(rx_limited),
-        state_cell(tx_limited),
-        Cell::from(fmt_remain(ip.rx_remaining, ip.tx_remaining)),
-    ])
+    match cols {
+        DetailCols::Wide => Row::new(vec![
+            Cell::from(std::net::Ipv4Addr::from(ip.ip).to_string()),
+            Cell::from(format_bps(ip.rx_bps)),
+            Cell::from(format_bps(ip.tx_bps)),
+            Cell::from(format_bytes(ip.rx_bytes)),
+            Cell::from(format_bytes(ip.tx_bytes)),
+            Cell::from(format_bps(ip.rx_window_bps)),
+            Cell::from(format_bps(ip.tx_window_bps)),
+            Cell::from(fmt_pol(ip.rx_limit)),
+            Cell::from(fmt_pol(ip.tx_limit)),
+            state_cell(rx_limited),
+            state_cell(tx_limited),
+            Cell::from(fmt_remain(ip.rx_remaining, ip.tx_remaining)),
+        ]),
+        DetailCols::Mid => {
+            // One combined state column (- / RX / TX / BOTH) instead of two.
+            let st = match (rx_limited, tx_limited) {
+                (false, false) => "-".to_string(),
+                (true, false) => "RX".to_string(),
+                (false, true) => "TX".to_string(),
+                (true, true) => "BOTH".to_string(),
+            };
+            let st_cell = Cell::from(st);
+            let st_cell = if rx_limited || tx_limited {
+                st_cell.style(limited_style)
+            } else {
+                st_cell
+            };
+            Row::new(vec![
+                Cell::from(std::net::Ipv4Addr::from(ip.ip).to_string()),
+                Cell::from(format_bps(ip.rx_bps)),
+                Cell::from(format_bps(ip.tx_bps)),
+                Cell::from(format_bytes(ip.rx_bytes)),
+                Cell::from(format_bytes(ip.tx_bytes)),
+                Cell::from(fmt_pol(ip.rx_limit)),
+                Cell::from(fmt_pol(ip.tx_limit)),
+                st_cell,
+                Cell::from(fmt_remain(ip.rx_remaining, ip.tx_remaining)),
+            ])
+        }
+        DetailCols::Min => {
+            let st = match (rx_limited, tx_limited) {
+                (false, false) => "-".to_string(),
+                (true, false) => "RX".to_string(),
+                (false, true) => "TX".to_string(),
+                (true, true) => "BOTH".to_string(),
+            };
+            let st_cell = Cell::from(st);
+            let st_cell = if rx_limited || tx_limited {
+                st_cell.style(limited_style)
+            } else {
+                st_cell
+            };
+            Row::new(vec![
+                Cell::from(std::net::Ipv4Addr::from(ip.ip).to_string()),
+                Cell::from(format_bps(ip.rx_bps)),
+                Cell::from(format_bps(ip.tx_bps)),
+                st_cell,
+            ])
+        }
+    }
 }
 
-fn sort_ips(ips: &mut [IpDetail], sort: SortMode) {
+pub fn sort_ips(ips: &mut [IpDetail], sort: SortMode) {
     match sort {
         SortMode::Ip => ips.sort_by_key(|i| i.ip),
         SortMode::Rx => ips.sort_by(|a, b| {
@@ -343,6 +510,118 @@ fn waiting_widget(title: &'static str) -> Paragraph<'static> {
         .block(Block::bordered().title(title))
 }
 
+const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Bucket a series down to `width` columns and render as one sparkline row.
+fn sparkline(points: &[(i64, f64)], width: usize) -> (String, f64, f64, f64) {
+    if points.is_empty() || width == 0 {
+        return ("(no data)".to_string(), 0.0, 0.0, 0.0);
+    }
+    let max = points
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(1e-9);
+    let min = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let avg = points.iter().map(|p| p.1).sum::<f64>() / points.len() as f64;
+    let n = width.max(1);
+    let mut cols = vec![0.0f64; n];
+    let mut cnt = vec![0u32; n];
+    for (i, p) in points.iter().enumerate() {
+        // Bucket by position so a short series still aligns to the right edge.
+        let idx = (i * n / points.len()).min(n - 1);
+        cols[idx] += p.1;
+        cnt[idx] += 1;
+    }
+    let line: String = cols
+        .iter()
+        .zip(&cnt)
+        .map(|(sum, c)| {
+            if *c == 0 {
+                ' '
+            } else {
+                let v = sum / *c as f64;
+                BARS[((v / max) * 7.0).round() as usize]
+            }
+        })
+        .collect();
+    (line, min, avg, max)
+}
+
+fn draw_trend(f: &mut Frame, app: &UiState, area: Rect) {
+    let Some(trend) = &app.trend else {
+        f.render_widget(waiting_widget("IP Trend"), area);
+        return;
+    };
+
+    let ip = std::net::Ipv4Addr::from(trend.ip);
+    let mut title = format!("IP Trend: {ip}   [");
+    for (i, (label, _, _)) in TREND_WINDOWS.iter().enumerate() {
+        if i == trend.win {
+            title.push_str(&format!(" *{label}* "));
+        } else {
+            title.push_str(&format!(" {label} "));
+        }
+    }
+    let metric = match trend.kind {
+        TrendKind::Bandwidth => "bandwidth (bit/s)",
+        TrendKind::Packets => "packets (pps)",
+    };
+    title.push_str(&format!("]   metric: {metric}"));
+
+    let fmt_val = |v: f64| match trend.kind {
+        TrendKind::Bandwidth => format_bps(v),
+        TrendKind::Packets => {
+            if v >= 1_000_000.0 {
+                format!("{:.2} Mpps", v / 1e6)
+            } else if v >= 1_000.0 {
+                format!("{:.1} Kpps", v / 1e3)
+            } else {
+                format!("{:.0} pps", v)
+            }
+        }
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    match &trend.data {
+        None if trend.error.is_none() => lines.push(Line::from("Loading trend data…")),
+        None => {}
+        Some(data) => {
+            let width = area.width.saturating_sub(4) as usize;
+            for (label, series) in [("RX", &data.rx), ("TX", &data.tx)] {
+                let (spark, min, avg, max) = sparkline(series, width);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{label}  "),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(spark),
+                ]));
+                lines.push(Line::from(format!(
+                    "     min {}   avg {}   max {}   ({} points)",
+                    fmt_val(min),
+                    fmt_val(avg),
+                    fmt_val(max),
+                    series.len()
+                )));
+                lines.push(Line::from(""));
+            }
+        }
+    }
+    if let Some(err) = &trend.error {
+        lines.push(Line::from(Span::styled(
+            format!("VictoriaMetrics: {err}"),
+            Style::default()
+                .fg(ratatui::style::Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title)),
+        area,
+    );
+}
+
 fn draw_help(f: &mut Frame) {
     let area = centered_rect(60, 60, f.area());
     let text = vec![
@@ -365,6 +644,15 @@ fn draw_help(f: &mut Frame) {
         Line::from("r          refresh now"),
         Line::from("Esc        back to overview"),
         Line::from("q          quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "IP Trend (VictoriaMetrics)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Enter      open trend for selected IP"),
+        Line::from("←/→ 1-4    window: 1h / 24h / 7d / 30d"),
+        Line::from("b / p      bandwidth / packets"),
+        Line::from("Esc        back to detail"),
         Line::from(""),
         Line::from("any key closes this help"),
     ];

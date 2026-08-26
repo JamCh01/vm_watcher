@@ -6,7 +6,9 @@
 
 mod collector;
 mod daemon;
+mod http;
 mod interface;
+mod metrics;
 mod tc;
 mod tui;
 mod ui;
@@ -44,7 +46,7 @@ fn run() -> Result<()> {
 
     if cli.ui {
         // The UI prints errors to the normal terminal (no raw mode yet).
-        return ui::run_ui();
+        return ui::run_ui(cli.config);
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

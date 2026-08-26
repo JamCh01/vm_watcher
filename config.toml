@@ -9,6 +9,14 @@ map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / GCRA_STATE map �
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
 
+# 历史趋势统计（可选）：把累计流量推送到 VictoriaMetrics，--ui 里选中 IP 按 Enter
+# 可查看 1h / 24h / 7d / 30d 的带宽与发包量趋势。VictoriaMetrics 部署见
+# dist/docker-compose.yml（docker compose up -d）。
+[metrics]
+enabled = false
+url = "http://127.0.0.1:8428"     # VictoriaMetrics 地址（仅支持 http://）
+push_interval_secs = 60           # 推送周期（5..=3600）
+
 # ============================================================
 # 默认配置：仅监控带宽，不启用任何限速策略（各段都不写 [ip_ranges.policy]）。
 #

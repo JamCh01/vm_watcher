@@ -4,7 +4,8 @@
 
 实时统计 Linux Bridge（`br0`）下虚拟机按 IPv4 地址划分的网络带宽，并可对 IP 段 / 单个
 IP 做 **GCRA 限速**。eBPF (TC/SchedClassifier, Aya) 采集与执行，长期运行 daemon +
-只读 `--ui` 终端界面，`config.toml` 热加载，无数据库、无 HTTP 服务、无 REST/gRPC。
+只读 `--ui` 终端界面，`config.toml` 热加载。默认无数据库、无 HTTP 服务；可选把
+累计流量推送到 VictoriaMetrics，在 `--ui` 里查看任意 IP 的历史趋势。
 
 - 只统计 `config.toml` 配置的 `开始IP-结束IP` 地址段内的 IPv4，其余一律放行不计数。
 - 每个 TAP 接口挂载 TC ingress（VM TX，按源 IP）与 TC egress（VM RX，按目标 IP）。
@@ -15,6 +16,9 @@ IP 做 **GCRA 限速**。eBPF (TC/SchedClassifier, Aya) 采集与执行，长期
 - **热加载**：修改 `config.toml` 自动生效（文件监听 + `SIGHUP`），先完整校验再一次性
   应用；非法配置被拒绝且保持上一次成功配置（last-known-good）。
 - eBPF 数据面只做观察计数与 GCRA policing，任何异常路径一律放行（fail-open）。
+- **历史趋势**（可选）：`[metrics]` 启用后，daemon 周期推送每 IP 的累计字节/包数
+  到 VictoriaMetrics；`--ui` 详情页选中 IP 按 `Enter` 查看 1h / 24h / 7d / 30d 的
+  带宽与发包量趋势。
 
 ## 工作区结构
 
@@ -94,6 +98,11 @@ map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / GCRA_STATE 容量
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
 
+[metrics]                         # 可选：历史趋势（VictoriaMetrics）
+enabled = false
+url = "http://127.0.0.1:8428"
+push_interval_secs = 60
+
 [[ip_ranges]]
 name = "VM-Network-1"
 range = "10.30.8.1-10.30.8.16"
@@ -124,6 +133,9 @@ range = "10.30.8.1-10.30.8.16"
   IP 必须落在所属段内，且同一段内不可重复。
 - 触发线 = `threshold × trigger_ratio`。判定的是**过去完整 `window` 的平均带宽**，
   不是瞬时采样；窗口观察满后才允许首次触发。
+- `[metrics]` 可选（默认关闭）：`enabled = true` 时 daemon 每 `push_interval_secs`
+  （5..=3600）秒向 `url` 推送一次累计计数器；`url` 仅支持 `http://`（内置客户端
+  无 TLS，本机部署即可）。未启用时不产生任何出站请求。
 
 ## 限速策略配置详解
 
@@ -361,7 +373,33 @@ Limited 数；顶栏显示 bridge、TAP 数、`Config generation`、最近一次
 | 详情 | `↑`/`↓` | 选择 IP |
 | 详情 | `s` | 切换排序（IP → RX → TX → RX+TX） |
 | 详情 | `r` | 立即刷新 |
+| 详情 | `Enter` | 打开选中 IP 的历史趋势 |
 | 详情 | `Esc` | 返回 |
+| 趋势 | `←`/`→` 或 `1`-`4` | 切换窗口（1h / 24h / 7d / 30d） |
+| 趋势 | `b` / `p` | 带宽 / 发包量 |
+| 趋势 | `Esc` | 返回详情 |
+
+界面列宽随终端宽度自适应：窄终端自动收敛为精简列集，不再叠字。首页末尾有全段
+合计行（`Σ All ranges`），详情页头部显示该段累计 RX/TX 总量（自本次启动起）。
+
+## 历史趋势（VictoriaMetrics）
+
+```bash
+cd dist && docker compose up -d     # 单节点，监听 127.0.0.1:8428，保留 35 天
+```
+
+然后在 `config.toml` 启用：
+
+```toml
+[metrics]
+enabled = true
+url = "http://127.0.0.1:8428"
+push_interval_secs = 60
+```
+
+`[metrics]` 参与热加载：改动在文件监听触发后的下一个推送周期生效。数据模型：每 IP 四条累计计数器（`vmbw_{rx,tx}_{bytes,packets}_total`，
+标签 `ip`/`range`），趋势屏用 `rate()` 查询，daemon 重启造成的计数器归零由
+`rate()` 按标准 counter reset 处理。
 
 ## 实现要点
 

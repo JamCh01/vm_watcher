@@ -12,11 +12,11 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
 
-use vm_bandwidth_core::config::SortMode;
+use vm_bandwidth_core::config::{self};
 use vm_bandwidth_core::ipc::{self, Request, Response};
 
 use crate::daemon::SOCK_PATH;
-use crate::tui::{self, Screen, UiState};
+use crate::tui::{self, Screen, Series, TrendKind, TrendView, UiState, TREND_WINDOWS};
 
 const REFRESH: Duration = Duration::from_secs(1);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -54,7 +54,7 @@ enum UiAction {
     Refresh,
 }
 
-pub fn run_ui() -> Result<()> {
+pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
     if !std::io::stdin().is_terminal()
         && std::fs::OpenOptions::new()
             .read(true)
@@ -75,8 +75,28 @@ pub fn run_ui() -> Result<()> {
         default_hook(info);
     }));
 
+    // The UI reads the same config file as the daemon, purely for the [metrics]
+    // section (trend queries go straight to VictoriaMetrics, never via the daemon).
+    let metrics_cfg = match config::load(&config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("warning: cannot load {config_path:?}: {e}; trend screen disabled");
+            return Ok(());
+        }
+    };
+    if metrics_cfg.metrics_enabled {
+        println!(
+            "metrics: querying {} (refresh {}s)",
+            metrics_cfg.metrics_url, metrics_cfg.metrics_push_interval_secs
+        );
+    }
+
     let mut terminal = ratatui::init();
-    let mut app = UiState::new("br0".to_string(), REFRESH, SortMode::Ip);
+    let mut app = UiState::new("br0".to_string(), REFRESH, metrics_cfg.default_sort);
+    app.metrics_enabled = metrics_cfg.metrics_enabled;
+    app.metrics_url = metrics_cfg.metrics_url.clone();
+    // rate() window: at least two push intervals, never below 2 minutes.
+    app.rate_window_secs = (metrics_cfg.metrics_push_interval_secs * 2).max(120);
 
     // crossterm input on a dedicated thread (blocking read degrades gracefully).
     let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
@@ -154,6 +174,18 @@ fn poll(client: &mut Option<Client>, app: &mut UiState) {
         }
     }
 
+    if matches!(app.screen, Screen::Trend) {
+        let stale = app
+            .trend
+            .as_ref()
+            .and_then(|t| t.fetched_at)
+            .map(|t| t.elapsed() > Duration::from_secs(30))
+            .unwrap_or(true);
+        if stale {
+            fetch_trend(app);
+        }
+    }
+
     if matches!(app.screen, Screen::Detail) {
         let idx = app.detail_index.or_else(|| app.overview.selected());
         if let (Some(c), Some(idx)) = (client.as_mut(), idx) {
@@ -204,6 +236,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
                 let len = app.detail.as_ref().map(|d| d.ips.len()).unwrap_or(0);
                 move_selection(&mut app.detail_table, len, -1);
             }
+            Screen::Trend => {}
         },
         KeyCode::Down => match app.screen {
             Screen::Overview => {
@@ -214,7 +247,52 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
                 let len = app.detail.as_ref().map(|d| d.ips.len()).unwrap_or(0);
                 move_selection(&mut app.detail_table, len, 1);
             }
+            Screen::Trend => {}
         },
+        KeyCode::Left
+        | KeyCode::Char('1')
+        | KeyCode::Char('2')
+        | KeyCode::Char('3')
+        | KeyCode::Char('4')
+            if matches!(app.screen, Screen::Trend) =>
+        {
+            if let Some(trend) = app.trend.as_mut() {
+                let next = match key.code {
+                    KeyCode::Char(d) => (d as usize) - ('1' as usize),
+                    _ => (trend.win + TREND_WINDOWS.len() - 1) % TREND_WINDOWS.len(),
+                };
+                if next != trend.win {
+                    trend.win = next;
+                    trend.fetched_at = None;
+                    return UiAction::Refresh;
+                }
+            }
+        }
+        KeyCode::Right if matches!(app.screen, Screen::Trend) => {
+            if let Some(trend) = app.trend.as_mut() {
+                trend.win = (trend.win + 1) % TREND_WINDOWS.len();
+                trend.fetched_at = None;
+                return UiAction::Refresh;
+            }
+        }
+        KeyCode::Char('b') if matches!(app.screen, Screen::Trend) => {
+            if let Some(trend) = app.trend.as_mut() {
+                if trend.kind != TrendKind::Bandwidth {
+                    trend.kind = TrendKind::Bandwidth;
+                    trend.fetched_at = None;
+                    return UiAction::Refresh;
+                }
+            }
+        }
+        KeyCode::Char('p') if matches!(app.screen, Screen::Trend) => {
+            if let Some(trend) = app.trend.as_mut() {
+                if trend.kind != TrendKind::Packets {
+                    trend.kind = TrendKind::Packets;
+                    trend.fetched_at = None;
+                    return UiAction::Refresh;
+                }
+            }
+        }
         KeyCode::Enter if matches!(app.screen, Screen::Overview) => {
             if let Some(sel) = app.overview.selected() {
                 app.screen = Screen::Detail;
@@ -223,15 +301,130 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
                 return UiAction::Refresh;
             }
         }
-        KeyCode::Esc if matches!(app.screen, Screen::Detail) => {
-            app.screen = Screen::Overview;
-            app.detail = None;
-            app.detail_index = None;
+        KeyCode::Enter if matches!(app.screen, Screen::Detail) => {
+            // Open the historical trend for the selected IP.
+            // Mirror the exact sort the detail table renders with, so the selection
+            // index maps to the same IP the user sees highlighted.
+            let ip = app.detail.as_ref().and_then(|d| {
+                let mut ips = d.ips.clone();
+                tui::sort_ips(&mut ips, app.sort);
+                app.detail_table
+                    .selected()
+                    .and_then(|sel| ips.get(sel).map(|i| i.ip))
+            });
+            if let Some(ip) = ip {
+                app.trend = Some(TrendView {
+                    ip,
+                    win: 0,
+                    kind: TrendKind::Bandwidth,
+                    data: None,
+                    fetched_at: None,
+                    error: None,
+                });
+                app.screen = Screen::Trend;
+                return UiAction::Refresh;
+            }
         }
+        KeyCode::Esc => match app.screen {
+            Screen::Detail => {
+                app.screen = Screen::Overview;
+                app.detail = None;
+                app.detail_index = None;
+            }
+            Screen::Trend => {
+                app.screen = Screen::Detail;
+                app.trend = None;
+                return UiAction::Refresh;
+            }
+            Screen::Overview => {}
+        },
         KeyCode::Char('s') if matches!(app.screen, Screen::Detail) => {
             app.sort = app.sort.next();
         }
         _ => {}
     }
     UiAction::Nothing
+}
+
+/// Fetch the trend for `app.trend`'s IP/window/kind straight from VictoriaMetrics.
+fn fetch_trend(app: &mut UiState) {
+    let Some(trend) = app.trend.as_mut() else {
+        return;
+    };
+    trend.fetched_at = Some(std::time::Instant::now());
+    trend.error = None;
+
+    if !app.metrics_enabled {
+        trend.error = Some(
+            "metrics disabled: set [metrics] enabled = true in config.toml and restart".to_string(),
+        );
+        trend.data = None;
+        return;
+    }
+
+    let (_, span, step) = TREND_WINDOWS[trend.win];
+    let end = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let start = end - span as i64;
+    let ip = std::net::Ipv4Addr::from(trend.ip);
+    let metric = match trend.kind {
+        TrendKind::Bandwidth => "vmbw_rx_bytes_total|vmbw_tx_bytes_total",
+        TrendKind::Packets => "vmbw_rx_packets_total|vmbw_tx_packets_total",
+    };
+    let mut query = format!(
+        "rate({{__name__=~\"{metric}\",ip=\"{ip}\"}}[{}s])",
+        app.rate_window_secs
+    );
+    if matches!(trend.kind, TrendKind::Bandwidth) {
+        query.push_str(" * 8");
+    }
+    let url = format!(
+        "{}/api/v1/query_range?query={}&start={start}&end={end}&step={step}",
+        app.metrics_url,
+        crate::http::percent_encode(&query)
+    );
+
+    match crate::http::get(&url) {
+        Ok(body) => match parse_query_range(&body) {
+            Ok((rx, tx)) => {
+                trend.data = Some(tui::TrendData { rx, tx });
+            }
+            Err(e) => {
+                trend.error = Some(format!("{e:#}"));
+                trend.data = None;
+            }
+        },
+        Err(e) => {
+            trend.error = Some(format!("{e:#}"));
+            trend.data = None;
+        }
+    }
+}
+
+/// Extract RX and TX series from a VictoriaMetrics `query_range` reply.
+fn parse_query_range(body: &str) -> Result<(Series, Series)> {
+    let v: serde_json::Value = serde_json::from_str(body).context("bad JSON from metrics")?;
+    if v["status"] != "success" {
+        anyhow::bail!("metrics query failed: {}", v["error"]);
+    }
+    let mut rx = Vec::new();
+    let mut tx = Vec::new();
+    for series in v["data"]["result"].as_array().into_iter().flatten() {
+        let name = series["metric"]["__name__"].as_str().unwrap_or("");
+        let is_rx = name.contains("rx_");
+        let target = if is_rx { &mut rx } else { &mut tx };
+        for point in series["values"].as_array().into_iter().flatten() {
+            let ts = point[0].as_f64().unwrap_or(0.0) as i64;
+            let val: f64 = point[1]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            if val.is_finite() {
+                target.push((ts, val));
+            }
+        }
+    }
+    Ok((rx, tx))
 }

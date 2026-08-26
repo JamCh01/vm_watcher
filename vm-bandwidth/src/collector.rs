@@ -199,6 +199,8 @@ impl Collector {
                     IpTotals {
                         rx_bytes: s.rx_bytes,
                         tx_bytes: s.tx_bytes,
+                        rx_packets: s.rx_packets,
+                        tx_packets: s.tx_packets,
                     },
                 )
             })

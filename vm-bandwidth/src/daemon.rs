@@ -65,6 +65,8 @@ struct Engine {
     collector: Collector,
     limiter: Limiter,
     last_snapshot: Option<crate::collector::Snapshot>,
+    /// Last poll's cumulative per-IP counters, for the VictoriaMetrics push.
+    last_totals: std::collections::HashMap<u32, vm_bandwidth_core::limiter::IpTotals>,
 
     monitored: AyaHashMap<MapData, u32, u8>,
     #[allow(dead_code)] // kept alive so its map fd stays open
@@ -86,7 +88,39 @@ impl Engine {
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         self.apply_gcra_actions(&actions);
+        self.last_totals = totals;
         self.last_snapshot = Some(snapshot);
+    }
+
+    /// Push cumulative per-IP counters to VictoriaMetrics (no-op when disabled).
+    /// A push failure is logged and skipped; the next interval simply retries.
+    fn push_metrics(&self) {
+        if !self.cfg.metrics_enabled {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let lines =
+            crate::metrics::render_prom_lines(&self.last_totals, |ip| self.range_name(ip), now_ms);
+        if lines.is_empty() {
+            return;
+        }
+        if let Err(e) = crate::metrics::push(&self.cfg.metrics_url, &lines) {
+            log::warn!("metrics push to {} failed: {e:#}", self.cfg.metrics_url);
+        } else {
+            log::debug!("metrics push: {} line(s)", lines.lines().count());
+        }
+    }
+
+    fn range_name(&self, ip: u32) -> String {
+        self.cfg
+            .ranges
+            .iter()
+            .find(|r| (r.inner.start..=r.inner.end).contains(&ip))
+            .map(|r| r.inner.name.clone())
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     fn rescan_taps(&mut self) {
@@ -496,6 +530,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         collector: Collector::new(),
         limiter: Limiter::new(tick_secs),
         last_snapshot: None,
+        last_totals: std::collections::HashMap::new(),
         monitored,
         limit_policies,
         gcra_state,
@@ -544,6 +579,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         tokio::time::Instant::now() + Duration::from_millis(engine.cfg.refresh_interval_ms.max(1));
     let mut next_scan = tokio::time::Instant::now()
         + Duration::from_secs(engine.cfg.interface_scan_interval_secs.max(1));
+    let mut next_push = tokio::time::Instant::now()
+        + Duration::from_secs(engine.cfg.metrics_push_interval_secs.max(5));
 
     log::info!("daemon running (generation {})", engine.generation);
     loop {
@@ -580,6 +617,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
                 engine.rescan_taps();
                 next_scan = tokio::time::Instant::now()
                     + Duration::from_secs(engine.cfg.interface_scan_interval_secs.max(1));
+            }
+            _ = tokio::time::sleep_until(next_push) => {
+                engine.push_metrics();
+                next_push = tokio::time::Instant::now()
+                    + Duration::from_secs(engine.cfg.metrics_push_interval_secs.max(5));
             }
         }
     }

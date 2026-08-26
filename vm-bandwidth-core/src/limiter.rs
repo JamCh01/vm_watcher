@@ -18,6 +18,9 @@ use crate::window::RollingWindow;
 pub struct IpTotals {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Cumulative packet counters (unused by the limiter; carried for metrics export).
+    pub rx_packets: u64,
+    pub tx_packets: u64,
 }
 
 /// (ipv4, direction) identifies one limiter / one rolling window.
@@ -396,6 +399,9 @@ mod tests {
             show_interface: false,
             show_packets: false,
             default_sort: SortMode::Ip,
+            metrics_enabled: false,
+            metrics_url: String::new(),
+            metrics_push_interval_secs: 60,
             ranges,
         }
     }
@@ -435,6 +441,8 @@ mod tests {
         m.insert(
             u32::from(std::net::Ipv4Addr::from(ip)),
             IpTotals {
+                rx_packets: 0,
+                tx_packets: 0,
                 rx_bytes: rx,
                 tx_bytes: tx,
             },

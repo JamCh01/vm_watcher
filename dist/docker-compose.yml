@@ -1,0 +1,19 @@
+# VictoriaMetrics for vm-bandwidth-monitor's [metrics] export.
+#
+#   docker compose up -d
+#
+# Listens on 127.0.0.1:8428 only. The daemon pushes cumulative per-IP
+# counters here (Prometheus import API); the --ui trend screen queries it.
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:latest
+    container_name: victoriametrics
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8428:8428"
+    volumes:
+      - ./victoria-metrics-data:/victoria-metrics-data
+    command:
+      - -storagePath=/victoria-metrics-data
+      # Keep 35 days so the UI's 30-day window always has data.
+      - -retentionPeriod=35d
