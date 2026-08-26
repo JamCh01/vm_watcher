@@ -172,24 +172,17 @@ fn build_dir(
     if merged.limit_duration_secs.is_none() {
         missing_fields.push("limit_duration".to_string());
     }
+    // Fields that do not apply to the selected algorithm are ignored rather than
+    // rejected: an IP override switching algorithms inherits the range's fields and
+    // has no way to "unset" them.
     let algorithm = merged.algorithm.unwrap_or(ALGO_GCRA);
     if is_bucket_algo(algorithm) {
         if merged.burst_bytes.is_none() {
             missing_fields.push("burst".to_string());
         }
-        if merged.limit_window_secs.is_some() {
-            return Err(format!(
-                "policy for {what}: limit_window does not apply to this algorithm"
-            ));
-        }
     } else if is_window_algo(algorithm) {
         if merged.limit_window_secs.is_none() {
             missing_fields.push("limit_window".to_string());
-        }
-        if merged.burst_bytes.is_some() {
-            return Err(format!(
-                "policy for {what}: burst does not apply to this algorithm"
-            ));
         }
     } else {
         return Err(format!("policy for {what}: unknown algorithm {algorithm}"));
@@ -207,9 +200,19 @@ fn build_dir(
         window_secs: merged.window_secs.unwrap(),
         trigger_ratio_pct: merged.trigger_ratio_pct.unwrap(),
         limit_duration_secs: merged.limit_duration_secs.unwrap(),
-        burst_bytes: merged.burst_bytes.unwrap_or(0),
+        // Fields that do not apply to the selected algorithm are zeroed here so they
+        // can never leak into an installed eBPF policy.
+        burst_bytes: if is_window_algo(algorithm) {
+            0
+        } else {
+            merged.burst_bytes.unwrap_or(0)
+        },
         algorithm,
-        limit_window_secs: merged.limit_window_secs.unwrap_or(0),
+        limit_window_secs: if is_window_algo(algorithm) {
+            merged.limit_window_secs.unwrap_or(0)
+        } else {
+            0
+        },
     }))
 }
 
