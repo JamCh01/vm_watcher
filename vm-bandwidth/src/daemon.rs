@@ -648,7 +648,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
             }
             maybe = reload_rx.recv() => {
                 if maybe.is_some() {
-                    engine.reload(&config_path);
+                    // File read + parse are blocking; block_in_place keeps the IPC
+                    // tasks running on another worker while the engine works.
+                    tokio::task::block_in_place(|| engine.reload(&config_path));
                 }
             }
             maybe = ipc_rx.recv() => {
@@ -658,12 +660,13 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
                 }
             }
             _ = tokio::time::sleep_until(next_collect) => {
-                engine.collect_tick();
+                // Map iteration is a burst of syscalls; same reasoning as above.
+                tokio::task::block_in_place(|| engine.collect_tick());
                 next_collect = tokio::time::Instant::now()
                     + Duration::from_millis(engine.cfg.refresh_interval_ms.max(1));
             }
             _ = tokio::time::sleep_until(next_scan) => {
-                engine.rescan_taps();
+                tokio::task::block_in_place(|| engine.rescan_taps());
                 next_scan = tokio::time::Instant::now()
                     + Duration::from_secs(engine.cfg.interface_scan_interval_secs.max(1));
             }
