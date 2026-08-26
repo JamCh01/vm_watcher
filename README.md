@@ -267,6 +267,52 @@ range = "10.30.8.1-10.30.8.64"
 name = "Internal"
 range = "10.30.9.1-10.30.9.32"
 # 不写 policy：只监控，不限速
+```
+
+## 查看与解除限速
+
+### 如何查看当前是否有限速
+
+按可信度从高到低，三种方式互相印证：
+
+1. **`--ui` 界面**（最快）：
+   - 总览页每个段都有 `Limited` 列：`0` 表示该段没有任何流处于限速；> 0 即有限速中的流。
+   - 按回车进详情页，`状态` 列逐流显示 `NORMAL` / `LIMITED`，LIMITED 还会显示剩余秒数。
+2. **日志**：触发与解除都会落日志，直接查：
+
+   ```bash
+   journalctl -u vm-bandwidth-monitor | grep -iE "limited|trigger|expire"
+   ```
+
+3. **eBPF 数据面实证**（最权威，需 `bpftool`）：数据面是否真的在丢包只取决于两张 map，
+   两者都是 `[]`（空）即**没有任何生效中的限速**：
+
+   ```bash
+   apt-get install -y bpftool            # 若未安装（仅诊断用，不影响运行中的 daemon）
+   bpftool map dump name LIMIT_POLICIES   # 生效中的限速策略；[] = 无
+   bpftool map dump name GCRA_STATE       # GCRA 运行状态（TAT）；[] = 无
+   ```
+
+   配置里没有 `[ip_ranges.policy]` 时，这两张 map 必然为空：限速器只给带策略的流下发，
+   策略不存在就不可能触发（配置可用 `grep -E "(policy|limit|threshold|burst)" config.toml` 快速确认）。
+
+### 如何解除限速
+
+限速的写入方只有限速器，解除即“移除策略/状态”，全部热生效、无需重启：
+
+| 想解除的范围 | 做法 |
+| --- | --- |
+| 某段的全部限速 | 删掉该段的 `[ip_ranges.policy]` 块，保存。热加载后该段所有 LIMITED 流立即恢复 NORMAL，GCRA 策略与状态一并移除 |
+| 单台机器的限速 | 给该 IP 加一条 `[[ip_ranges.overrides]]`，把 `rx_limit`/`tx_limit` 设成极高值（如 `1Tbps`，校验上限）；或把该段拆出来不设 policy；无法用 override “删除”继承来的策略 |
+| 缩短剩余时长 | 把 `limit_duration` 改小：`limited_until` 从原始 `limited_since` 重算，算出已过期则**立即解除** |
+| 全部清零重来 | `systemctl restart vm-bandwidth-monitor`：所有窗口、限速状态、GCRA 状态清空，从基线重新观察；配置本身不变，满窗后仍可能再次触发（治标手段，不是禁用） |
+| 永久禁用限速 | 配置中不保留任何 `[ip_ranges.policy]`（默认 `config.toml` 就是这种状态） |
+| 等待自动解除 | 什么都不做：`limit_duration` 到期自动恢复并重新观察 |
+
+注意：解除是即时生效的（下一个包就不再按旧策略判），但解除后窗口会重新积累，
+若流量仍超触发线，满窗后会再次触发——这是预期行为，不是残留故障。
+解除后想确认干净，用上面「查看」的第 3 条验证两张 map 均为 `[]` 即可。
+
 
 ## 限速（GCRA）
 
