@@ -56,7 +56,6 @@ struct Engine {
     last_reload_error: String,
 
     bridge: String,
-    object: &'static [u8],
     manager: AttachManager,
     taps: Vec<Tap>,
 
@@ -90,7 +89,7 @@ impl Engine {
     fn rescan_taps(&mut self) {
         match interface::discover_taps(&self.bridge) {
             Ok(found) => {
-                let (added, failed) = self.manager.reconcile(&found, self.object);
+                let (added, failed) = self.manager.reconcile(&found);
                 if added > 0 || failed > 0 {
                     log::info!("scan: {added} attached, {failed} failed");
                 }
@@ -356,7 +355,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         .try_lock()
         .context("another vm-bandwidth-monitor instance is already running")?;
 
-    // 3. Start from clean maps.
+    // 3. Remove any pins left by older versions (v0.2.0 and earlier pinned the maps);
+    //    the current maps are unpinned and live only as long as the daemon does.
     for pin in [
         PIN_MONITORED_IPS,
         PIN_TRAFFIC,
@@ -413,12 +413,12 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     )
     .context("TRAFFIC has the wrong type")?;
 
-    // 4. Discover TAPs and attach.
-    let mut manager = AttachManager::new();
+    // 4. Discover TAPs and attach (one loaded object, one link pair per TAP).
+    let mut manager = AttachManager::new(base)?;
     let mut taps = Vec::new();
     match interface::discover_taps(&cfg.bridge) {
         Ok(found) => {
-            let (added, failed) = manager.reconcile(&found, object);
+            let (added, failed) = manager.reconcile(&found);
             log::info!("initial scan: {added} TAP(s) attached, {failed} failed");
             taps = manager.taps();
         }
@@ -433,7 +433,6 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_reload_ok: true,
         last_reload_error: String::new(),
         bridge: cfg.bridge.clone(),
-        object,
         manager,
         taps,
         collector: Collector::new(),
@@ -527,17 +526,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         }
     }
 
-    // 9. Cleanup: detach our TC filters, drop pins and the socket. Dropping `manager`
-    //    (inside `engine`) detaches exactly the filters this program created.
+    // 9. Cleanup: dropping `engine` drops the `AttachManager`, which detaches exactly
+    //    the TC links this program created; the unpinned maps die with the process.
     drop(engine);
-    for pin in [
-        PIN_MONITORED_IPS,
-        PIN_TRAFFIC,
-        PIN_LIMIT_POLICIES,
-        PIN_GCRA_STATE,
-    ] {
-        let _ = std::fs::remove_file(pin);
-    }
     let _ = std::fs::remove_file(SOCK_PATH);
     drop(lock_file);
     let _ = std::fs::remove_file(LOCK_PATH);

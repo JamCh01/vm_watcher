@@ -1,13 +1,12 @@
 //! TC classifiers for VM bandwidth accounting + GCRA policing.
 //!
-//! Userspace loads one instance of this object per TAP interface and attaches
-//! * `tc_ingress` to TC ingress — packets the VM sends out (VM TX), keyed by source IP
-//! * `tc_egress` to TC egress — packets the VM receives (VM RX), keyed by destination IP
+//! The daemon loads this object exactly once and attaches `tc_ingress` / `tc_egress` to
+//! every TAP under the bridge, so all interfaces share the same maps by construction:
+//! * `tc_ingress` on TC ingress — packets the VM sends out (VM TX), keyed by source IP
+//! * `tc_egress` on TC egress — packets the VM receives (VM RX), keyed by destination IP
 //!
-//! `aya`'s TC context does not expose `skb->ifindex`, so the interface index is baked in
-//! as a global (`IFINDEX`) that userspace overrides before each per-interface load. All
-//! maps are pinned, so every per-interface instance shares the same whitelist, counters
-//! and limiter state.
+//! The interface index is read straight from the skb context, so no per-interface
+//! reloading of the object is needed.
 //!
 //! Every path — parse failure, IP not whitelisted, map pressure, missing or invalid
 //! policy, arithmetic anomaly — ends in `TC_ACT_PIPE`: traffic is never dropped unless
@@ -24,9 +23,9 @@
 
 use aya_ebpf::{
     bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_PIPE, TC_ACT_SHOT},
+    btf_maps::{HashMap, PerCpuHashMap},
     helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
-    macros::{classifier, map},
-    maps::{HashMap, PerCpuHashMap},
+    macros::{btf_map, classifier},
     programs::TcContext,
 };
 use network_types::{
@@ -35,14 +34,9 @@ use network_types::{
 };
 use vm_bandwidth_common::{GcraKey, GcraPolicy, TrafficKey, TrafficValue};
 
-/// ifindex of the TAP interface this object instance is attached to.
-/// Overridden from userspace with `EbpfLoader::override_global` before load.
-#[no_mangle]
-static IFINDEX: u32 = 0;
-
-/// Compile-time floor; userspace overrides `max_entries` at load time
+/// Compile-time default; userspace overrides `max_entries` at load time
 /// (`EbpfLoader::map_max_entries`) before the maps are created.
-const MAP_CAPACITY: u32 = 8192;
+const MAP_CAPACITY: usize = 8192;
 
 /// Packets larger than this are never policed (fail open); it also keeps the
 /// time-increment arithmetic provably inside `u64`.
@@ -52,17 +46,17 @@ const NS_PER_SEC: u64 = 1_000_000_000;
 const BITS_PER_BYTE: u64 = 8;
 
 /// Whitelist: only IPv4 addresses present here are ever counted.
-#[map]
-static MONITORED_IPS: HashMap<u32, u8> = HashMap::pinned(MAP_CAPACITY, 0);
+#[btf_map]
+static MONITORED_IPS: HashMap<u32, u8, MAP_CAPACITY> = HashMap::new();
 
 /// (ifindex, ipv4) -> per-CPU monotonic counters.
-#[map]
-static TRAFFIC: PerCpuHashMap<TrafficKey, TrafficValue> = PerCpuHashMap::pinned(MAP_CAPACITY, 0);
+#[btf_map]
+static TRAFFIC: PerCpuHashMap<TrafficKey, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
 
 /// (ipv4, direction) -> limiter policy installed by the daemon. Absent or
 /// `enabled == 0` means the flow is not policed.
-#[map]
-static LIMIT_POLICIES: HashMap<GcraKey, GcraPolicy> = HashMap::pinned(MAP_CAPACITY, 0);
+#[btf_map]
+static LIMIT_POLICIES: HashMap<GcraKey, GcraPolicy, MAP_CAPACITY> = HashMap::new();
 
 /// GCRA runtime state for one (IPv4, direction) flow: the Theoretical Arrival Time.
 ///
@@ -77,8 +71,8 @@ struct GcraStateVal {
 
 /// (ipv4, direction) -> GCRA runtime state. Shared (NOT per-CPU) so all CPUs and all TAPs
 /// enforce one common rate budget per flow.
-#[map]
-static GCRA_STATE: HashMap<GcraKey, GcraStateVal> = HashMap::pinned(MAP_CAPACITY, 0);
+#[btf_map]
+static GCRA_STATE: HashMap<GcraKey, GcraStateVal, MAP_CAPACITY> = HashMap::new();
 
 /// TAP ingress: the VM is sending. The VM's address is the IPv4 source.
 #[classifier]
@@ -109,12 +103,15 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     };
     let ipv4 = u32::from_be_bytes(if is_tx { ip.src_addr } else { ip.dst_addr });
 
+    // The TAP's ifindex, read from the skb context (valid for TC programs).
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+
     unsafe {
         if MONITORED_IPS.get(ipv4).is_none() {
             return TC_ACT_PIPE;
         }
 
-        count(ctx, ipv4, is_tx);
+        count(ctx, ipv4, ifindex, is_tx);
 
         let direction = if is_tx {
             vm_bandwidth_common::DIR_TX
@@ -131,11 +128,8 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
 
 /// Accumulate byte/packet counters for a whitelisted flow. Never fails the packet.
 #[inline(always)]
-unsafe fn count(ctx: &TcContext, ipv4: u32, is_tx: bool) {
-    let key = TrafficKey {
-        ifindex: IFINDEX,
-        ipv4,
-    };
+unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
+    let key = TrafficKey { ifindex, ipv4 };
     let value = match TRAFFIC.get_ptr_mut(key) {
         Some(ptr) => &mut *ptr,
         None => {
