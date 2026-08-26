@@ -14,6 +14,7 @@ services:
     volumes:
       - ./victoria-metrics-data:/victoria-metrics-data
     command:
-      - -storagePath=/victoria-metrics-data
+      # v1.150+ renamed -storagePath to -storageDataPath.
+      - -storageDataPath=/victoria-metrics-data
       # Keep 35 days so the UI's 30-day window always has data.
       - -retentionPeriod=35d
