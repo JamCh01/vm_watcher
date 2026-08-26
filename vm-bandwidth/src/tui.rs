@@ -79,6 +79,8 @@ pub struct UiState {
     pub trend_rt: Option<tokio::runtime::Handle>,
     /// Sequence of the latest in-flight trend fetch; stale results are dropped.
     pub trend_seq: u64,
+    /// Shared HTTP client for trend queries (connection pool is reused across fetches).
+    pub trend_client: reqwest::Client,
     /// `[metrics]` section from config.toml (trend queries go straight to VM).
     pub metrics_enabled: bool,
     pub metrics_url: String,
@@ -103,6 +105,10 @@ impl UiState {
             trend_tx: None,
             trend_rt: None,
             trend_seq: 0,
+            trend_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build the trend HTTP client"),
             metrics_enabled: false,
             metrics_url: String::new(),
             rate_window_secs: 120,

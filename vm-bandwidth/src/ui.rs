@@ -418,11 +418,13 @@ fn fetch_trend(app: &mut UiState) {
     };
     let base = app.metrics_url.clone();
     let rate_window = app.rate_window_secs;
+    let client = app.trend_client.clone();
 
     app.trend_seq += 1;
     let seq = app.trend_seq;
     rt.spawn(async move {
         let res = fetch_pair(
+            &client,
             &base,
             rate_window,
             ip,
@@ -441,6 +443,7 @@ fn fetch_trend(app: &mut UiState) {
 /// Fetch the RX and TX series for one trend view.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_pair(
+    client: &reqwest::Client,
     base: &str,
     rate_window: u64,
     ip: std::net::Ipv4Addr,
@@ -451,15 +454,11 @@ async fn fetch_pair(
     end: i64,
     step: u64,
 ) -> Result<tui::TrendData, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
     // Both directions in parallel: they are independent queries against the same
     // connection pool, so the round-trip cost is paid once, not twice.
     let (rx, tx) = tokio::try_join!(
         fetch_series(
-            &client,
+            client,
             base,
             rate_window,
             ip,
@@ -470,7 +469,7 @@ async fn fetch_pair(
             step
         ),
         fetch_series(
-            &client,
+            client,
             base,
             rate_window,
             ip,
