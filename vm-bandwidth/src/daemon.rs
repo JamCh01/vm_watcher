@@ -10,15 +10,18 @@
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use arc_swap::ArcSwap;
 use aya::maps::{HashMap as AyaHashMap, MapData, PerCpuHashMap};
 use futures::{SinkExt, StreamExt};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::RecursiveMode;
+use notify_debouncer_full::Debouncer;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use vm_bandwidth_common::{
     LimitKey, LimitPolicy, LimitState, SwlRing, TrafficKey, TrafficKey6, TrafficValue,
@@ -50,10 +53,18 @@ const RELOAD_DEBOUNCE_MS: u64 = 300;
 
 type IpcReq = (Request, oneshot::Sender<Response>);
 
+/// The applied configuration, shared as an atomic snapshot: the engine is the
+/// sole writer (after a successful transactional reload), every read site loads
+/// it lock-free and never observes a half-applied config.
+type ConfigArc = Arc<ArcSwap<ValidatedConfig>>;
+
 /// All the eBPF + runtime state the engine owns.
 struct Engine {
-    cfg: ValidatedConfig,
+    config: ConfigArc,
     generation: u64,
+    /// Bumped on every successfully applied reload; the scheduler rebuilds its
+    /// timers from it instead of waiting one stale interval out.
+    config_watch: watch::Sender<u64>,
     config_loaded_at: String,
     last_reload_at: String,
     last_reload_ok: bool,
@@ -94,7 +105,7 @@ impl Engine {
     }
 
     fn collect_tick(&mut self) {
-        let ranges = self.cfg.ip_ranges();
+        let ranges = self.config.load().ip_ranges();
         let PollResult {
             snapshot,
             totals,
@@ -111,7 +122,8 @@ impl Engine {
     /// Push cumulative per-IP counters to VictoriaMetrics (no-op when disabled).
     /// A push failure is logged and skipped; the next interval simply retries.
     async fn push_metrics(&self) {
-        if !self.cfg.metrics_enabled {
+        let cfg = self.config.load();
+        if !cfg.metrics_enabled {
             return;
         }
         let now_ms = std::time::SystemTime::now()
@@ -127,15 +139,16 @@ impl Engine {
         if lines.is_empty() {
             return;
         }
-        if let Err(e) = crate::metrics::push(&self.http, &self.cfg.metrics_url, &lines).await {
-            log::warn!("metrics push to {} failed: {e:#}", self.cfg.metrics_url);
+        if let Err(e) = crate::metrics::push(&self.http, &cfg.metrics_url, &lines).await {
+            log::warn!("metrics push to {} failed: {e:#}", cfg.metrics_url);
         } else {
             log::debug!("metrics push: {} line(s)", lines.lines().count());
         }
     }
 
     fn range_name(&self, ip: u32) -> String {
-        self.cfg
+        self.config
+            .load()
             .ranges
             .iter()
             .find(|r| (r.inner.start..=r.inner.end).contains(&ip))
@@ -322,6 +335,7 @@ impl Engine {
         }
 
         self.generation += 1;
+        let _ = self.config_watch.send_replace(self.generation);
         self.last_reload_ok = true;
         self.last_reload_error.clear();
         self.config_loaded_at = stamp;
@@ -339,7 +353,7 @@ impl Engine {
             );
         }
         let now = self.now_secs();
-        let old_ips = ip_set(&self.cfg);
+        let old_ips = ip_set(&self.config.load());
         let new_ips = ip_set(&new_cfg);
 
         // §27 ordering — additions write the whitelist first ...
@@ -362,7 +376,7 @@ impl Engine {
         }
 
         self.collector.prune_ips(&new_ips);
-        self.cfg = new_cfg;
+        self.config.store(Arc::new(new_cfg));
         Ok(())
     }
 
@@ -370,10 +384,10 @@ impl Engine {
 
     fn build_status(&self) -> Status {
         let mut ranges = Vec::new();
+        let cfg = self.config.load();
         if let Some(snap) = &self.last_snapshot {
             for (i, rs) in snap.ranges.iter().enumerate() {
-                let limited = self
-                    .cfg
+                let limited = cfg
                     .ranges
                     .get(i)
                     .map(|vr| self.limiter.limited_count(vr.start, vr.end))
@@ -595,14 +609,18 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     }
 
     let tick_secs = (cfg.refresh_interval_ms / 1000).max(1);
+    let config: ConfigArc = Arc::new(ArcSwap::from_pointee(cfg));
+    let (config_watch, _) = watch::channel(1u64);
     let mut engine = Engine {
+        config: config.clone(),
+        config_watch: config_watch.clone(),
         generation: 1,
         config_loaded_at: format_unix_utc(now_unix()),
         last_reload_at: String::new(),
         last_reload_ok: true,
         last_reload_error: String::new(),
         last_config_bytes: initial_config_bytes,
-        bridge: cfg.bridge.clone(),
+        bridge: config.load().bridge.clone(),
         manager,
         taps,
         collector: Collector::new(),
@@ -618,12 +636,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         traffic6,
         http: crate::metrics::client(),
         epoch: std::time::Instant::now(),
-        cfg,
     };
     // Apply the initial limiter policy index (no LIMITs yet; just builds lookups).
     let _ = engine
         .limiter
-        .apply_config(&engine.cfg.clone(), engine.now_secs())
+        .apply_config(&engine.config.load(), engine.now_secs())
         .map_err(anyhow::Error::msg)?;
 
     // 5. IPC server.
@@ -659,13 +676,10 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
 
-    // 8. Engine loop.
-    let mut next_collect =
-        tokio::time::Instant::now() + Duration::from_millis(engine.cfg.refresh_interval_ms.max(1));
-    let mut next_scan = tokio::time::Instant::now()
-        + Duration::from_secs(engine.cfg.interface_scan_interval_secs.max(1));
-    let mut next_push = tokio::time::Instant::now()
-        + Duration::from_secs(engine.cfg.metrics_push_interval_secs.max(5));
+    // 8. Engine loop. A config change reschedules all three timers immediately
+    //    (the scheduler is the component that rebuilds on the watch signal).
+    let mut config_rx = config_watch.subscribe();
+    let (mut next_collect, mut next_scan, mut next_push) = schedules_from(&engine.config.load());
 
     log::info!("daemon running (generation {})", engine.generation);
     loop {
@@ -689,6 +703,17 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
                     tokio::task::block_in_place(|| engine.reload(&config_path));
                 }
             }
+            r = config_rx.changed() => {
+                if r.is_ok() {
+                    // The reload applied above changed intervals; rebuild the
+                    // schedule now rather than one stale cycle later.
+                    (next_collect, next_scan, next_push) = schedules_from(&engine.config.load());
+                    log::info!(
+                        "config generation {}: timers rescheduled",
+                        *config_rx.borrow_and_update()
+                    );
+                }
+            }
             maybe = ipc_rx.recv() => {
                 if let Some((req, reply)) = maybe {
                     let resp = engine.handle_request(req);
@@ -699,17 +724,17 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
                 // Map iteration is a burst of syscalls; same reasoning as above.
                 tokio::task::block_in_place(|| engine.collect_tick());
                 next_collect = tokio::time::Instant::now()
-                    + Duration::from_millis(engine.cfg.refresh_interval_ms.max(1));
+                    + Duration::from_millis(engine.config.load().refresh_interval_ms.max(1));
             }
             _ = tokio::time::sleep_until(next_scan) => {
                 tokio::task::block_in_place(|| engine.rescan_taps());
                 next_scan = tokio::time::Instant::now()
-                    + Duration::from_secs(engine.cfg.interface_scan_interval_secs.max(1));
+                    + Duration::from_secs(engine.config.load().interface_scan_interval_secs.max(1));
             }
             _ = tokio::time::sleep_until(next_push) => {
                 engine.push_metrics().await;
                 next_push = tokio::time::Instant::now()
-                    + Duration::from_secs(engine.cfg.metrics_push_interval_secs.max(5));
+                    + Duration::from_secs(engine.config.load().metrics_push_interval_secs.max(5));
             }
         }
     }
@@ -771,9 +796,31 @@ async fn send_response(
     framed.send(body.into()).await.is_ok()
 }
 
+/// (Re)build the three engine timers from a config snapshot.
+fn schedules_from(
+    cfg: &ValidatedConfig,
+) -> (
+    tokio::time::Instant,
+    tokio::time::Instant,
+    tokio::time::Instant,
+) {
+    let now = tokio::time::Instant::now();
+    (
+        now + Duration::from_millis(cfg.refresh_interval_ms.max(1)),
+        now + Duration::from_secs(cfg.interface_scan_interval_secs.max(1)),
+        now + Duration::from_secs(cfg.metrics_push_interval_secs.max(5)),
+    )
+}
+
 /// Watch the config file's parent directory; debounce bursts and trigger one reload (§29).
 /// Watching the directory (not the file) survives editors that save via atomic rename.
-fn spawn_watcher(path: PathBuf, reload_tx: mpsc::Sender<()>) -> Result<RecommendedWatcher> {
+/// `notify-debouncer-full` merges event bursts and tracks renames; we keep the
+/// "only real content changes count" semantics so the daemon's own reload reads
+/// cannot re-trigger itself.
+fn spawn_watcher(
+    path: PathBuf,
+    reload_tx: mpsc::Sender<()>,
+) -> Result<Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -784,57 +831,44 @@ fn spawn_watcher(path: PathBuf, reload_tx: mpsc::Sender<()>) -> Result<Recommend
         .map(|n| n.to_os_string())
         .unwrap_or_default();
 
-    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    })
-    .context("creating file watcher")?;
-    watcher
+    let (tx, rx) = std::sync::mpsc::channel::<notify_debouncer_full::DebounceEventResult>();
+    let mut debouncer =
+        notify_debouncer_full::new_debouncer(Duration::from_millis(RELOAD_DEBOUNCE_MS), None, tx)
+            .context("creating config debouncer")?;
+    debouncer
         .watch(&dir, RecursiveMode::NonRecursive)
         .with_context(|| format!("watching {}", dir.display()))?;
 
     std::thread::spawn(move || {
         while let Ok(res) = rx.recv() {
-            let Ok(event) = res else { continue };
+            let Ok(events) = res else {
+                continue;
+            };
             // Only real content changes count: in-place writes, atomic renames onto the
             // target, and (re)creation. Reads (OPEN/CLOSE-read — including this daemon's
             // own reload reads), metadata touches (ATTRIB) and deletions are ignored;
             // accepting them would make the daemon's reload re-trigger itself.
-            let content_change = matches!(
-                event.kind,
-                EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
-            ) || matches!(
-                event.kind,
-                EventKind::Create(CreateKind::File | CreateKind::Any)
-            ) || matches!(
-                event.kind,
-                EventKind::Access(AccessKind::Close(AccessMode::Write))
-            );
-            let touches_config = event
-                .paths
-                .iter()
-                .any(|p| p.file_name().map(|n| n == target_name).unwrap_or(false));
-            if !content_change || !touches_config {
-                continue;
-            }
-            // Trailing-edge debounce: keep absorbing events as long as they keep
-            // arriving within the window, then fire one reload once things go quiet.
-            // A single save (open/write/close, atomic rename, multi-chunk writes)
-            // collapses to one reload.
-            loop {
-                std::thread::sleep(Duration::from_millis(RELOAD_DEBOUNCE_MS));
-                let mut more = false;
-                while rx.try_recv().is_ok() {
-                    more = true;
-                }
-                if !more {
-                    break;
-                }
-            }
-            if reload_tx.blocking_send(()).is_err() {
+            let relevant = events.iter().any(|e| {
+                let content_change = matches!(
+                    e.event.kind,
+                    EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+                ) || matches!(
+                    e.event.kind,
+                    EventKind::Create(CreateKind::File | CreateKind::Any)
+                ) || matches!(
+                    e.event.kind,
+                    EventKind::Access(AccessKind::Close(AccessMode::Write))
+                );
+                content_change
+                    && e.event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name().map(|n| n == target_name).unwrap_or(false))
+            });
+            if relevant && reload_tx.blocking_send(()).is_err() {
                 break;
             }
         }
     });
-    Ok(watcher)
+    Ok(debouncer)
 }
