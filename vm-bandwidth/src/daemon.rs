@@ -73,6 +73,13 @@ struct MapRollback {
     installs: Vec<(LimitKey, Option<LimitPolicy>)>,
 }
 
+/// Whitelist-trie key for one prefix. The kernel LPM trie matches bits in MEMORY-byte
+/// order, so the address goes in network byte order — a host-order u32 would reverse
+/// the octets and only match by accident while all variance stays inside one octet.
+fn trie_key(c: &Cidr) -> TrieKey<u32> {
+    TrieKey::new(u32::from(c.prefix_len), c.network.to_be())
+}
+
 /// Treat "key absent" as success for cleanup removes; every other error propagates.
 /// Absence surfaces two ways depending on the map op: `KeyNotFound` from lookup-based
 /// paths, or a raw ENOENT (`io::ErrorKind::NotFound`) wrapped in `SyscallError` from
@@ -565,17 +572,14 @@ impl Engine {
     ) -> Result<()> {
         for c in new_prefixes.difference(old_prefixes) {
             self.monitored
-                .insert(&TrieKey::new(u32::from(c.prefix_len), c.network), 1u8, 0)
+                .insert(&trie_key(c), 1u8, 0)
                 .with_context(|| format!("whitelisting {}", c.display()))?;
             rb.wl_added.push(*c);
         }
         self.execute_limit_actions(actions, rb)?;
         for c in old_prefixes.difference(new_prefixes) {
-            map_gone(
-                self.monitored
-                    .remove(&TrieKey::new(u32::from(c.prefix_len), c.network)),
-            )
-            .with_context(|| format!("dropping whitelist prefix {}", c.display()))?;
+            map_gone(self.monitored.remove(&trie_key(c)))
+                .with_context(|| format!("dropping whitelist prefix {}", c.display()))?;
             rb.wl_removed.push(*c);
         }
         Ok(())
@@ -780,7 +784,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     .context("MONITORED_IPS has the wrong type")?;
     for c in &prefixes {
         monitored
-            .insert(&TrieKey::new(u32::from(c.prefix_len), c.network), 1u8, 0)
+            .insert(&trie_key(c), 1u8, 0)
             .with_context(|| format!("inserting whitelist prefix {}", c.display()))?;
     }
     log::info!(
