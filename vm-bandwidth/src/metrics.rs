@@ -235,13 +235,18 @@ mod tests {
             crate::collector::PolicerIpTotals::default(),
         );
         let lines = render_prom_lines_policer(&totals, |_| "r1".into(), 123);
-        assert!(lines.contains(
-            "vmbw_policer_rx_passed_bytes_total{ip=\"10.0.0.2\",range=\"r1\"} 100 123"
-        ));
-        assert!(lines.contains(
-            "vmbw_policer_tx_dropped_bytes_total{ip=\"10.0.0.2\",range=\"r1\"} 40 123"
-        ));
-        assert_eq!(lines.lines().count(), 3, "zero series must be skipped: {lines}");
-        assert!(!lines.contains("10.0.0.1"), "unpoliced IP must emit nothing");
+        assert!(lines
+            .contains("vmbw_policer_rx_passed_bytes_total{ip=\"10.0.0.2\",range=\"r1\"} 100 123"));
+        assert!(lines
+            .contains("vmbw_policer_tx_dropped_bytes_total{ip=\"10.0.0.2\",range=\"r1\"} 40 123"));
+        assert_eq!(
+            lines.lines().count(),
+            3,
+            "zero series must be skipped: {lines}"
+        );
+        assert!(
+            !lines.contains("10.0.0.1"),
+            "unpoliced IP must emit nothing"
+        );
     }
 }

@@ -120,6 +120,13 @@ struct SwlRingVal {
 #[btf_map]
 static SWL_LOG: HashMap<LimitKey, SwlRingVal, MAP_CAPACITY> = HashMap::new();
 
+/// (ipv4, direction) -> cumulative verdict counters, per-CPU. TRAFFIC records demand
+/// (what arrived); this records what the policer actually let through versus dropped,
+/// so userspace can see loss instead of only inferring it. Only flows with an active
+/// policy are recorded; fail-open paths make no entry.
+#[btf_map]
+static POLICER_STATS: PerCpuHashMap<LimitKey, PolicerStats, MAP_CAPACITY> = PerCpuHashMap::new();
+
 /// TAP ingress: the VM is sending. The VM's address is the IPv4 source.
 #[classifier]
 pub fn tc_ingress(ctx: TcContext) -> i32 {
