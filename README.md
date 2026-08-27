@@ -562,6 +562,24 @@ TRAFFIC 记的是限速前的流量需求，这组才是实际放行/丢弃量�
   （白名单为普通 map，其余为 BTF 定义）。
 - 挂载/卸载由 `AttachManager` 负责：丢弃某个链接即移除**且仅移除**本程序创建的
   TC filter；不动 `fq_codel`/`noqueue`，不清理其他程序的 filter。
+- qdisc 生命周期（v0.6.4 起）：
+  - **Linux ≥6.6 默认走 TCX**（`bpf_link_create`），先直接 attach，不需要任何
+    qdisc，退出后接口上不会遗留本程序创建的 `clsact`。
+  - 旧内核回退传统 netlink TC：仅当首次 attach 以 ENOENT 证明挂钩缺少父 qdisc 时，
+    才创建 `clsact` 并重试一次；已存在的 `clsact` 一律复用（EEXIST），不替换、
+    不删除。其他错误（权限、接口不存在等）如实上抛，不会被当成“已存在”。
+  - ingress 成功而 egress 失败时回滚 ingress 链接；若是遗留 `ingress` 独占 qdisc
+    导致 egress 无处可挂，给出明确的冲突诊断。
+  - **程序永不删除无法确认归属的共享 qdisc**：本程序自建的 `clsact` 在卸载时也仅“保留并记录”，
+    因为 aya 0.14 无法安全证明没有其他工具的 filter 共用它；根 qdisc 永不触碰。
+  - 历史版本（< v0.6.4）遗留的空 `clsact` 需一次性手工清理（前提：两个 filter 查询均为空，
+    且 vm-bandwidth-monitor 已停止）：
+    ```bash
+    DEV=<tap>
+    tc filter show dev "$DEV" ingress
+    tc filter show dev "$DEV" egress
+    tc qdisc del dev "$DEV" clsact
+    ```
 - 计数为单调累计值，用户态按相邻采样差值计算速率；计数回绕/复位或 TAP 重建时该周期
   记 0，绝不产生负带宽或虚假触发。
 - 单一 "engine" 任务持有全部可变状态（map、TAP、collector、limiter），IPC/监听/信号
