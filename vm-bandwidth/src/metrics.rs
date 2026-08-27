@@ -134,6 +134,11 @@ pub fn render_prom_lines_policer(
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(TIMEOUT)
+        // Pushes go out once a minute; the pooled keep-alive connection regularly
+        // outlives VictoriaMetrics' shorter idle timeout and dies mid-request
+        // ("connection closed before message completed"). A fresh connection per
+        // push costs nothing on localhost and removes the race.
+        .pool_max_idle_per_host(0)
         .build()
         .expect("failed to build the HTTP client")
 }
