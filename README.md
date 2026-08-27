@@ -349,6 +349,8 @@ IP 默认继承所属段的 `policy`。需要给个别机器不同待遇时，�
 | 改 `threshold` / `trigger_ratio` | 保留当前窗口，下一次评估用新触发线 |
 | 删除 policy / override | 立即移除对应限速、恢复 NORMAL；override 删除则回落继承 |
 | 新增段 / 删除段 | 同步增删白名单与监控状态；删除段会清理其限速、算法状态和窗口 |
+| 改 `collector.refresh_interval_ms` / `collector.map_max_entries` | **不支持热加载**：限速器窗口按整秒 tick 校准、eBPF map 容量启动时固定，校验拒绝并提示重启 |
+| 新配置地址数超容量 | 预检拒绝（不动任何 map）：新地址数 > 启动时定的 `MONITORED_IPS` 容量、或预计 `TRAFFIC`/限速 map 用量超限时，明确要求重启调整；全部范围地址总数 > 1<<20 在共享校验层直接拒绝（启动与热加载同一条路） |
 | 改 `network.bridge` | **不支持热加载**，校验直接拒绝，需要重启进程 |
 | 任何非法配置 | 整份拒绝：保持上一次成功配置（last-known-good），不中断监控与限速，`--ui` 顶栏显示 FAILED 与原因 |
 

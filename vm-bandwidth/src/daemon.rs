@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use aya::maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuHashMap};
 use futures::{SinkExt, StreamExt};
@@ -111,6 +111,11 @@ struct Engine {
     last_policer: std::collections::HashMap<u32, crate::collector::PolicerIpTotals>,
     /// Last poll's aggregate IPv6 counters, for the VictoriaMetrics push.
     last_ipv6: crate::collector::IpStats,
+
+    /// Map capacities fixed at startup; hot reload must fit inside them.
+    whitelist_capacity: u32,
+    traffic_capacity: u32,
+    limit_capacity: u32,
 
     monitored: AyaHashMap<MapData, u32, u8>,
     #[allow(dead_code)] // kept alive so its map fd stays open
@@ -493,13 +498,74 @@ impl Engine {
                 new_cfg.bridge
             );
         }
+        // Fields whose effects are baked into structures created at startup: the
+        // limiter's windows are calibrated in whole tick seconds and the eBPF maps
+        // have fixed capacities. Changing them needs a restart, not a reload.
+        let cur = self.config.load();
+        if new_cfg.refresh_interval_ms != cur.refresh_interval_ms {
+            anyhow::bail!(
+                "changing collector.refresh_interval_ms is not supported by hot reload \
+                 (the limiter's windows are calibrated in whole tick seconds); \
+                 restart the daemon instead"
+            );
+        }
+        if new_cfg.map_max_entries != cur.map_max_entries {
+            anyhow::bail!(
+                "changing collector.map_max_entries is not supported by hot reload \
+                 (the eBPF maps are sized once at startup); restart the daemon instead"
+            );
+        }
+
+        let old_ips = ip_set(&cur);
+        let new_ips = ip_set(&new_cfg);
+
+        // Refuse reloads that would overflow the startup-sized maps BEFORE touching any
+        // map, instead of failing halfway through the whitelist phase.
+        let new_count = u32::try_from(new_ips.len()).unwrap_or(u32::MAX);
+        if new_count > self.whitelist_capacity {
+            anyhow::bail!(
+                "new config monitors {new_count} addresses but MONITORED_IPS capacity is {} \
+                 (sized at startup); restart the daemon to resize it",
+                self.whitelist_capacity
+            );
+        }
+        if new_count.saturating_mul(2) > self.traffic_capacity {
+            anyhow::bail!(
+                "new config needs ~{} TRAFFIC entries (2 per address) but the map capacity \
+                 is {} (collector.map_max_entries at startup); restart the daemon with a \
+                 larger value",
+                new_count.saturating_mul(2),
+                self.traffic_capacity
+            );
+        }
+        // Upper bound on flows that may become LIMITED simultaneously: every address
+        // with a policy, both directions.
+        let policied_ips: u64 = new_cfg
+            .ranges
+            .iter()
+            .map(|r| {
+                if r.policy.is_empty() {
+                    r.overrides.len() as u64
+                } else {
+                    r.len()
+                }
+            })
+            .sum();
+        if policied_ips.saturating_mul(2) > self.limit_capacity as u64 {
+            anyhow::bail!(
+                "new config may limit {policied_ips} addresses ({} flows) but the limit \
+                 maps hold {} entries (collector.map_max_entries at startup); restart the \
+                 daemon with a larger value",
+                policied_ips.saturating_mul(2),
+                self.limit_capacity
+            );
+        }
+
         let now = self.now_secs();
         let plan = self
             .limiter
             .plan_reload(&new_cfg, now)
             .map_err(anyhow::Error::msg)?;
-        let old_ips = ip_set(&self.config.load());
-        let new_ips = ip_set(&new_cfg);
 
         let mut rb = MapRollback::default();
         if let Err(e) = self.apply_maps(&plan.actions, &old_ips, &new_ips, &mut rb) {
@@ -712,10 +778,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         let _ = std::fs::remove_file(pin);
     }
 
+    // The v1 address cap is enforced in the shared validation layer (config::parse) so
+    // hot reload cannot bypass it; here we only size the maps from the total.
     let total_ips: u64 = cfg.ranges.iter().map(|r| r.len()).sum();
-    if total_ips > 1 << 20 {
-        bail!("configured IP ranges cover {total_ips} addresses, which is too large for v1");
-    }
     let whitelist_capacity = (total_ips.max(1) as u32)
         .saturating_mul(2)
         .next_power_of_two();
@@ -788,7 +853,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         Err(e) => log::warn!("initial TAP discovery failed: {e}"),
     }
 
-    let tick_secs = (cfg.refresh_interval_ms / 1000).max(1);
+    // refresh_interval_ms is validated second-aligned, so this division is exact.
+    let tick_secs = cfg.refresh_interval_ms / 1000;
+    let map_max_entries = cfg.map_max_entries;
     let config: ConfigArc = Arc::new(ArcSwap::from_pointee(cfg));
     let (config_watch, _) = watch::channel(1u64);
     let mut engine = Engine {
@@ -809,6 +876,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_totals: std::collections::HashMap::new(),
         last_policer: std::collections::HashMap::new(),
         last_ipv6: crate::collector::IpStats::default(),
+        whitelist_capacity,
+        traffic_capacity: map_max_entries,
+        limit_capacity: map_max_entries,
         monitored,
         limit_policies,
         limit_state,

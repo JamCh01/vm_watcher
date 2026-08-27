@@ -366,8 +366,15 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     if bridge.is_empty() {
         return Err("network.bridge must not be empty".to_string());
     }
-    if config.collector.refresh_interval_ms == 0 {
-        return Err("collector.refresh_interval_ms must be > 0".to_string());
+    // The rate limiter's rolling windows are calibrated in WHOLE tick seconds, so the
+    // interval must be second-aligned (a 1500 ms interval used to silently truncate to
+    // 1 s ticks and mis-measure bandwidth by 1.5x).
+    if config.collector.refresh_interval_ms < 1000
+        || !config.collector.refresh_interval_ms.is_multiple_of(1000)
+    {
+        return Err(
+            "collector.refresh_interval_ms must be a whole number of seconds (>= 1000)".to_string(),
+        );
     }
     if config.collector.interface_scan_interval_secs == 0 {
         return Err("collector.interface_scan_interval_secs must be > 0".to_string());
@@ -463,6 +470,16 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
             policy,
             overrides,
         });
+    }
+
+    // v1 sizing guard: every address is enumerated into the whitelist and per-IP map
+    // state is sized from this total. It lives in the shared validation layer so hot
+    // reload cannot bypass it.
+    let total_ips: u64 = validated.iter().map(|r| r.len()).sum();
+    if total_ips > 1 << 20 {
+        return Err(format!(
+            "configured IP ranges cover {total_ips} addresses, which is too large for v1"
+        ));
     }
 
     Ok(ValidatedConfig {
@@ -586,6 +603,20 @@ range = "10.0.0.1-10.0.0.2"
     fn rejects_zero_intervals() {
         let text = EXAMPLE.replace("refresh_interval_ms = 1000", "refresh_interval_ms = 0");
         assert!(load_str(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_non_second_aligned_interval() {
+        let text = EXAMPLE.replace("refresh_interval_ms = 1000", "refresh_interval_ms = 1500");
+        assert!(load_str(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_ranges_larger_than_the_v1_cap() {
+        // 192.0.0.0/6 = 2^26 addresses > the 1<<20 cap.
+        let text =
+            "[network]\nbridge = \"br0\"\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
+        assert!(load_str(text).is_err());
     }
 
     const POLICY_EXAMPLE: &str = r#"
