@@ -71,9 +71,15 @@ struct MapRollback {
 }
 
 /// Treat "key absent" as success for cleanup removes; every other error propagates.
+/// Absence surfaces two ways depending on the map op: `KeyNotFound` from lookup-based
+/// paths, or a raw ENOENT (`io::ErrorKind::NotFound`) wrapped in `SyscallError` from
+/// `bpf_map_delete_elem` — both mean the entry is already gone.
 fn map_gone(r: Result<(), MapError>) -> Result<()> {
     match r {
         Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+        Err(MapError::SyscallError(e)) if e.io_error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
         Err(e) => Err(e.into()),
     }
 }
