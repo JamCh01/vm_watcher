@@ -336,7 +336,8 @@ fn overview_row(r: &RangeSummary, cols: OverviewCols) -> Row<'static> {
             Cell::from(format_bps(r.rx_bps)),
             Cell::from(format_bps(r.tx_bps)),
             style_limited(r.limited),
-        ]),
+        ])
+        .height(2),
     }
 }
 
@@ -361,7 +362,7 @@ fn total_row(
             Cell::from(limited.to_string()),
         ]),
         OverviewCols::Mid => Row::new(vec![
-            Cell::from(format!("Σ All ranges ({ip_total} IPs)")),
+            Cell::from(format!("Σ All ({ip_total} IPs)")),
             Cell::from(""),
             Cell::from(format_bps(rx_bps)),
             Cell::from(format_bps(tx_bps)),
@@ -375,7 +376,8 @@ fn total_row(
             Cell::from(format_bps(rx_bps)),
             Cell::from(format_bps(tx_bps)),
             Cell::from(limited.to_string()),
-        ]),
+        ])
+        .height(2),
     }
 }
 
