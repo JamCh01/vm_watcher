@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
-use aya::maps::{HashMap as AyaHashMap, MapData, PerCpuHashMap};
+use aya::maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuHashMap};
 use futures::{SinkExt, StreamExt};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::RecursiveMode;
@@ -57,6 +57,26 @@ type IpcReq = (Request, oneshot::Sender<Response>);
 /// sole writer (after a successful transactional reload), every read site loads
 /// it lock-free and never observes a half-applied config.
 type ConfigArc = Arc<ArcSwap<ValidatedConfig>>;
+
+/// Rollback bookkeeping for one transactional map apply: filled as operations
+/// succeed, played back in reverse on the first failure.
+#[derive(Default)]
+struct MapRollback {
+    wl_added: Vec<u32>,
+    wl_removed: Vec<u32>,
+    /// Executed Remove actions with the policy they displaced (None = was absent).
+    removes: Vec<(LimitKey, Option<LimitPolicy>)>,
+    /// Executed Install actions with the policy they displaced (None = fresh flow).
+    installs: Vec<(LimitKey, Option<LimitPolicy>)>,
+}
+
+/// Treat "key absent" as success for cleanup removes; every other error propagates.
+fn map_gone(r: Result<(), MapError>) -> Result<()> {
+    match r {
+        Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
 
 /// All the eBPF + runtime state the engine owns.
 struct Engine {
@@ -119,7 +139,24 @@ impl Engine {
             .poll(&self.traffic, &self.traffic6, &self.policer_stats, &ranges);
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
-        self.apply_limit_actions(&actions);
+        if !actions.is_empty() {
+            let mut rb = MapRollback::default();
+            if let Err(e) = self.execute_limit_actions(&actions, &mut rb) {
+                // A half-applied batch is worse than none: roll the dataplane back and
+                // let the flows re-evaluate from NORMAL on their next threshold cross.
+                self.rollback_map_apply(&rb);
+                for action in &actions {
+                    let (ipv4, direction) = match action {
+                        LimitAction::Install {
+                            ipv4, direction, ..
+                        }
+                        | LimitAction::Remove { ipv4, direction } => (*ipv4, *direction),
+                    };
+                    self.limiter.reset_flow(ipv4, direction);
+                }
+                log::error!("runtime limit actions failed and were rolled back: {e:#}");
+            }
+        }
         self.last_totals = totals;
         self.last_ipv6 = ipv6;
         self.last_policer = policer;
@@ -203,87 +240,164 @@ impl Engine {
         }
     }
 
-    fn apply_limit_actions(&mut self, actions: &[LimitAction]) {
+    /// Execute limit actions against the eBPF maps transactionally. Removes run first
+    /// (they free capacity); per flow the write order is:
+    ///   Install: STATE FIRST, POLICY LAST — the policy is the arming marker, so a
+    ///            failed state write can never leave an armed policy without state;
+    ///   Remove:  POLICY FIRST, state after — a failed cleanup can never leave an armed
+    ///            policy behind a "removed" verdict.
+    /// Every map operation propagates its error; on the first failure the caller plays
+    /// back `rb` in reverse.
+    fn execute_limit_actions(
+        &mut self,
+        actions: &[LimitAction],
+        rb: &mut MapRollback,
+    ) -> Result<()> {
+        // Pass 1: removals (disarm, then clean up).
         for action in actions {
-            match action {
-                LimitAction::Install {
-                    ipv4,
-                    direction,
-                    rate_bps,
-                    burst_bytes,
-                    algorithm,
-                    window_ns,
-                } => {
-                    let key = LimitKey::new(*ipv4, *direction);
-                    // When the flow was previously limited with the sliding-window-log
-                    // algorithm and now switches away from it, its log ring is dead weight.
-                    let was_swl = self
-                        .limit_policies
-                        .get(&key, 0)
-                        .map(|p: LimitPolicy| p.algorithm == ALGO_SLIDING_WINDOW_LOG)
-                        .unwrap_or(false);
-                    if was_swl && *algorithm != ALGO_SLIDING_WINDOW_LOG {
-                        let _ = self.swl_log.remove(&key);
-                    }
-                    let policy = LimitPolicy {
-                        enabled: 1,
-                        _pad0: [0; 3],
-                        algorithm: *algorithm,
-                        rate_bps: *rate_bps,
-                        burst_bytes: *burst_bytes,
-                        window_ns: *window_ns,
-                    };
-                    match self.limit_policies.insert(key, policy, 0) {
-                        Ok(()) => {
-                            // (Re)create the runtime state so the new policy starts clean;
-                            // the data path never creates lock-bearing values.
-                            let fresh = LimitState::default();
-                            if *algorithm == ALGO_SLIDING_WINDOW_LOG {
-                                if let Err(e) = self.swl_log.insert(key, SwlRing::default(), 0) {
-                                    log::error!(
-                                        "failed to init sliding-window log for {}: {e}",
-                                        std::net::Ipv4Addr::from(*ipv4)
-                                    );
-                                }
-                            } else if let Err(e) = self.limit_state.insert(key, fresh, 0) {
-                                log::error!(
-                                    "failed to init limit state for {}: {e}",
-                                    std::net::Ipv4Addr::from(*ipv4)
-                                );
-                            }
-                            // Fresh verdict counters for the new policy session.
-                            // Verdict counters are created zero-initialized in eBPF on
-                            // the first verdict and deleted again in the Remove branch;
-                            // no reset needed here.
-                            log::info!(
-                                "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
-                                std::net::Ipv4Addr::from(*ipv4),
-                                direction,
-                                Self::algorithm_name(*algorithm),
-                                rate_bps,
-                                burst_bytes,
-                                window_ns
-                            );
-                        }
-                        Err(e) => log::error!(
-                            "failed to install limit for {}: {e}",
-                            std::net::Ipv4Addr::from(*ipv4)
-                        ),
+            let LimitAction::Remove { ipv4, direction } = action else {
+                continue;
+            };
+            let key = LimitKey::new(*ipv4, *direction);
+            let addr = std::net::Ipv4Addr::from(*ipv4);
+            let old = self.get_policy(&key)?;
+            self.limit_policies
+                .remove(&key)
+                .with_context(|| format!("removing limit policy for {addr} dir={direction}"))?;
+            rb.removes.push((key, old));
+            map_gone(self.limit_state.remove(&key))
+                .with_context(|| format!("removing limit state for {addr}"))?;
+            map_gone(self.swl_log.remove(&key))
+                .with_context(|| format!("removing sliding-window log for {addr}"))?;
+            map_gone(self.policer_stats.remove(&key))
+                .with_context(|| format!("removing policer stats for {addr}"))?;
+            log::info!("back to NORMAL {addr} dir={direction}");
+        }
+
+        // Pass 2: installs (state first, policy as the arming marker last).
+        for action in actions {
+            let LimitAction::Install {
+                ipv4,
+                direction,
+                rate_bps,
+                burst_bytes,
+                algorithm,
+                window_ns,
+            } = action
+            else {
+                continue;
+            };
+            let key = LimitKey::new(*ipv4, *direction);
+            let addr = std::net::Ipv4Addr::from(*ipv4);
+            let old = self.get_policy(&key)?;
+            let old_was_swl = old
+                .map(|p| p.algorithm == ALGO_SLIDING_WINDOW_LOG)
+                .unwrap_or(false);
+
+            self.write_fresh_state(&key, *algorithm)
+                .with_context(|| format!("initialising limit state for {addr}"))?;
+
+            let policy = LimitPolicy {
+                enabled: 1,
+                _pad0: [0; 3],
+                algorithm: *algorithm,
+                rate_bps: *rate_bps,
+                burst_bytes: *burst_bytes,
+                window_ns: *window_ns,
+            };
+            self.limit_policies
+                .insert(key, policy, 0)
+                .with_context(|| format!("installing limit policy for {addr} dir={direction}"))?;
+            rb.installs.push((key, old));
+
+            // Drop the displaced algorithm's artifact only after the new policy is
+            // armed, so no window exists where an armed policy points at dead state.
+            if old_was_swl && *algorithm != ALGO_SLIDING_WINDOW_LOG {
+                map_gone(self.swl_log.remove(&key))
+                    .with_context(|| format!("removing stale sliding-window log for {addr}"))?;
+            } else if old.is_some() && *algorithm == ALGO_SLIDING_WINDOW_LOG {
+                map_gone(self.limit_state.remove(&key))
+                    .with_context(|| format!("removing stale limit state for {addr}"))?;
+            }
+
+            log::info!(
+                "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
+                addr,
+                direction,
+                Self::algorithm_name(*algorithm),
+                rate_bps,
+                burst_bytes,
+                window_ns
+            );
+        }
+        Ok(())
+    }
+
+    /// Read the currently armed policy for a flow (None = not policed). Propagates
+    /// errors other than absence.
+    fn get_policy(&self, key: &LimitKey) -> Result<Option<LimitPolicy>> {
+        match self.limit_policies.get(key, 0) {
+            Ok(p) => Ok(Some(p)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Zero-initialise the runtime-state map matching `algorithm` (the data path never
+    /// creates lock-bearing values).
+    fn write_fresh_state(&mut self, key: &LimitKey, algorithm: u32) -> Result<()> {
+        if algorithm == ALGO_SLIDING_WINDOW_LOG {
+            self.swl_log
+                .insert(*key, SwlRing::default(), 0)
+                .map_err(Into::into)
+        } else {
+            self.limit_state
+                .insert(*key, LimitState::default(), 0)
+                .map_err(Into::into)
+        }
+    }
+
+    /// Best-effort reverse of everything recorded in `rb`, played back in reverse order.
+    /// Restored algorithm state is FRESH — kernel-side state is unrecoverable once
+    /// overwritten, so a rolled-back flow restarts its budget from zero.
+    fn rollback_map_apply(&mut self, rb: &MapRollback) {
+        for (key, old) in rb.installs.iter().rev() {
+            let _ = self.limit_policies.remove(key);
+            match old {
+                Some(old) => {
+                    // Re-arm the displaced policy with fresh state.
+                    if self.limit_policies.insert(*key, *old, 0).is_ok() {
+                        let _ = self.write_fresh_state(key, old.algorithm);
+                    } else {
+                        log::warn!(
+                            "rollback: failed to re-arm policy for {}",
+                            std::net::Ipv4Addr::from(key.ipv4)
+                        );
                     }
                 }
-                LimitAction::Remove { ipv4, direction } => {
-                    let key = LimitKey::new(*ipv4, *direction);
-                    let _ = self.limit_policies.remove(&key);
-                    let _ = self.limit_state.remove(&key);
-                    let _ = self.swl_log.remove(&key);
-                    let _ = self.policer_stats.remove(&key);
-                    log::info!(
-                        "back to NORMAL {} dir={}",
-                        std::net::Ipv4Addr::from(*ipv4),
-                        direction
+                None => {
+                    let _ = self.limit_state.remove(key);
+                    let _ = self.swl_log.remove(key);
+                }
+            }
+        }
+        for (key, old) in rb.removes.iter().rev() {
+            if let Some(old) = old {
+                if self.limit_policies.insert(*key, *old, 0).is_ok() {
+                    let _ = self.write_fresh_state(key, old.algorithm);
+                } else {
+                    log::warn!(
+                        "rollback: failed to restore policy for {}",
+                        std::net::Ipv4Addr::from(key.ipv4)
                     );
                 }
             }
+        }
+        for ip in rb.wl_removed.iter().rev() {
+            let _ = self.monitored.insert(*ip, 1u8, 0);
+        }
+        for ip in rb.wl_added.iter().rev() {
+            let _ = self.monitored.remove(ip);
         }
     }
 
@@ -360,7 +474,11 @@ impl Engine {
         log::info!("config reload succeeded; generation {}", self.generation);
     }
 
-    /// Apply an already-validated config: reconcile whitelist, policies and limiter state.
+    /// Transactional config apply: compute a pure plan, execute every map operation
+    /// (whitelist additions, then limit actions removes-first/installs-last, then
+    /// whitelist removals), and only if ALL of them succeed commit the limiter state,
+    /// prune the collector and atomically switch the visible config. Any failure rolls
+    /// the dataplane back and keeps the previous config and generation.
     fn apply_config(&mut self, new_cfg: ValidatedConfig) -> Result<()> {
         if new_cfg.bridge != self.bridge {
             anyhow::bail!(
@@ -370,30 +488,47 @@ impl Engine {
             );
         }
         let now = self.now_secs();
+        let plan = self
+            .limiter
+            .plan_reload(&new_cfg, now)
+            .map_err(anyhow::Error::msg)?;
         let old_ips = ip_set(&self.config.load());
         let new_ips = ip_set(&new_cfg);
 
-        // §27 ordering — additions write the whitelist first ...
-        for ip in new_ips.difference(&old_ips) {
+        let mut rb = MapRollback::default();
+        if let Err(e) = self.apply_maps(&plan.actions, &old_ips, &new_ips, &mut rb) {
+            self.rollback_map_apply(&rb);
+            return Err(e);
+        }
+
+        // Commit phase: limiter internals, then collector, then the visible switch.
+        self.limiter.commit_reload(plan);
+        self.collector.prune_ips(&new_ips);
+        self.config.store(Arc::new(new_cfg));
+        Ok(())
+    }
+
+    /// §27 ordering with rollback bookkeeping: whitelist additions first, limit-map
+    /// actions second, whitelist removals last.
+    fn apply_maps(
+        &mut self,
+        actions: &[LimitAction],
+        old_ips: &HashSet<u32>,
+        new_ips: &HashSet<u32>,
+        rb: &mut MapRollback,
+    ) -> Result<()> {
+        for ip in new_ips.difference(old_ips) {
             self.monitored
                 .insert(*ip, 1u8, 0)
                 .with_context(|| format!("whitelisting {ip}"))?;
+            rb.wl_added.push(*ip);
         }
-
-        // ... reconcile policies / limiter (returns map actions for LIMITED flows) ...
-        let actions = self
-            .limiter
-            .apply_config(&new_cfg, now)
-            .map_err(anyhow::Error::msg)?;
-        self.apply_limit_actions(&actions);
-
-        // ... and deletions drop the whitelist last.
-        for ip in old_ips.difference(&new_ips) {
-            let _ = self.monitored.remove(ip);
+        self.execute_limit_actions(actions, rb)?;
+        for ip in old_ips.difference(new_ips) {
+            map_gone(self.monitored.remove(ip))
+                .with_context(|| format!("dropping whitelist IP {ip}"))?;
+            rb.wl_removed.push(*ip);
         }
-
-        self.collector.prune_ips(&new_ips);
-        self.config.store(Arc::new(new_cfg));
         Ok(())
     }
 
@@ -679,10 +814,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         epoch: std::time::Instant::now(),
     };
     // Apply the initial limiter policy index (no LIMITs yet; just builds lookups).
-    let _ = engine
+    let plan = engine
         .limiter
-        .apply_config(&engine.config.load(), engine.now_secs())
+        .plan_reload(&engine.config.load(), engine.now_secs())
         .map_err(anyhow::Error::msg)?;
+    engine.limiter.commit_reload(plan);
 
     // 5. IPC server.
     let _ = std::fs::remove_file(SOCK_PATH);

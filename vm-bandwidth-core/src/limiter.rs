@@ -44,6 +44,20 @@ pub enum LimitAction {
     Remove { ipv4: u32, direction: u8 },
 }
 
+/// A reload change plan: pure output of `plan_reload`, consumed by `commit_reload`
+/// only after the runtime has applied every map action successfully.
+#[derive(Debug)]
+pub struct ReloadPlan {
+    /// Map actions in execution order: Removes first (they free capacity), Installs last.
+    pub actions: Vec<LimitAction>,
+    new_ranges: Vec<PolicyRange>,
+    new_overrides: HashMap<u32, EffectivePolicy>,
+    /// LIMITED flows returning to NORMAL (phase state + window reset at commit).
+    flow_resets: Vec<FlowKey>,
+    /// LIMITED flows staying limited: new `limited_until` and newly applied policy.
+    flow_updates: Vec<(FlowKey, u64, DirPolicy)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
     #[default]
@@ -140,13 +154,16 @@ impl Limiter {
 
     /// Apply a (new) configuration, reconciling limiter state. Used at startup and on every
     /// successful reload. Returns the map actions needed to converge (§18, §22–§27).
-    pub fn apply_config(
-        &mut self,
-        cfg: &ValidatedConfig,
-        now: u64,
-    ) -> Result<Vec<LimitAction>, String> {
+    /// Compute the reload change plan against the NEW config without touching any mutable
+    /// state. The runtime executes `plan.actions` against the eBPF maps first; only after
+    /// every map operation succeeds does [`commit_reload`] apply the internal transitions.
+    /// A rejected plan leaves the limiter (and the dataplane) exactly as they were.
+    pub fn plan_reload(&self, cfg: &ValidatedConfig, now: u64) -> Result<ReloadPlan, String> {
         let (new_ranges, new_overrides) = Self::build_index(cfg)?;
-        let mut actions = Vec::new();
+        let mut removes = Vec::new();
+        let mut installs = Vec::new();
+        let mut flow_resets = Vec::new();
+        let mut flow_updates = Vec::new();
 
         // Flows that are currently LIMITED, reconciled against the NEW config (§22–§25).
         let limited: Vec<FlowKey> = self
@@ -156,55 +173,39 @@ impl Limiter {
             .map(|(k, _)| *k)
             .collect();
 
-        // Install the new index so lookups below see the new config.
-        self.ranges = new_ranges;
-        self.overrides = new_overrides;
-
-        // Baselines for IPs that no longer have any policy are dead weight (§33). If a
-        // policy comes back for such an IP later it starts from a fresh baseline, which
-        // is the same semantics as any newly added policy.
-        self.prev_totals
-            .retain(|ip, _| lookup(&self.ranges, &self.overrides, *ip).is_some());
-
         for flow in limited {
             let (ip, dir) = flow;
-            let new_dir = lookup(&self.ranges, &self.overrides, ip).and_then(|p| match dir {
+            let new_dir = lookup(&new_ranges, &new_overrides, ip).and_then(|p| match dir {
                 DIR_RX => p.rx,
                 DIR_TX => p.tx,
                 _ => None,
             });
-            let state = match self.states.get_mut(&flow) {
+            let state = match self.states.get(&flow) {
                 Some(s) => s,
                 None => continue,
             };
-            let applied = match state.applied {
+            let applied = match &state.applied {
                 Some(a) => a,
                 None => continue,
             };
             match new_dir {
                 // §25 / range-or-IP removed: stop policing, back to NORMAL.
                 None => {
-                    actions.push(LimitAction::Remove {
+                    removes.push(LimitAction::Remove {
                         ipv4: ip,
                         direction: dir,
                     });
-                    *state = DirState::default();
-                    if let Some(w) = self.windows.get_mut(&flow) {
-                        w.reset();
-                    }
+                    flow_resets.push(flow);
                 }
                 Some(np) => {
                     // §24: duration re-anchored to the original limited_since.
                     let limited_until = state.limited_since.saturating_add(np.limit_duration_secs);
                     if limited_until <= now {
-                        actions.push(LimitAction::Remove {
+                        removes.push(LimitAction::Remove {
                             ipv4: ip,
                             direction: dir,
                         });
-                        *state = DirState::default();
-                        if let Some(w) = self.windows.get_mut(&flow) {
-                            w.reset();
-                        }
+                        flow_resets.push(flow);
                         continue;
                     }
                     // §22 / §23: rate, burst, algorithm or window changed → re-install
@@ -214,7 +215,7 @@ impl Limiter {
                         || np.algorithm != applied.algorithm
                         || np.limit_window_secs != applied.limit_window_secs
                     {
-                        actions.push(LimitAction::Install {
+                        installs.push(LimitAction::Install {
                             ipv4: ip,
                             direction: dir,
                             rate_bps: np.limit_bps,
@@ -223,9 +224,47 @@ impl Limiter {
                             window_ns: np.limit_window_secs.saturating_mul(1_000_000_000),
                         });
                     }
-                    state.limited_until = limited_until;
-                    state.applied = Some(np);
+                    flow_updates.push((flow, limited_until, np));
                 }
+            }
+        }
+
+        // Removes run first: they free map capacity before installs spend it.
+        let mut actions = removes;
+        actions.extend(installs);
+        Ok(ReloadPlan {
+            actions,
+            new_ranges,
+            new_overrides,
+            flow_resets,
+            flow_updates,
+        })
+    }
+
+    /// Apply a plan's internal transitions after the runtime has executed every map
+    /// operation successfully. Never called on a rejected plan.
+    pub fn commit_reload(&mut self, plan: ReloadPlan) {
+        self.ranges = plan.new_ranges;
+        self.overrides = plan.new_overrides;
+
+        // Baselines for IPs that no longer have any policy are dead weight (§33). If a
+        // policy comes back for such an IP later it starts from a fresh baseline, which
+        // is the same semantics as any newly added policy.
+        self.prev_totals
+            .retain(|ip, _| lookup(&self.ranges, &self.overrides, *ip).is_some());
+
+        for flow in plan.flow_resets {
+            if let Some(s) = self.states.get_mut(&flow) {
+                *s = DirState::default();
+            }
+            if let Some(w) = self.windows.get_mut(&flow) {
+                w.reset();
+            }
+        }
+        for (flow, limited_until, applied) in plan.flow_updates {
+            if let Some(s) = self.states.get_mut(&flow) {
+                s.limited_until = limited_until;
+                s.applied = Some(applied);
             }
         }
 
@@ -263,8 +302,15 @@ impl Limiter {
                     })
                     .is_some()
         });
+    }
 
-        Ok(actions)
+    /// Drop the phase state of one flow (keeps its rolling window/baseline). Used after a
+    /// failed runtime map apply so the flow re-evaluates from NORMAL instead of sitting
+    /// in a LIMITED phase the dataplane does not share.
+    pub fn reset_flow(&mut self, ip: u32, dir: u8) {
+        if let Some(s) = self.states.get_mut(&(ip, dir)) {
+            *s = DirState::default();
+        }
     }
 
     /// Advance one tick with the current per-IP cumulative totals. Returns the actions the
@@ -482,7 +528,8 @@ mod tests {
     fn triggers_after_full_window() {
         let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
 
         let mut cumulative = 0u64;
         let mut actions = Vec::new();
@@ -512,7 +559,8 @@ mod tests {
     fn does_not_trigger_before_window_full() {
         let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
         let mut cumulative = 0u64;
         for t in 1..=2 {
             cumulative += BYTES_PER_TICK;
@@ -526,7 +574,8 @@ mod tests {
     fn expires_after_duration() {
         let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
         let cumulative = drive_to_limited(&mut l);
         assert!(l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
         // limited at t=4 with duration 10 → until t=14.
@@ -544,7 +593,8 @@ mod tests {
     fn counter_reset_yields_zero_delta() {
         let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
         l.tick(1, &totals(IP, 1_000_000, 0));
         let actions = l.tick(2, &totals(IP, 0, 0));
         assert!(actions.is_empty(), "{actions:?}");
@@ -565,7 +615,8 @@ mod tests {
             .insert(u32::from(std::net::Ipv4Addr::new(10, 30, 8, 2)), ov);
         let cfg = cfg_from(vec![r]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
 
         let eff = l
             .effective_policy(u32::from(std::net::Ipv4Addr::new(10, 30, 8, 2)))
@@ -583,12 +634,15 @@ mod tests {
     fn reload_removes_limiter_when_policy_deleted() {
         let cfg_with = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg_with, 0).unwrap();
+        let plan = l.plan_reload(&cfg_with, 0).unwrap();
+        l.commit_reload(plan);
         drive_to_limited(&mut l);
         assert!(l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
 
         let cfg_without = cfg_from(vec![range("A", IP, IP, PolicyFields::default())]);
-        let actions = l.apply_config(&cfg_without, 5).unwrap();
+        let plan = l.plan_reload(&cfg_without, 5).unwrap();
+        let actions = plan.actions.clone();
+        l.commit_reload(plan);
         assert!(actions
             .iter()
             .any(|a| matches!(a, LimitAction::Remove { direction, .. } if *direction == DIR_RX)));
@@ -599,14 +653,17 @@ mod tests {
     fn reload_updates_limit_for_limited_flow() {
         let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
         drive_to_limited(&mut l);
         assert!(l.is_limited(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX));
 
         let mut pf = policy_fields();
         pf.rx_limit_bps = Some(300_000_000);
         let cfg2 = cfg_from(vec![range("A", IP, IP, pf)]);
-        let actions = l.apply_config(&cfg2, 5).unwrap();
+        let plan = l.plan_reload(&cfg2, 5).unwrap();
+        let actions = plan.actions.clone();
+        l.commit_reload(plan);
         let install = actions
             .iter()
             .find(|a| matches!(a, LimitAction::Install { direction, .. } if *direction == DIR_RX))
@@ -622,7 +679,8 @@ mod tests {
     fn reload_duration_reanchored_and_may_release() {
         let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
         drive_to_limited(&mut l);
         // limited_since = 4, duration 10 → until 14; at now=5 that is 9s left.
         assert_eq!(
@@ -633,7 +691,9 @@ mod tests {
         let mut pf = policy_fields();
         pf.limit_duration_secs = Some(1);
         let cfg2 = cfg_from(vec![range("A", IP, IP, pf)]);
-        let actions = l.apply_config(&cfg2, 5).unwrap();
+        let plan = l.plan_reload(&cfg2, 5).unwrap();
+        let actions = plan.actions.clone();
+        l.commit_reload(plan);
         assert!(actions
             .iter()
             .any(|a| matches!(a, LimitAction::Remove { direction, .. } if *direction == DIR_RX)));
@@ -644,7 +704,8 @@ mod tests {
     fn reload_window_change_resets_accumulation() {
         let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
         let mut l = Limiter::new(1);
-        l.apply_config(&cfg, 0).unwrap();
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
         // Partially fill the window.
         l.tick(1, &totals(IP, BYTES_PER_TICK, 0));
         l.tick(2, &totals(IP, BYTES_PER_TICK * 2, 0));
@@ -654,10 +715,73 @@ mod tests {
         let mut pf = policy_fields();
         pf.window_secs = Some(10);
         let cfg2 = cfg_from(vec![range("A", IP, IP, pf)]);
-        l.apply_config(&cfg2, 3).unwrap();
+        let plan = l.plan_reload(&cfg2, 3).unwrap();
+        l.commit_reload(plan);
         assert_eq!(
             l.window_avg_bps(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX),
             0.0
+        );
+    }
+
+    #[test]
+    fn reload_plan_orders_removes_before_installs() {
+        // Two flows LIMITED under cfg1; cfg2 deletes A's policy and changes B's rate.
+        // The plan must execute A's Remove before B's Install: removes free map
+        // capacity that installs then spend.
+        let ip_a = [10u8, 0, 0, 1];
+        let ip_b = [10u8, 0, 0, 2];
+        let a = u32::from(std::net::Ipv4Addr::from(ip_a));
+        let b = u32::from(std::net::Ipv4Addr::from(ip_b));
+
+        let cfg1 = cfg_from(vec![
+            range("A", ip_a, ip_a, policy_fields()),
+            range("B", ip_b, ip_b, policy_fields()),
+        ]);
+        let mut l = Limiter::new(1);
+        let plan = l.plan_reload(&cfg1, 0).unwrap();
+        l.commit_reload(plan);
+
+        let (mut cum_a, mut cum_b) = (0u64, 0u64);
+        for t in 1..=4 {
+            cum_a += BYTES_PER_TICK;
+            cum_b += BYTES_PER_TICK;
+            let mut m = HashMap::new();
+            for (ip, cum) in [(a, cum_a), (b, cum_b)] {
+                m.insert(
+                    ip,
+                    IpTotals {
+                        rx_bytes: cum,
+                        tx_bytes: 0,
+                        rx_packets: 0,
+                        tx_packets: 0,
+                    },
+                );
+            }
+            l.tick(t, &m);
+        }
+        assert!(l.is_limited(a, DIR_RX));
+        assert!(l.is_limited(b, DIR_RX));
+
+        let mut pf_b = policy_fields();
+        pf_b.rx_limit_bps = Some(300_000_000);
+        let cfg2 = cfg_from(vec![
+            range("A", ip_a, ip_a, PolicyFields::default()),
+            range("B", ip_b, ip_b, pf_b),
+        ]);
+        let plan = l.plan_reload(&cfg2, 5).unwrap();
+        let pos_remove = plan
+            .actions
+            .iter()
+            .position(|x| matches!(x, LimitAction::Remove { ipv4, .. } if *ipv4 == a))
+            .expect("remove action for A");
+        let pos_install = plan
+            .actions
+            .iter()
+            .position(|x| matches!(x, LimitAction::Install { ipv4, .. } if *ipv4 == b))
+            .expect("install action for B");
+        assert!(
+            pos_remove < pos_install,
+            "removes must execute before installs"
         );
     }
 }
