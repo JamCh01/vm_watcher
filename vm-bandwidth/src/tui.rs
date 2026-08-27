@@ -14,7 +14,7 @@ use ratatui::Frame;
 
 use vm_bandwidth_core::bandwidth::{format_bps, format_bytes};
 use vm_bandwidth_core::config::SortMode;
-use vm_bandwidth_core::ipc::{IpDetail, RangeDetail, Status};
+use vm_bandwidth_core::ipc::{IpDetail, RangeDetail, RangeSummary, Status};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Screen {
@@ -216,21 +216,18 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
         return;
     };
 
+    // Wide terminals get every column; narrower ones drop totals and IP counts
+    // progressively instead of overlapping cells (same tiers as the detail page).
+    let cols = match area.width {
+        w if w >= 105 => OverviewCols::Wide,
+        w if w >= 66 => OverviewCols::Mid,
+        _ => OverviewCols::Min,
+    };
+
     let mut rows: Vec<Row> = status
         .ranges
         .iter()
-        .map(|r| {
-            Row::new(vec![
-                Cell::from(r.name.clone()),
-                Cell::from(r.range.clone()),
-                Cell::from(format_bps(r.rx_bps)),
-                Cell::from(format_bps(r.tx_bps)),
-                Cell::from(format_bytes(r.rx_bytes)),
-                Cell::from(format_bytes(r.tx_bytes)),
-                Cell::from(r.ip_count.to_string()),
-                style_limited(r.limited),
-            ])
-        })
+        .map(|r| overview_row(r, cols))
         .collect();
 
     // Grand-total row across all ranges (cumulative totals are since daemon start).
@@ -243,7 +240,102 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
     });
     let limited_total: usize = status.ranges.iter().map(|r| r.limited).sum();
     rows.push(
-        Row::new(vec![
+        total_row(rx_bps, tx_bps, rx_bytes, tx_bytes, limited_total, cols)
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    );
+
+    let (widths, headers): (&[Constraint], &[&str]) = match cols {
+        OverviewCols::Wide => (
+            &[
+                Constraint::Min(14),
+                Constraint::Min(22),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(11),
+                Constraint::Length(11),
+                Constraint::Length(6),
+                Constraint::Length(8),
+            ],
+            &[
+                "Name", "IP Range", "RX", "TX", "RX Total", "TX Total", "IPs", "Limited",
+            ],
+        ),
+        OverviewCols::Mid => (
+            &[
+                Constraint::Min(14),
+                Constraint::Min(22),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(8),
+            ],
+            &["Name", "IP Range", "RX", "TX", "Limited"],
+        ),
+        OverviewCols::Min => (
+            &[
+                Constraint::Min(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(8),
+            ],
+            &["Name", "RX", "TX", "Limited"],
+        ),
+    };
+    let table = Table::new(rows, widths)
+        .header(header_row(headers.iter().copied()))
+        .block(Block::bordered().title("IP Range Overview"))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
+
+    clamp_selection(&mut app.overview, status.ranges.len());
+    f.render_stateful_widget(table, area, &mut app.overview);
+}
+
+/// Column density of the overview table, chosen from the available width.
+#[derive(Clone, Copy)]
+enum OverviewCols {
+    Wide,
+    Mid,
+    Min,
+}
+
+fn overview_row(r: &RangeSummary, cols: OverviewCols) -> Row<'static> {
+    match cols {
+        OverviewCols::Wide => Row::new(vec![
+            Cell::from(r.name.clone()),
+            Cell::from(r.range.clone()),
+            Cell::from(format_bps(r.rx_bps)),
+            Cell::from(format_bps(r.tx_bps)),
+            Cell::from(format_bytes(r.rx_bytes)),
+            Cell::from(format_bytes(r.tx_bytes)),
+            Cell::from(r.ip_count.to_string()),
+            style_limited(r.limited),
+        ]),
+        OverviewCols::Mid => Row::new(vec![
+            Cell::from(r.name.clone()),
+            Cell::from(r.range.clone()),
+            Cell::from(format_bps(r.rx_bps)),
+            Cell::from(format_bps(r.tx_bps)),
+            style_limited(r.limited),
+        ]),
+        OverviewCols::Min => Row::new(vec![
+            Cell::from(r.name.clone()),
+            Cell::from(format_bps(r.rx_bps)),
+            Cell::from(format_bps(r.tx_bps)),
+            style_limited(r.limited),
+        ]),
+    }
+}
+
+fn total_row(
+    rx_bps: f64,
+    tx_bps: f64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    limited: usize,
+    cols: OverviewCols,
+) -> Row<'static> {
+    match cols {
+        OverviewCols::Wide => Row::new(vec![
             Cell::from("Σ All ranges"),
             Cell::from(""),
             Cell::from(format_bps(rx_bps)),
@@ -251,31 +343,22 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
             Cell::from(format_bytes(rx_bytes)),
             Cell::from(format_bytes(tx_bytes)),
             Cell::from(""),
-            Cell::from(limited_total.to_string()),
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
-    );
-
-    let widths = [
-        Constraint::Min(14),
-        Constraint::Min(22),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(11),
-        Constraint::Length(11),
-        Constraint::Length(6),
-        Constraint::Length(8),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header_row([
-            "Name", "IP Range", "RX", "TX", "RX Total", "TX Total", "IPs", "Limited",
-        ]))
-        .block(Block::bordered().title("IP Range Overview"))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
-
-    clamp_selection(&mut app.overview, status.ranges.len());
-    f.render_stateful_widget(table, area, &mut app.overview);
+            Cell::from(limited.to_string()),
+        ]),
+        OverviewCols::Mid => Row::new(vec![
+            Cell::from("Σ All ranges"),
+            Cell::from(""),
+            Cell::from(format_bps(rx_bps)),
+            Cell::from(format_bps(tx_bps)),
+            Cell::from(limited.to_string()),
+        ]),
+        OverviewCols::Min => Row::new(vec![
+            Cell::from("Σ All ranges"),
+            Cell::from(format_bps(rx_bps)),
+            Cell::from(format_bps(tx_bps)),
+            Cell::from(limited.to_string()),
+        ]),
+    }
 }
 
 fn style_limited(n: usize) -> Cell<'static> {
