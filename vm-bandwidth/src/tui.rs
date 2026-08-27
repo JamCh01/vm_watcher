@@ -239,9 +239,18 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
         (r.saturating_add(x.rx_bytes), t.saturating_add(x.tx_bytes))
     });
     let limited_total: usize = status.ranges.iter().map(|r| r.limited).sum();
+    let ip_total: usize = status.ranges.iter().map(|r| r.ip_count).sum();
     rows.push(
-        total_row(rx_bps, tx_bps, rx_bytes, tx_bytes, limited_total, cols)
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        total_row(
+            rx_bps,
+            tx_bps,
+            rx_bytes,
+            tx_bytes,
+            ip_total,
+            limited_total,
+            cols,
+        )
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     );
 
     let (widths, headers): (&[Constraint], &[&str]) = match cols {
@@ -277,7 +286,7 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
                 Constraint::Length(12),
                 Constraint::Length(8),
             ],
-            &["Name", "RX", "TX", "Limited"],
+            &["Name / Range", "RX", "TX", "Limited"],
         ),
     };
     let table = Table::new(rows, widths)
@@ -318,7 +327,12 @@ fn overview_row(r: &RangeSummary, cols: OverviewCols) -> Row<'static> {
             style_limited(r.limited),
         ]),
         OverviewCols::Min => Row::new(vec![
-            Cell::from(r.name.clone()),
+            // Two-line cell: narrow terminals drop the Range column, so keep the
+            // identity visible by stacking name over range in one cell.
+            Cell::from(vec![
+                Line::from(r.name.clone()),
+                Line::from(r.range.clone()),
+            ]),
             Cell::from(format_bps(r.rx_bps)),
             Cell::from(format_bps(r.tx_bps)),
             style_limited(r.limited),
@@ -331,6 +345,7 @@ fn total_row(
     tx_bps: f64,
     rx_bytes: u64,
     tx_bytes: u64,
+    ip_total: usize,
     limited: usize,
     cols: OverviewCols,
 ) -> Row<'static> {
@@ -342,18 +357,21 @@ fn total_row(
             Cell::from(format_bps(tx_bps)),
             Cell::from(format_bytes(rx_bytes)),
             Cell::from(format_bytes(tx_bytes)),
-            Cell::from(""),
+            Cell::from(ip_total.to_string()),
             Cell::from(limited.to_string()),
         ]),
         OverviewCols::Mid => Row::new(vec![
-            Cell::from("Σ All ranges"),
+            Cell::from(format!("Σ All ranges ({ip_total} IPs)")),
             Cell::from(""),
             Cell::from(format_bps(rx_bps)),
             Cell::from(format_bps(tx_bps)),
             Cell::from(limited.to_string()),
         ]),
         OverviewCols::Min => Row::new(vec![
-            Cell::from("Σ All ranges"),
+            Cell::from(vec![
+                Line::from("Σ All ranges"),
+                Line::from(format!("{ip_total} IPs")),
+            ]),
             Cell::from(format_bps(rx_bps)),
             Cell::from(format_bps(tx_bps)),
             Cell::from(limited.to_string()),
