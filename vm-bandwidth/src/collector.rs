@@ -133,11 +133,13 @@ impl Collector {
     }
 
     /// Drop state for IPs that are no longer configured (§33: no stale entries linger
-    /// after a range is removed by a hot reload).
-    pub fn prune_ips(&mut self, keep: &HashSet<u32>) {
-        self.totals.retain(|ip, _| keep.contains(ip));
-        self.prev.retain(|key, _| keep.contains(&key.ipv4));
-        self.prev_policer.retain(|key, _| keep.contains(&key.ipv4));
+    /// after a range is removed by a hot reload). Membership is a range-containment
+    /// test over the observed IPs — the ranges themselves are never enumerated.
+    pub fn prune_ips(&mut self, ranges: &[IpRange]) {
+        let kept = |ip: &u32| ranges.iter().any(|r| r.contains(*ip));
+        self.totals.retain(|ip, _| kept(ip));
+        self.prev.retain(|key, _| kept(&key.ipv4));
+        self.prev_policer.retain(|key, _| kept(&key.ipv4));
     }
 
     /// Drop previous-sample entries for TAPs that no longer exist (pairs that can never
@@ -314,31 +316,35 @@ impl Collector {
             }
         }
 
-        // Per-range aggregation over every configured IP, traffic or not.
-        let mut snap_ranges = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let mut rs = RangeStats {
+        // Per-range aggregation over OBSERVED IPs only (the LPM-trie whitelist makes
+        // ranges arbitrarily large, so enumerating them is impossible by design).
+        // Idle addresses contribute zero anyway; `ips` is now "seen since daemon start".
+        let mut snap_ranges: Vec<RangeStats> = ranges
+            .iter()
+            .map(|range| RangeStats {
                 name: range.name.clone(),
                 range: range.display(),
                 ..Default::default()
+            })
+            .collect();
+        for (&ip, stats) in self.totals.iter() {
+            let Some(idx) = ranges.iter().position(|r| r.contains(ip)) else {
+                continue;
             };
-            for ip in range.start..=range.end {
-                let stats = self.totals.get(&ip).cloned().unwrap_or_default();
-                rs.rx_bps += stats.rx_bps;
-                rs.tx_bps += stats.tx_bps;
-                rs.rx_bytes += stats.rx_bytes;
-                rs.tx_bytes += stats.tx_bytes;
-                rs.rx_packets += stats.rx_packets;
-                rs.tx_packets += stats.tx_packets;
-                rs.rx_dropped_bps += stats.rx_dropped_bps;
-                rs.tx_dropped_bps += stats.tx_dropped_bps;
-                rs.rx_dropped_bytes += stats.rx_dropped_bytes;
-                rs.tx_dropped_bytes += stats.tx_dropped_bytes;
-                rs.rx_dropped_packets += stats.rx_dropped_packets;
-                rs.tx_dropped_packets += stats.tx_dropped_packets;
-                rs.ips.push((ip, stats));
-            }
-            snap_ranges.push(rs);
+            let rs = &mut snap_ranges[idx];
+            rs.rx_bps += stats.rx_bps;
+            rs.tx_bps += stats.tx_bps;
+            rs.rx_bytes += stats.rx_bytes;
+            rs.tx_bytes += stats.tx_bytes;
+            rs.rx_packets += stats.rx_packets;
+            rs.tx_packets += stats.tx_packets;
+            rs.rx_dropped_bps += stats.rx_dropped_bps;
+            rs.tx_dropped_bps += stats.tx_dropped_bps;
+            rs.rx_dropped_bytes += stats.rx_dropped_bytes;
+            rs.tx_dropped_bytes += stats.tx_dropped_bytes;
+            rs.rx_dropped_packets += stats.rx_dropped_packets;
+            rs.tx_dropped_packets += stats.tx_dropped_packets;
+            rs.ips.push((ip, stats.clone()));
         }
 
         let totals = self

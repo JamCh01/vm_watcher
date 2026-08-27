@@ -472,16 +472,6 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         });
     }
 
-    // v1 sizing guard: every address is enumerated into the whitelist and per-IP map
-    // state is sized from this total. It lives in the shared validation layer so hot
-    // reload cannot bypass it.
-    let total_ips: u64 = validated.iter().map(|r| r.len()).sum();
-    if total_ips > 1 << 20 {
-        return Err(format!(
-            "configured IP ranges cover {total_ips} addresses, which is too large for v1"
-        ));
-    }
-
     Ok(ValidatedConfig {
         bridge,
         refresh_interval_ms: config.collector.refresh_interval_ms,
@@ -612,11 +602,12 @@ range = "10.0.0.1-10.0.0.2"
     }
 
     #[test]
-    fn rejects_ranges_larger_than_the_v1_cap() {
-        // 192.0.0.0/6 = 2^26 addresses > the 1<<20 cap.
+    fn accepts_huge_ranges() {
+        // The whitelist is an LPM trie of CIDR prefixes: range size no longer costs
+        // one map entry per address, so large ranges are valid.
         let text =
             "[network]\nbridge = \"br0\"\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
-        assert!(load_str(text).is_err());
+        assert!(load_str(text).is_ok());
     }
 
     const POLICY_EXAMPLE: &str = r#"

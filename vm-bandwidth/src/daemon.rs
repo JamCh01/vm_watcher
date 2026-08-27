@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use aya::maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuHashMap};
+use aya::maps::{
+    lpm_trie::Key as TrieKey, HashMap as AyaHashMap, LpmTrie, MapData, MapError, PerCpuHashMap,
+};
 use futures::{SinkExt, StreamExt};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::RecursiveMode;
@@ -29,6 +31,7 @@ use vm_bandwidth_common::{
 };
 
 use vm_bandwidth_core::config::{self, ValidatedConfig};
+use vm_bandwidth_core::ip_range::Cidr;
 use vm_bandwidth_core::ipc::{
     self, IpDetail, RangeDetail, RangeSummary, Request, Response, Status,
 };
@@ -62,8 +65,8 @@ type ConfigArc = Arc<ArcSwap<ValidatedConfig>>;
 /// succeed, played back in reverse on the first failure.
 #[derive(Default)]
 struct MapRollback {
-    wl_added: Vec<u32>,
-    wl_removed: Vec<u32>,
+    wl_added: Vec<Cidr>,
+    wl_removed: Vec<Cidr>,
     /// Executed Remove actions with the policy they displaced (None = was absent).
     removes: Vec<(LimitKey, Option<LimitPolicy>)>,
     /// Executed Install actions with the policy they displaced (None = fresh flow).
@@ -112,12 +115,10 @@ struct Engine {
     /// Last poll's aggregate IPv6 counters, for the VictoriaMetrics push.
     last_ipv6: crate::collector::IpStats,
 
-    /// Map capacities fixed at startup; hot reload must fit inside them.
+    /// Whitelist-trie capacity fixed at startup; hot reload must fit inside it.
     whitelist_capacity: u32,
-    traffic_capacity: u32,
-    limit_capacity: u32,
 
-    monitored: AyaHashMap<MapData, u32, u8>,
+    monitored: LpmTrie<MapData, u32, u8>,
     #[allow(dead_code)] // kept alive so its map fd stays open
     limit_policies: AyaHashMap<MapData, LimitKey, LimitPolicy>,
     limit_state: AyaHashMap<MapData, LimitKey, LimitState>,
@@ -211,7 +212,7 @@ impl Engine {
             .load()
             .ranges
             .iter()
-            .find(|r| (r.inner.start..=r.inner.end).contains(&ip))
+            .find(|r| r.inner.contains(ip))
             .map(|r| r.inner.name.clone())
             .unwrap_or_else(|| "unknown".to_string())
     }
@@ -404,11 +405,15 @@ impl Engine {
                 }
             }
         }
-        for ip in rb.wl_removed.iter().rev() {
-            let _ = self.monitored.insert(*ip, 1u8, 0);
+        for c in rb.wl_removed.iter().rev() {
+            let _ =
+                self.monitored
+                    .insert(&TrieKey::new(u32::from(c.prefix_len), c.network), 1u8, 0);
         }
-        for ip in rb.wl_added.iter().rev() {
-            let _ = self.monitored.remove(ip);
+        for c in rb.wl_added.iter().rev() {
+            let _ = self
+                .monitored
+                .remove(&TrieKey::new(u32::from(c.prefix_len), c.network));
         }
     }
 
@@ -516,48 +521,17 @@ impl Engine {
             );
         }
 
-        let old_ips = ip_set(&cur);
-        let new_ips = ip_set(&new_cfg);
+        let old_prefixes = prefix_set(&cur);
+        let new_prefixes = prefix_set(&new_cfg);
 
-        // Refuse reloads that would overflow the startup-sized maps BEFORE touching any
-        // map, instead of failing halfway through the whitelist phase.
-        let new_count = u32::try_from(new_ips.len()).unwrap_or(u32::MAX);
+        // The trie capacity is fixed at startup; refuse a reload that would overflow it
+        // before touching any map, instead of failing halfway through the install phase.
+        let new_count = u32::try_from(new_prefixes.len()).unwrap_or(u32::MAX);
         if new_count > self.whitelist_capacity {
             anyhow::bail!(
-                "new config monitors {new_count} addresses but MONITORED_IPS capacity is {} \
-                 (sized at startup); restart the daemon to resize it",
+                "new config needs {new_count} whitelist prefixes but MONITORED_IPS capacity \
+                 is {} (sized at startup); restart the daemon to resize it",
                 self.whitelist_capacity
-            );
-        }
-        if new_count.saturating_mul(2) > self.traffic_capacity {
-            anyhow::bail!(
-                "new config needs ~{} TRAFFIC entries (2 per address) but the map capacity \
-                 is {} (collector.map_max_entries at startup); restart the daemon with a \
-                 larger value",
-                new_count.saturating_mul(2),
-                self.traffic_capacity
-            );
-        }
-        // Upper bound on flows that may become LIMITED simultaneously: every address
-        // with a policy, both directions.
-        let policied_ips: u64 = new_cfg
-            .ranges
-            .iter()
-            .map(|r| {
-                if r.policy.is_empty() {
-                    r.overrides.len() as u64
-                } else {
-                    r.len()
-                }
-            })
-            .sum();
-        if policied_ips.saturating_mul(2) > self.limit_capacity as u64 {
-            anyhow::bail!(
-                "new config may limit {policied_ips} addresses ({} flows) but the limit \
-                 maps hold {} entries (collector.map_max_entries at startup); restart the \
-                 daemon with a larger value",
-                policied_ips.saturating_mul(2),
-                self.limit_capacity
             );
         }
 
@@ -568,14 +542,14 @@ impl Engine {
             .map_err(anyhow::Error::msg)?;
 
         let mut rb = MapRollback::default();
-        if let Err(e) = self.apply_maps(&plan.actions, &old_ips, &new_ips, &mut rb) {
+        if let Err(e) = self.apply_maps(&plan.actions, &old_prefixes, &new_prefixes, &mut rb) {
             self.rollback_map_apply(&rb);
             return Err(e);
         }
 
         // Commit phase: limiter internals, then collector, then the visible switch.
         self.limiter.commit_reload(plan);
-        self.collector.prune_ips(&new_ips);
+        self.collector.prune_ips(&new_cfg.ip_ranges());
         self.config.store(Arc::new(new_cfg));
         Ok(())
     }
@@ -585,21 +559,24 @@ impl Engine {
     fn apply_maps(
         &mut self,
         actions: &[LimitAction],
-        old_ips: &HashSet<u32>,
-        new_ips: &HashSet<u32>,
+        old_prefixes: &HashSet<Cidr>,
+        new_prefixes: &HashSet<Cidr>,
         rb: &mut MapRollback,
     ) -> Result<()> {
-        for ip in new_ips.difference(old_ips) {
+        for c in new_prefixes.difference(old_prefixes) {
             self.monitored
-                .insert(*ip, 1u8, 0)
-                .with_context(|| format!("whitelisting {ip}"))?;
-            rb.wl_added.push(*ip);
+                .insert(&TrieKey::new(u32::from(c.prefix_len), c.network), 1u8, 0)
+                .with_context(|| format!("whitelisting {}", c.display()))?;
+            rb.wl_added.push(*c);
         }
         self.execute_limit_actions(actions, rb)?;
-        for ip in old_ips.difference(new_ips) {
-            map_gone(self.monitored.remove(ip))
-                .with_context(|| format!("dropping whitelist IP {ip}"))?;
-            rb.wl_removed.push(*ip);
+        for c in old_prefixes.difference(new_prefixes) {
+            map_gone(
+                self.monitored
+                    .remove(&TrieKey::new(u32::from(c.prefix_len), c.network)),
+            )
+            .with_context(|| format!("dropping whitelist prefix {}", c.display()))?;
+            rb.wl_removed.push(*c);
         }
         Ok(())
     }
@@ -733,14 +710,10 @@ fn state_label(limited: bool) -> String {
     }
 }
 
-fn ip_set(cfg: &ValidatedConfig) -> HashSet<u32> {
-    let mut set = HashSet::new();
-    for range in &cfg.ranges {
-        for ip in range.start..=range.end {
-            set.insert(ip);
-        }
-    }
-    set
+/// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
+/// Ranges are validated disjoint, so their prefix sets never overlap.
+fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
+    cfg.ranges.iter().flat_map(|r| r.inner.cidrs()).collect()
 }
 
 /// Entry point for daemon mode.
@@ -778,10 +751,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         let _ = std::fs::remove_file(pin);
     }
 
-    // The v1 address cap is enforced in the shared validation layer (config::parse) so
-    // hot reload cannot bypass it; here we only size the maps from the total.
     let total_ips: u64 = cfg.ranges.iter().map(|r| r.len()).sum();
-    let whitelist_capacity = (total_ips.max(1) as u32)
+    let prefixes: Vec<Cidr> = cfg.ranges.iter().flat_map(|r| r.inner.cidrs()).collect();
+    // The LPM trie holds one entry per CIDR prefix, not per address; keep headroom for
+    // hot-reload additions.
+    let whitelist_capacity = (prefixes.len().max(1) as u32)
         .saturating_mul(2)
         .next_power_of_two();
 
@@ -799,19 +773,20 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
              a kernel with TC eBPF support, and bpffs mounted at /sys/fs/bpf",
         )?;
 
-    let mut monitored = AyaHashMap::<_, u32, u8>::try_from(
+    let mut monitored = LpmTrie::<_, u32, u8>::try_from(
         base.take_map("MONITORED_IPS")
             .context("MONITORED_IPS map missing")?,
     )
     .context("MONITORED_IPS has the wrong type")?;
-    for range in &cfg.ranges {
-        for ip in range.start..=range.end {
-            monitored
-                .insert(ip, 1u8, 0)
-                .with_context(|| format!("inserting whitelist IP {ip}"))?;
-        }
+    for c in &prefixes {
+        monitored
+            .insert(&TrieKey::new(u32::from(c.prefix_len), c.network), 1u8, 0)
+            .with_context(|| format!("inserting whitelist prefix {}", c.display()))?;
     }
-    log::info!("whitelisted {total_ips} IPv4 address(es)");
+    log::info!(
+        "whitelisted {} CIDR prefix(es) covering {total_ips} IPv4 address(es)",
+        prefixes.len()
+    );
 
     let limit_policies = AyaHashMap::<_, LimitKey, LimitPolicy>::try_from(
         base.take_map("LIMIT_POLICIES")
@@ -855,7 +830,6 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
 
     // refresh_interval_ms is validated second-aligned, so this division is exact.
     let tick_secs = cfg.refresh_interval_ms / 1000;
-    let map_max_entries = cfg.map_max_entries;
     let config: ConfigArc = Arc::new(ArcSwap::from_pointee(cfg));
     let (config_watch, _) = watch::channel(1u64);
     let mut engine = Engine {
@@ -877,8 +851,6 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_policer: std::collections::HashMap::new(),
         last_ipv6: crate::collector::IpStats::default(),
         whitelist_capacity,
-        traffic_capacity: map_max_entries,
-        limit_capacity: map_max_entries,
         monitored,
         limit_policies,
         limit_state,

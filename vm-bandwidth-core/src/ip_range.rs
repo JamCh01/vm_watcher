@@ -5,6 +5,31 @@ use std::net::Ipv4Addr;
 
 use crate::config::IpRangeEntry;
 
+/// One CIDR prefix: `network` with its top `prefix_len` bits fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Cidr {
+    pub prefix_len: u8,
+    pub network: u32,
+}
+
+impl Cidr {
+    /// `10.30.8.0/24`
+    pub fn display(&self) -> String {
+        format!("{}/{}", Ipv4Addr::from(self.network), self.prefix_len)
+    }
+
+    /// Inclusive address span covered by this prefix.
+    pub fn span(&self) -> (u32, u32) {
+        let size = if self.prefix_len == 0 {
+            1u64 << 32
+        } else {
+            1u64 << (32 - self.prefix_len)
+        };
+        let start = u64::from(self.network);
+        (start as u32, (start + size - 1) as u32)
+    }
+}
+
 /// One configured, validated IP range. `start <= end` always holds.
 #[derive(Debug, Clone)]
 pub struct IpRange {
@@ -21,6 +46,39 @@ impl IpRange {
     /// A valid range always contains at least one address; required by clippy.
     pub fn is_empty(&self) -> bool {
         false
+    }
+
+    pub fn contains(&self, ip: u32) -> bool {
+        (self.start..=self.end).contains(&ip)
+    }
+
+    /// Minimal set of CIDR prefixes whose union is exactly `start..=end`. This is what
+    /// gets loaded into the LPM-trie whitelist, so a range costs O(log) map entries
+    /// instead of one entry per address. At most 62 prefixes per range.
+    pub fn cidrs(&self) -> Vec<Cidr> {
+        let mut out = Vec::new();
+        let mut cur = u64::from(self.start);
+        let end = u64::from(self.end);
+        while cur <= end {
+            // Largest power-of-two block starting at `cur` that stays inside the range:
+            // alignment limits the block size (a 2^k block needs a 2^k-aligned start),
+            // the remaining length bounds it. A u64 cursor keeps `end = u32::MAX` safe.
+            let align_bits = if cur == 0 { 32 } else { cur.trailing_zeros() };
+            let mut bits = 0u32;
+            while bits < align_bits && bits < 32 {
+                let next = bits + 1;
+                if cur + (1u64 << next) - 1 > end {
+                    break;
+                }
+                bits = next;
+            }
+            out.push(Cidr {
+                prefix_len: (32 - bits) as u8,
+                network: cur as u32,
+            });
+            cur += 1u64 << bits;
+        }
+        out
     }
 
     /// `10.30.8.1-10.30.8.16`
@@ -200,5 +258,109 @@ mod tests {
             .unwrap();
         assert_eq!(r.len(), 16);
         assert_eq!(r.display(), "10.30.8.1-10.30.8.16");
+        assert!(r.contains(u32::from(Ipv4Addr::new(10, 30, 8, 1))));
+        assert!(!r.contains(u32::from(Ipv4Addr::new(10, 30, 8, 17))));
+    }
+
+    fn one_range(range: &str) -> IpRange {
+        validate_ranges(&[entry("A", range)])
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    #[test]
+    fn cidr_single_ip() {
+        assert_eq!(
+            one_range("10.0.0.5-10.0.0.5").cidrs(),
+            vec![Cidr {
+                prefix_len: 32,
+                network: u32::from(Ipv4Addr::new(10, 0, 0, 5))
+            }]
+        );
+    }
+
+    #[test]
+    fn cidr_aligned_block() {
+        assert_eq!(
+            one_range("10.30.8.0-10.30.8.255").cidrs(),
+            vec![Cidr {
+                prefix_len: 24,
+                network: u32::from(Ipv4Addr::new(10, 30, 8, 0))
+            }]
+        );
+    }
+
+    #[test]
+    fn cidr_full_space() {
+        assert_eq!(
+            one_range("0.0.0.0-255.255.255.255").cidrs(),
+            vec![Cidr {
+                prefix_len: 0,
+                network: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn cidr_irregular_known_answer() {
+        // 121-130: /32 + /31 + /30 + /31 + /32.
+        let base = u32::from(Ipv4Addr::new(10, 30, 10, 0));
+        assert_eq!(
+            one_range("10.30.10.121-10.30.10.130").cidrs(),
+            vec![
+                Cidr {
+                    prefix_len: 32,
+                    network: base | 121
+                },
+                Cidr {
+                    prefix_len: 31,
+                    network: base | 122
+                },
+                Cidr {
+                    prefix_len: 30,
+                    network: base | 124
+                },
+                Cidr {
+                    prefix_len: 31,
+                    network: base | 128
+                },
+                Cidr {
+                    prefix_len: 32,
+                    network: base | 130
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cidrs_reassemble_exactly() {
+        // The decomposed prefixes must tile the original range: contiguous, no gaps.
+        for range in [
+            "10.30.10.121-10.30.10.130",
+            "192.168.1.3-192.168.7.250",
+            "10.0.0.0-10.0.0.255",
+            "1.2.3.4-5.6.7.8",
+        ] {
+            let r = one_range(range);
+            let list = r.cidrs();
+            let (first_start, _) = list.first().unwrap().span();
+            let (_, last_end) = list.last().unwrap().span();
+            assert_eq!(first_start, r.start, "{range}: bad first prefix");
+            assert_eq!(last_end, r.end, "{range}: bad last prefix");
+            for pair in list.windows(2) {
+                let (_, prev_end) = pair[0].span();
+                let (next_start, _) = pair[1].span();
+                assert_eq!(next_start, prev_end + 1, "{range}: gap or overlap");
+            }
+            let total: u64 = list
+                .iter()
+                .map(|c| {
+                    let (s, e) = c.span();
+                    u64::from(e - s) + 1
+                })
+                .sum();
+            assert_eq!(total, r.len(), "{range}: size mismatch");
+        }
     }
 }

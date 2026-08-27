@@ -33,7 +33,8 @@ use aya_ebpf::{
     bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_PIPE, TC_ACT_SHOT},
     btf_maps::{HashMap, PerCpuHashMap},
     helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
-    macros::{btf_map, classifier},
+    macros::{btf_map, classifier, map},
+    maps::{lpm_trie::Key as TrieKey, LpmTrie},
     programs::TcContext,
 };
 use network_types::{
@@ -61,9 +62,11 @@ const BITS_PER_BYTE: u64 = 8;
 /// accumulate instead of being truncated to zero on every packet.
 const NBYTES_PER_BYTE: u64 = 1_000_000_000;
 
-/// Whitelist: only IPv4 addresses present here are ever counted.
-#[btf_map]
-static MONITORED_IPS: HashMap<u32, u8, MAP_CAPACITY> = HashMap::new();
+/// Whitelist: CIDR prefixes of the configured ranges. An address is monitored iff it
+/// matches some prefix (longest-prefix lookup), so membership costs O(log n) map
+/// entries per range instead of one entry per address.
+#[map]
+static MONITORED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(MAP_CAPACITY as u32, 0);
 
 /// (ifindex, ipv4) -> per-CPU monotonic counters.
 #[btf_map]
@@ -161,7 +164,7 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
 
     unsafe {
-        if MONITORED_IPS.get(ipv4).is_none() {
+        if MONITORED_IPS.get(&TrieKey::new(32, ipv4)).is_none() {
             return TC_ACT_PIPE;
         }
 

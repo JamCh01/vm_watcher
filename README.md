@@ -9,6 +9,8 @@ IP 做**限速**——限速算法可按段选择：令牌桶、漏桶、固定�
 累计流量推送到 VictoriaMetrics，在 `--ui` 里查看任意 IP 的历史趋势。
 
 - 只统计 `config.toml` 配置的 `开始IP-结束IP` 地址段内的 IPv4，其余一律放行不计数。
+  白名单是 eBPF **LPM 前缀字典树**：段被分解为最少的 CIDR 前缀写入
+  `MONITORED_IPS`（最长前缀匹配判定成员），段大小不再逐地址枚举、与 map 占用解耦。
   IPv6 另行聚合统计（首页末尾的 `IPv6` 行）：只计数、不限速、无按 IP 拆分。
 - 每个 TAP 接口挂载 TC ingress（VM TX，按源 IP）与 TC egress（VM RX，按目标 IP）。
 - TAP 识别不依赖接口名（支持纯数字接口名），按 `tun_flags` 判定；周期重扫，
@@ -72,8 +74,8 @@ cargo build --release
 sudo ./target/release/vm-bandwidth-monitor --config /etc/vm-bandwidth-monitor/config.toml
 ```
 
-启动流程：读取并完整校验配置 → 提升文件描述符上限 → 生成 IP 白名单写入
-`MONITORED_IPS` → 发现 br0 下的 TAP 并挂载 TC → 每秒采样计算带宽、驱动滑动窗口与
+启动流程：读取并完整校验配置 → 提升文件描述符上限 → 把各段分解为 CIDR 前缀写入
+LPM 字典树白名单 `MONITORED_IPS` → 发现 br0 下的 TAP 并挂载 TC → 每秒采样计算带宽、驱动滑动窗口与
 限速 → 在 `/run/vm-bandwidth-monitor.sock` 提供只读 IPC → 监听配置变化。
 
 正确处理 `SIGINT`/`SIGTERM`：停止计算与 reload、停 IPC、仅移除本程序创建的 TC
@@ -350,7 +352,7 @@ IP 默认继承所属段的 `policy`。需要给个别机器不同待遇时，�
 | 删除 policy / override | 立即移除对应限速、恢复 NORMAL；override 删除则回落继承 |
 | 新增段 / 删除段 | 同步增删白名单与监控状态；删除段会清理其限速、算法状态和窗口 |
 | 改 `collector.refresh_interval_ms` / `collector.map_max_entries` | **不支持热加载**：限速器窗口按整秒 tick 校准、eBPF map 容量启动时固定，校验拒绝并提示重启 |
-| 新配置地址数超容量 | 预检拒绝（不动任何 map）：新地址数 > 启动时定的 `MONITORED_IPS` 容量、或预计 `TRAFFIC`/限速 map 用量超限时，明确要求重启调整；全部范围地址总数 > 1<<20 在共享校验层直接拒绝（启动与热加载同一条路） |
+| 新配置前缀数超容量 | 预检拒绝（不动任何 map）：新配置的 CIDR 前缀数 > 启动时定的 `MONITORED_IPS` 字典树容量时，明确要求重启调整。段再大也不逐地址枚举；`TRAFFIC`/限速类 map 按真实出现的流动态占用，满时逐流降级（不计数/不限速，放行） |
 | 改 `network.bridge` | **不支持热加载**，校验直接拒绝，需要重启进程 |
 | 任何非法配置 | 整份拒绝：保持上一次成功配置（last-known-good），不中断监控与限速，`--ui` 顶栏显示 FAILED 与原因 |
 
@@ -406,6 +408,8 @@ range = "10.30.9.1-10.30.9.32"
 1. **`--ui` 界面**（最快）：
    - 总览页每个段都有 `Limited` 列：`0` 表示该段没有任何流处于限速；> 0 即有限速中的流。
    - 按回车进详情页，`状态` 列逐流显示 `NORMAL` / `LIMITED`，LIMITED 还会显示剩余秒数。
+     详情页只列出**本次启动以来出现过流量**的 IP（段不再逐地址展开）；段的
+     `IPs` 数即已观测地址数。
 2. **日志**：触发与解除都会落日志，直接查：
 
    ```bash
@@ -543,8 +547,9 @@ TRAFFIC 记的是限速前的流量需求，这组才是实际放行/丢弃量�
 
 - **单一 eBPF 对象，挂载到所有 TAP**：对象只加载一次（验证器只跑一遍），
   `tc_ingress`/`tc_egress` 直接从 `__sk_buff` 上下文读取 ifindex，同一对程序以
-  TCX/netlink 链接挂到每个 TAP；七份 map（白名单、IPv4/IPv6 计数、限速策略、限速状态、
-  滑窗日志、限速裁决统计）全部为 BTF 定义、天然共享，不 pin，随 daemon 生命周期存在。
+  TCX/netlink 链接挂到每个 TAP；七份 map（LPM 字典树白名单、IPv4/IPv6 计数、限速策略、
+  限速状态、滑窗日志、限速裁决统计）天然共享，不 pin，随 daemon 生命周期存在
+  （白名单为普通 map，其余为 BTF 定义）。
 - 挂载/卸载由 `AttachManager` 负责：丢弃某个链接即移除**且仅移除**本程序创建的
   TC filter；不动 `fq_codel`/`noqueue`，不清理其他程序的 filter。
 - 计数为单调累计值，用户态按相邻采样差值计算速率；计数回绕/复位或 TAP 重建时该周期
