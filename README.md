@@ -9,6 +9,7 @@ IP 做**限速**——限速算法可按段选择：令牌桶、漏桶、固定�
 累计流量推送到 VictoriaMetrics，在 `--ui` 里查看任意 IP 的历史趋势。
 
 - 只统计 `config.toml` 配置的 `开始IP-结束IP` 地址段内的 IPv4，其余一律放行不计数。
+  IPv6 另行聚合统计（首页末尾的 `IPv6` 行）：只计数、不限速、无按 IP 拆分。
 - 每个 TAP 接口挂载 TC ingress（VM TX，按源 IP）与 TC egress（VM RX，按目标 IP）。
 - TAP 识别不依赖接口名（支持纯数字接口名），按 `tun_flags` 判定；周期重扫，
   新增/删除 VM 无需重启。
@@ -554,7 +555,7 @@ push_interval_secs = 60
 
 ## 已知边界（v2）
 
-- 不统计 IPv6/ARP/非 IP 流量；不解析端口、连接、payload。
+- IPv6 只聚合计数（首页/趋势可见），不限速、无按 IP 拆分；ARP/非 IP 流量不统计；不解析端口、连接、payload。
 - `map_max_entries` 耗尽时新的计数键不再计数、新的限速策略无法安装（数据包仍放行，
   记日志）。
 - 累计流量自本次启动起计（每次启动重建 map）。

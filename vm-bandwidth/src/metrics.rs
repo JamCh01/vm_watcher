@@ -10,12 +10,35 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use vm_bandwidth_core::ipc::IPV6_RANGE_NAME;
 use vm_bandwidth_core::limiter::IpTotals;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Response bodies above this are refused: replies here are small status/error
 /// documents, and a misbehaving server must not grow memory unbounded.
 const MAX_RESPONSE_BODY: usize = 1 << 20;
+
+/// Render the aggregate IPv6 pseudo-series (`ip="ipv6-all"`, `range="IPv6"`).
+/// IPv6 is counted per address in eBPF but surfaced as one aggregate; a single
+/// bounded series set keeps VictoriaMetrics cardinality flat.
+pub fn render_prom_lines_ipv6(t: &crate::collector::IpStats, now_ms: i64) -> String {
+    if t.rx_bytes | t.tx_bytes | t.rx_packets | t.tx_packets == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(192);
+    for (name, value) in [
+        ("vmbw_rx_bytes_total", t.rx_bytes),
+        ("vmbw_tx_bytes_total", t.tx_bytes),
+        ("vmbw_rx_packets_total", t.rx_packets),
+        ("vmbw_tx_packets_total", t.tx_packets),
+    ] {
+        out.push_str(name);
+        out.push_str(&format!(
+            "{{ip=\"ipv6-all\",range=\"{IPV6_RANGE_NAME}\"}} {value} {now_ms}\n"
+        ));
+    }
+    out
+}
 
 /// Escape a Prometheus label value (backslash, double quote, newline).
 pub fn escape_label(v: &str) -> String {

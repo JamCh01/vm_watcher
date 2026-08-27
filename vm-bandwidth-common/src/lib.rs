@@ -11,6 +11,15 @@ pub struct TrafficKey {
     pub ipv4: u32,
 }
 
+/// Key of the TRAFFIC6 map: one counter set per (interface, IPv6) pair.
+/// IPv6 is counted but never policed (there is no IPv6 limit policy).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrafficKey6 {
+    pub ifindex: u32,
+    pub ipv6: [u8; 16],
+}
+
 /// Monotonic byte/packet counters. Userspace computes rates from deltas.
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -123,6 +132,9 @@ pub struct LimitState {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficKey {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for TrafficKey6 {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficValue {}

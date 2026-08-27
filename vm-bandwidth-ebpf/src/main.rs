@@ -38,12 +38,12 @@ use aya_ebpf::{
 };
 use network_types::{
     eth::{EthHdr, EtherType},
-    ip::Ipv4Hdr,
+    ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, SwlEntry, TrafficKey, TrafficValue, ALGO_FIXED_WINDOW, ALGO_GCRA,
-    ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET,
-    SWL_LOG_CAP,
+    LimitKey, LimitPolicy, SwlEntry, TrafficKey, TrafficKey6, TrafficValue, ALGO_FIXED_WINDOW,
+    ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG,
+    ALGO_TOKEN_BUCKET, SWL_LOG_CAP,
 };
 
 /// Compile-time default; userspace overrides `max_entries` at load time
@@ -68,6 +68,12 @@ static MONITORED_IPS: HashMap<u32, u8, MAP_CAPACITY> = HashMap::new();
 /// (ifindex, ipv4) -> per-CPU monotonic counters.
 #[btf_map]
 static TRAFFIC: PerCpuHashMap<TrafficKey, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
+
+/// (ifindex, ipv6) -> per-CPU monotonic counters. IPv6 is counted but never
+/// policed and has no whitelist (config has no IPv6 ranges); the map cap is the
+/// only bound on distinct flows.
+#[btf_map]
+static TRAFFIC6: PerCpuHashMap<TrafficKey6, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
 
 /// (ipv4, direction) -> limiter policy installed by the daemon. Absent or
 /// `enabled == 0` means the flow is not policed.
@@ -134,7 +140,8 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     };
     match eth.ether_type() {
         Ok(EtherType::Ipv4) => {}
-        // ARP, IPv6, LLDP, STP, VLAN, ... are not counted in v1.
+        Ok(EtherType::Ipv6) => return handle_v6(ctx, is_tx),
+        // ARP, LLDP, STP, VLAN, ... are not counted.
         _ => return TC_ACT_PIPE,
     }
     let ip: Ipv4Hdr = match ctx.load(EthHdr::LEN) {
@@ -199,6 +206,65 @@ unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
         }
     };
 
+    let len = ctx.len() as u64;
+    if is_tx {
+        value.tx_bytes += len;
+        value.tx_packets += 1;
+    } else {
+        value.rx_bytes += len;
+        value.rx_packets += 1;
+    }
+}
+
+/// IPv6 accounting: counted like IPv4 but never policed and never whitelisted
+/// (config has no IPv6 ranges). Every error path fails open, same as IPv4.
+#[inline(always)]
+fn handle_v6(ctx: &TcContext, is_tx: bool) -> i32 {
+    let ip: Ipv6Hdr = match ctx.load(EthHdr::LEN) {
+        Ok(i) => i,
+        Err(_) => return TC_ACT_PIPE,
+    };
+    // Extension headers, when present, come after the fixed 40-byte header, so the
+    // addresses are always at these offsets.
+    let addr = if is_tx { ip.src_addr } else { ip.dst_addr };
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    unsafe { count6(ctx, &addr, ifindex, is_tx) };
+    TC_ACT_PIPE
+}
+
+/// Accumulate byte/packet counters for one IPv6 flow. Never fails the packet.
+#[inline(always)]
+unsafe fn count6(ctx: &TcContext, ipv6: &[u8; 16], ifindex: u32, is_tx: bool) {
+    let key = TrafficKey6 {
+        ifindex,
+        ipv6: *ipv6,
+    };
+    let value = match TRAFFIC6.get_ptr_mut(key) {
+        Some(ptr) => &mut *ptr,
+        None => {
+            // Same E2BIG fail-open as the IPv4 path; see `count` for the `&` note.
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            if TRAFFIC6
+                .insert(
+                    &key,
+                    &TrafficValue {
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        rx_packets: 0,
+                        tx_packets: 0,
+                    },
+                    0,
+                )
+                .is_err()
+            {
+                return;
+            }
+            match TRAFFIC6.get_ptr_mut(key) {
+                Some(ptr) => &mut *ptr,
+                None => return,
+            }
+        }
+    };
     let len = ctx.len() as u64;
     if is_tx {
         value.tx_bytes += len;

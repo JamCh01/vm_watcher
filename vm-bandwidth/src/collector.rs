@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use aya::maps::{MapData, PerCpuHashMap};
-use vm_bandwidth_common::{TrafficKey, TrafficValue};
+use vm_bandwidth_common::{TrafficKey, TrafficKey6, TrafficValue};
 
 use vm_bandwidth_core::ip_range::IpRange;
 use vm_bandwidth_core::limiter::IpTotals;
@@ -48,6 +48,9 @@ pub struct Snapshot {
 pub struct PollResult {
     pub snapshot: Snapshot,
     pub totals: HashMap<u32, IpTotals>,
+    /// Aggregate IPv6 counters and rates. IPv6 has no per-IP breakdown in the
+    /// snapshot and never enters the limiter.
+    pub ipv6: IpStats,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -76,6 +79,9 @@ impl Delta {
 pub struct Collector {
     prev: HashMap<TrafficKey, TrafficValue>,
     totals: HashMap<u32, IpStats>,
+    prev6: HashMap<TrafficKey6, TrafficValue>,
+    /// Running IPv6 aggregate (cumulative counters + last-interval rates).
+    ipv6: IpStats,
     last_poll: Option<Instant>,
 }
 
@@ -84,6 +90,8 @@ impl Collector {
         Self {
             prev: HashMap::new(),
             totals: HashMap::new(),
+            prev6: HashMap::new(),
+            ipv6: IpStats::default(),
             last_poll: None,
         }
     }
@@ -99,11 +107,13 @@ impl Collector {
     /// produce a delta again).
     pub fn prune_ifindexes(&mut self, live: &HashSet<u32>) {
         self.prev.retain(|key, _| live.contains(&key.ifindex));
+        self.prev6.retain(|key, _| live.contains(&key.ifindex));
     }
 
     pub fn poll(
         &mut self,
         traffic: &PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
+        traffic6: &PerCpuHashMap<MapData, TrafficKey6, TrafficValue>,
         ranges: &[IpRange],
     ) -> PollResult {
         let now = Instant::now();
@@ -152,6 +162,51 @@ impl Collector {
             }
         }
         self.prev = cur;
+
+        // IPv6: identical delta logic, collapsed into one grand total — there is no
+        // per-address breakdown and no IPv6 limit policy to feed.
+        let mut cur6: HashMap<TrafficKey6, TrafficValue> = HashMap::new();
+        for item in traffic6.iter() {
+            match item {
+                Ok((key, values)) => {
+                    let mut acc = TrafficValue::default();
+                    for v in values.iter() {
+                        acc.rx_bytes += v.rx_bytes;
+                        acc.tx_bytes += v.tx_bytes;
+                        acc.rx_packets += v.rx_packets;
+                        acc.tx_packets += v.tx_packets;
+                    }
+                    cur6.insert(key, acc);
+                }
+                Err(e) => log::warn!("reading TRAFFIC6 map: {e}"),
+            }
+        }
+        let mut d6 = Delta::default();
+        if elapsed_secs > 0.0 {
+            for (key, value) in &cur6 {
+                let Some(prev) = self.prev6.get(key) else {
+                    continue;
+                };
+                let d = Delta {
+                    rx_bytes: value.rx_bytes.saturating_sub(prev.rx_bytes),
+                    tx_bytes: value.tx_bytes.saturating_sub(prev.tx_bytes),
+                    rx_packets: value.rx_packets.saturating_sub(prev.rx_packets),
+                    tx_packets: value.tx_packets.saturating_sub(prev.tx_packets),
+                };
+                if !d.is_zero() {
+                    d6 += d;
+                }
+            }
+        }
+        self.prev6 = cur6;
+        self.ipv6.rx_bytes += d6.rx_bytes;
+        self.ipv6.tx_bytes += d6.tx_bytes;
+        self.ipv6.rx_packets += d6.rx_packets;
+        self.ipv6.tx_packets += d6.tx_packets;
+        if elapsed_secs > 0.0 {
+            self.ipv6.rx_bps = d6.rx_bytes as f64 * 8.0 / elapsed_secs;
+            self.ipv6.tx_bps = d6.tx_bytes as f64 * 8.0 / elapsed_secs;
+        }
 
         for (ip, delta) in &deltas {
             let stats = self.totals.entry(*ip).or_default();
@@ -211,6 +266,7 @@ impl Collector {
                 ranges: snap_ranges,
             },
             totals,
+            ipv6: self.ipv6.clone(),
         }
     }
 }

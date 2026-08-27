@@ -7,6 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Display name of the aggregate IPv6 pseudo-range. Counted like a range but
+/// never policed and without a per-IP breakdown; shared by daemon, metrics push
+/// and UI so the name never drifts between the three.
+pub const IPV6_RANGE_NAME: &str = "IPv6";
+
 /// A request from the UI to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

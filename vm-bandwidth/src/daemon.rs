@@ -21,8 +21,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, LimitState, SwlRing, TrafficKey, TrafficValue, ALGO_SLIDING_WINDOW_LOG,
-    DIR_RX, DIR_TX,
+    LimitKey, LimitPolicy, LimitState, SwlRing, TrafficKey, TrafficKey6, TrafficValue,
+    ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
 };
 
 use vm_bandwidth_core::config::{self, ValidatedConfig};
@@ -70,6 +70,8 @@ struct Engine {
     last_snapshot: Option<crate::collector::Snapshot>,
     /// Last poll's cumulative per-IP counters, for the VictoriaMetrics push.
     last_totals: std::collections::HashMap<u32, vm_bandwidth_core::limiter::IpTotals>,
+    /// Last poll's aggregate IPv6 counters, for the VictoriaMetrics push.
+    last_ipv6: crate::collector::IpStats,
 
     monitored: AyaHashMap<MapData, u32, u8>,
     #[allow(dead_code)] // kept alive so its map fd stays open
@@ -79,6 +81,7 @@ struct Engine {
     /// the `sliding_window_log` algorithm.
     swl_log: AyaHashMap<MapData, LimitKey, SwlRing>,
     traffic: PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
+    traffic6: PerCpuHashMap<MapData, TrafficKey6, TrafficValue>,
     /// Shared HTTP client for the VictoriaMetrics push.
     http: reqwest::Client,
 
@@ -92,11 +95,16 @@ impl Engine {
 
     fn collect_tick(&mut self) {
         let ranges = self.cfg.ip_ranges();
-        let PollResult { snapshot, totals } = self.collector.poll(&self.traffic, &ranges);
+        let PollResult {
+            snapshot,
+            totals,
+            ipv6,
+        } = self.collector.poll(&self.traffic, &self.traffic6, &ranges);
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         self.apply_limit_actions(&actions);
         self.last_totals = totals;
+        self.last_ipv6 = ipv6;
         self.last_snapshot = Some(snapshot);
     }
 
@@ -110,8 +118,12 @@ impl Engine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let lines =
+        let mut lines =
             crate::metrics::render_prom_lines(&self.last_totals, |ip| self.range_name(ip), now_ms);
+        lines.push_str(&crate::metrics::render_prom_lines_ipv6(
+            &self.last_ipv6,
+            now_ms,
+        ));
         if lines.is_empty() {
             return;
         }
@@ -377,6 +389,19 @@ impl Engine {
                     limited,
                 });
             }
+            // Aggregate IPv6 pseudo-range: counted but never policed, no per-IP
+            // breakdown (the UI blocks Enter on it; `t` still trends it).
+            let v6 = &self.last_ipv6;
+            ranges.push(RangeSummary {
+                name: ipc::IPV6_RANGE_NAME.to_string(),
+                range: String::new(),
+                rx_bps: v6.rx_bps,
+                tx_bps: v6.tx_bps,
+                rx_bytes: v6.rx_bytes,
+                tx_bytes: v6.tx_bytes,
+                ip_count: 0,
+                limited: 0,
+            });
         }
         Status {
             generation: self.generation,
@@ -509,6 +534,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
 
     let mut base = aya::EbpfLoader::new()
         .map_max_entries("TRAFFIC", cfg.map_max_entries)
+        .map_max_entries("TRAFFIC6", cfg.map_max_entries)
         .map_max_entries("MONITORED_IPS", whitelist_capacity)
         .map_max_entries("LIMIT_POLICIES", cfg.map_max_entries)
         .map_max_entries("LIMIT_STATE", cfg.map_max_entries)
@@ -551,6 +577,10 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         base.take_map("TRAFFIC").context("TRAFFIC missing")?,
     )
     .context("TRAFFIC has the wrong type")?;
+    let traffic6 = PerCpuHashMap::<MapData, TrafficKey6, TrafficValue>::try_from(
+        base.take_map("TRAFFIC6").context("TRAFFIC6 missing")?,
+    )
+    .context("TRAFFIC6 has the wrong type")?;
 
     // 4. Discover TAPs and attach (one loaded object, one link pair per TAP).
     let mut manager = AttachManager::new(base)?;
@@ -579,11 +609,13 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         limiter: Limiter::new(tick_secs),
         last_snapshot: None,
         last_totals: std::collections::HashMap::new(),
+        last_ipv6: crate::collector::IpStats::default(),
         monitored,
         limit_policies,
         limit_state,
         swl_log,
         traffic,
+        traffic6,
         http: crate::metrics::client(),
         epoch: std::time::Instant::now(),
         cfg,

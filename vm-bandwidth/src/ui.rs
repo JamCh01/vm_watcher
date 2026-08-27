@@ -324,6 +324,15 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
         }
         KeyCode::Enter if matches!(app.screen, Screen::Overview) => {
             if let Some(sel) = app.overview.selected() {
+                // The aggregate IPv6 pseudo-range has no per-IP detail to open.
+                let is_ipv6 = app
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.ranges.get(sel))
+                    .is_some_and(|r| r.name == vm_bandwidth_core::ipc::IPV6_RANGE_NAME);
+                if is_ipv6 {
+                    return UiAction::Nothing;
+                }
                 app.screen = Screen::Detail;
                 app.detail_index = Some(sel);
                 app.detail_table.select(Some(0));
