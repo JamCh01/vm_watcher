@@ -13,6 +13,49 @@ use vm_bandwidth_common::{LimitKey, PolicerStats, TrafficKey, TrafficKey6, Traff
 use vm_bandwidth_core::ip_range::IpRange;
 use vm_bandwidth_core::limiter::IpTotals;
 
+/// Eviction discipline for the eBPF counter maps: a key whose counters did not change
+/// for [`IDLE_EVICT_POLLS`] consecutive polls is reported for removal. Entries are
+/// recreated by the data path on the first packet if traffic returns (cumulative
+/// counters restart; userspace deltas are reset-safe and `rate()` in VictoriaMetrics
+/// handles counter resets). This is what bounds the maps under IP churn — TAP
+/// recreation is additionally covered by the ifindex-based reclaim in rescan.
+pub const IDLE_EVICT_POLLS: u32 = 300; // ~5 minutes at the default 1s cadence
+
+struct IdleTracker<K: Eq + std::hash::Hash> {
+    counts: HashMap<K, u32>,
+}
+
+impl<K: Eq + std::hash::Hash> Default for IdleTracker<K> {
+    fn default() -> Self {
+        Self {
+            counts: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Copy> IdleTracker<K> {
+    /// Record one poll: `present` = keys currently in the map, `changed` = the subset
+    /// whose counters moved since the last poll. Returns keys that reached the idle
+    /// threshold and should be evicted from the map.
+    fn observe(&mut self, present: &HashSet<K>, changed: &HashSet<K>) -> Vec<K> {
+        let mut evict = Vec::new();
+        for key in present {
+            let n = self.counts.entry(*key).or_insert(0);
+            if changed.contains(key) {
+                *n = 0;
+            } else {
+                *n += 1;
+                if *n >= IDLE_EVICT_POLLS {
+                    evict.push(*key);
+                }
+            }
+        }
+        // Keys gone from the map (evicted or TAP removed) stop being tracked.
+        self.counts.retain(|k, _| present.contains(k));
+        evict
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IpStats {
     pub rx_bps: f64,
@@ -73,6 +116,9 @@ pub struct PollResult {
     pub ipv6: IpStats,
     /// Cumulative policer verdict counters per IP, for the metrics push.
     pub policer: HashMap<u32, PolicerIpTotals>,
+    /// Counter-map keys idle long enough to be evicted (daemon removes them).
+    pub stale_traffic: Vec<TrafficKey>,
+    pub stale_traffic6: Vec<TrafficKey6>,
 }
 
 /// Cumulative policer verdicts for one IP (both directions), for metrics export.
@@ -118,6 +164,9 @@ pub struct Collector {
     /// Running IPv6 aggregate (cumulative counters + last-interval rates).
     ipv6: IpStats,
     prev_policer: HashMap<LimitKey, PolicerStats>,
+    /// Idle-eviction tracking per counter-map key (see [`IdleTracker`]).
+    idle4: IdleTracker<TrafficKey>,
+    idle6: IdleTracker<TrafficKey6>,
     last_poll: Option<Instant>,
 }
 
@@ -129,6 +178,8 @@ impl Collector {
             prev6: HashMap::new(),
             ipv6: IpStats::default(),
             prev_policer: HashMap::new(),
+            idle4: IdleTracker::default(),
+            idle6: IdleTracker::default(),
             last_poll: None,
         }
     }
@@ -202,6 +253,20 @@ impl Collector {
                 }
             }
         }
+        // Idle eviction: keys frozen for IDLE_EVICT_POLLS consecutive polls are
+        // reported; the daemon removes them and the data path recreates them on the
+        // next packet. Also prune per-IP totals down to IPs that still own a key, so
+        // userspace state cannot grow past what the counter map actually holds.
+        let present4: HashSet<TrafficKey> = cur.keys().copied().collect();
+        let changed4: HashSet<TrafficKey> = cur
+            .iter()
+            .filter(|(k, v)| self.prev.get(k).map(|p| p != *v).unwrap_or(true))
+            .map(|(k, _)| *k)
+            .collect();
+        let stale_traffic = self.idle4.observe(&present4, &changed4);
+        let live_ips: HashSet<u32> = present4.iter().map(|k| k.ipv4).collect();
+        self.totals.retain(|ip, _| live_ips.contains(ip));
+
         self.prev = cur;
 
         // IPv6: identical delta logic, collapsed into one grand total — there is no
@@ -239,6 +304,14 @@ impl Collector {
                 }
             }
         }
+        let present6: HashSet<TrafficKey6> = cur6.keys().copied().collect();
+        let changed6: HashSet<TrafficKey6> = cur6
+            .iter()
+            .filter(|(k, v)| self.prev6.get(k).map(|p| p != *v).unwrap_or(true))
+            .map(|(k, _)| *k)
+            .collect();
+        let stale_traffic6 = self.idle6.observe(&present6, &changed6);
+
         self.prev6 = cur6;
         self.ipv6.rx_bytes += d6.rx_bytes;
         self.ipv6.tx_bytes += d6.tx_bytes;
@@ -394,6 +467,8 @@ impl Collector {
             totals,
             ipv6: self.ipv6.clone(),
             policer,
+            stale_traffic,
+            stale_traffic6,
         }
     }
 }
@@ -401,6 +476,23 @@ impl Collector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_tracker_evicts_after_threshold_and_forgets_removed_keys() {
+        let mut t = IdleTracker::default();
+        let k: u32 = 7;
+        let present: HashSet<u32> = [k].into_iter().collect();
+        let nothing: HashSet<u32> = HashSet::new();
+        // One change resets the counter.
+        assert!(t.observe(&present, &present).is_empty());
+        for _ in 0..(IDLE_EVICT_POLLS - 1) {
+            assert!(t.observe(&present, &nothing).is_empty());
+        }
+        assert_eq!(t.observe(&present, &nothing), vec![k]); // threshold reached
+                                                            // A key gone from the map stops being tracked: it must re-idle from zero.
+        assert!(t.observe(&nothing, &nothing).is_empty());
+        assert!(t.observe(&present, &nothing).is_empty());
+    }
 
     #[test]
     fn delta_math_is_reset_safe() {

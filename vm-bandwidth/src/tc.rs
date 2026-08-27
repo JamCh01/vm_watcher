@@ -291,9 +291,45 @@ impl AttachBackend for AyaBackend<'_> {
     }
 }
 
+/// Cap on the backoff between attach retries: 5s, 10s, 20s, ... doubling to this.
+const MAX_RETRY_BACKOFF_SECS: u64 = 300;
+
+/// Should this TAP be attempted now, per the backoff schedule?
+fn should_attempt(
+    backoff: &HashMap<String, (u32, std::time::Instant)>,
+    name: &str,
+    now: std::time::Instant,
+) -> bool {
+    backoff
+        .get(name)
+        .map(|(_, after)| now >= *after)
+        .unwrap_or(true)
+}
+
+/// Record a failure: returns the new consecutive-failure count and schedules the next
+/// attempt at `5s × 2^(n-1)` capped at [`MAX_RETRY_BACKOFF_SECS`].
+fn record_failure(
+    backoff: &mut HashMap<String, (u32, std::time::Instant)>,
+    name: &str,
+    now: std::time::Instant,
+) -> u32 {
+    let entry = backoff.entry(name.to_string()).or_insert((0, now));
+    entry.0 += 1;
+    let delay = (5u64 << (entry.0 - 1).min(6)).min(MAX_RETRY_BACKOFF_SECS);
+    entry.1 = now + std::time::Duration::from_secs(delay);
+    entry.0
+}
+
+fn record_success(backoff: &mut HashMap<String, (u32, std::time::Instant)>, name: &str) {
+    backoff.remove(name);
+}
+
 pub struct AttachManager {
     bpf: Ebpf,
     attached: HashMap<String, AttachedTap>,
+    /// Per-TAP attach backoff: consecutive failure count and earliest retry instant.
+    /// A persistent conflict (e.g. a foreign qdisc) must not warn every 5s forever.
+    retry_backoff: HashMap<String, (u32, std::time::Instant)>,
 }
 
 struct AttachedTap {
@@ -321,6 +357,7 @@ impl AttachManager {
         Ok(Self {
             bpf,
             attached: HashMap::new(),
+            retry_backoff: HashMap::new(),
         })
     }
 
@@ -350,9 +387,14 @@ impl AttachManager {
 
         let mut added = 0;
         let mut failed = 0;
+        let now = std::time::Instant::now();
         for tap in to_add {
+            if !should_attempt(&self.retry_backoff, &tap.name, now) {
+                continue; // backing off after repeated failures; retried later
+            }
             match self.attach(&tap) {
                 Ok((ingress_link, egress_link, qdisc_origin)) => {
+                    record_success(&mut self.retry_backoff, &tap.name);
                     log::info!("attached to TAP {} (ifindex {})", tap.name, tap.ifindex);
                     self.attached.insert(
                         tap.name.clone(),
@@ -366,7 +408,11 @@ impl AttachManager {
                     added += 1;
                 }
                 Err(e) => {
-                    log::warn!("failed to attach to TAP {}: {e:#}", tap.name);
+                    let n = record_failure(&mut self.retry_backoff, &tap.name, now);
+                    log::warn!(
+                        "failed to attach to TAP {} (failure {n}, next retry backed off): {e:#}",
+                        tap.name
+                    );
                     failed += 1;
                 }
             }
@@ -403,6 +449,7 @@ impl AttachManager {
         let Some(att) = self.attached.remove(name) else {
             return;
         };
+        record_success(&mut self.retry_backoff, name);
         if let Ok(ingress) = sched_program(&mut self.bpf, PROGRAM_INGRESS) {
             if let Err(e) = ingress.detach(att.ingress_link) {
                 log::debug!("detaching ingress on {name}: {e}");
@@ -717,6 +764,38 @@ mod tests {
         assert_eq!(to_detach, vec!["gone".to_string(), "moved".to_string()]);
         let added: Vec<&str> = to_add.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(added, vec!["moved", "fresh"]);
+    }
+
+    // Backoff: failures double the wait (capped), success clears it.
+    #[test]
+    fn attach_backoff_doubles_and_caps() {
+        let mut backoff = HashMap::new();
+        let t0 = std::time::Instant::now();
+        assert!(should_attempt(&backoff, "tap0", t0));
+        let n1 = record_failure(&mut backoff, "tap0", t0);
+        assert_eq!(n1, 1);
+        assert!(!should_attempt(&backoff, "tap0", t0)); // inside the 5s backoff
+        assert!(should_attempt(
+            &backoff,
+            "tap0",
+            t0 + std::time::Duration::from_secs(5)
+        ));
+        // Reach the cap: after enough failures the delay never exceeds 300s.
+        for _ in 0..20 {
+            record_failure(&mut backoff, "tap0", t0);
+        }
+        assert!(!should_attempt(
+            &backoff,
+            "tap0",
+            t0 + std::time::Duration::from_secs(299)
+        ));
+        assert!(should_attempt(
+            &backoff,
+            "tap0",
+            t0 + std::time::Duration::from_secs(300)
+        ));
+        record_success(&mut backoff, "tap0");
+        assert!(should_attempt(&backoff, "tap0", t0));
     }
 
     // Error classification: typed, errno-based, no string matching.

@@ -150,6 +150,8 @@ struct Engine {
     policer_stats: PerCpuHashMap<MapData, LimitKey, PolicerStats>,
     /// Shared HTTP client for the VictoriaMetrics push.
     http: reqwest::Client,
+    /// At most one metrics push in flight (see push_metrics).
+    push_inflight: Arc<std::sync::atomic::AtomicBool>,
 
     epoch: std::time::Instant,
 }
@@ -166,9 +168,26 @@ impl Engine {
             totals,
             ipv6,
             policer,
+            stale_traffic,
+            stale_traffic6,
         } = self
             .collector
             .poll(&self.traffic, &self.traffic6, &self.policer_stats, &ranges);
+        // Idle eviction: drop counter-map entries frozen long enough; the data path
+        // recreates them on the next packet (reset-safe deltas, see collector).
+        for key in &stale_traffic {
+            let _ = self.traffic.remove(key);
+        }
+        for key in &stale_traffic6 {
+            let _ = self.traffic6.remove(key);
+        }
+        if !(stale_traffic.is_empty() && stale_traffic6.is_empty()) {
+            log::debug!(
+                "evicted {} idle TRAFFIC / {} idle TRAFFIC6 key(s)",
+                stale_traffic.len(),
+                stale_traffic6.len()
+            );
+        }
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         if !actions.is_empty() {
@@ -196,8 +215,12 @@ impl Engine {
     }
 
     /// Push cumulative per-IP counters to VictoriaMetrics (no-op when disabled).
-    /// A push failure is logged and skipped; the next interval simply retries.
-    async fn push_metrics(&self) {
+    /// Rendering happens here on the engine (current state, current config); only the
+    /// network send runs in a spawned task, so a stalled endpoint delays at most
+    /// itself — never the sampling tick. At most one push is in flight: if the
+    /// previous one has not returned by the next interval this one is skipped and the
+    /// interval after retries with fresh (cumulative) values.
+    fn push_metrics(&self) {
         let cfg = self.config.load();
         if !cfg.metrics_enabled {
             return;
@@ -220,11 +243,24 @@ impl Engine {
         if lines.is_empty() {
             return;
         }
-        if let Err(e) = crate::metrics::push(&self.http, &cfg.metrics_url, &lines).await {
-            log::warn!("metrics push to {} failed: {e:#}", cfg.metrics_url);
-        } else {
-            log::debug!("metrics push: {} line(s)", lines.lines().count());
+        if self
+            .push_inflight
+            .swap(true, std::sync::atomic::Ordering::Acquire)
+        {
+            log::debug!("metrics push skipped: previous push still in flight");
+            return;
         }
+        let flag = self.push_inflight.clone();
+        let http = self.http.clone();
+        let url = cfg.metrics_url.clone();
+        tokio::spawn(async move {
+            let result = crate::metrics::push(&http, &url, &lines).await;
+            flag.store(false, std::sync::atomic::Ordering::Release);
+            match result {
+                Ok(()) => log::debug!("metrics push: {} line(s)", lines.lines().count()),
+                Err(e) => log::warn!("metrics push to {url} failed: {e:#}"),
+            }
+        });
     }
 
     fn range_name(&self, ip: u32) -> String {
@@ -892,6 +928,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         traffic6,
         policer_stats,
         http: crate::metrics::client(),
+        push_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         epoch: std::time::Instant::now(),
     };
     // Apply the initial limiter policy index (no LIMITs yet; just builds lookups).
@@ -994,7 +1031,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
                     + Duration::from_secs(engine.config.load().interface_scan_interval_secs.max(1));
             }
             _ = tokio::time::sleep_until(next_push) => {
-                engine.push_metrics().await;
+                engine.push_metrics();
                 next_push = tokio::time::Instant::now()
                     + Duration::from_secs(engine.config.load().metrics_push_interval_secs.max(5));
             }
