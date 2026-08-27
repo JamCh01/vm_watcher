@@ -164,7 +164,7 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
 
     unsafe {
-        if MONITORED_IPS.get(&TrieKey::new(32, ipv4)).is_none() {
+        if MONITORED_IPS.get(TrieKey::new(32, ipv4)).is_none() {
             return TC_ACT_PIPE;
         }
 
