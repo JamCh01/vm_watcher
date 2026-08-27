@@ -44,6 +44,10 @@ pub struct Status {
     pub last_reload_error: String,
     pub bridge: String,
     pub tap_count: usize,
+    /// False once the file watcher reported an error (hot reload may be dead).
+    pub config_watcher_healthy: bool,
+    pub config_watcher_errors_total: u64,
+    pub config_watcher_last_error: String,
     pub ranges: Vec<RangeSummary>,
 }
 

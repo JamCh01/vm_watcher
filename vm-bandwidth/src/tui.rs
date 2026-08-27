@@ -160,6 +160,12 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
             if !s.last_reload_ok && !s.last_reload_error.is_empty() {
                 line.push_str(&format!("    Error: {}", s.last_reload_error));
             }
+            if !s.config_watcher_healthy {
+                line.push_str(&format!(
+                    "    WATCHER UNHEALTHY: {} error(s), last: {}",
+                    s.config_watcher_errors_total, s.config_watcher_last_error
+                ));
+            }
             line
         }
         _ => format!("Config generation: {generation}"),

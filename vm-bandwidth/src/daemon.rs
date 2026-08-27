@@ -61,6 +61,14 @@ type IpcReq = (Request, oneshot::Sender<Response>);
 /// it lock-free and never observes a half-applied config.
 type ConfigArc = Arc<ArcSwap<ValidatedConfig>>;
 
+/// Messages the config watcher thread sends to the engine loop.
+enum WatchMsg {
+    Reload,
+    /// Debouncer/inotify errors: without surfacing these the daemon keeps running but
+    /// hot reload silently stops working.
+    Error(String),
+}
+
 /// Rollback bookkeeping for one transactional map apply: filled as operations
 /// succeed, played back in reverse on the first failure.
 #[derive(Default)]
@@ -107,6 +115,11 @@ struct Engine {
     last_reload_error: String,
     /// Raw bytes of the last successfully applied config (dedup spurious triggers).
     last_config_bytes: Vec<u8>,
+
+    /// Config file watcher health (inotify failures are otherwise silent).
+    config_watcher_healthy: bool,
+    config_watcher_errors_total: u64,
+    config_watcher_last_error: String,
 
     bridge: String,
     manager: AttachManager,
@@ -440,6 +453,13 @@ impl Engine {
 
     /// Transactional config reload (§16): parse + validate fully, then apply once.
     /// A rejected config leaves the previous one fully in place (§28).
+    fn record_watcher_error(&mut self, e: String) {
+        self.config_watcher_healthy = false;
+        self.config_watcher_errors_total += 1;
+        self.config_watcher_last_error = e.clone();
+        log::error!("config watcher error (hot reload may stop working): {e}");
+    }
+
     fn reload(&mut self, path: &Path) {
         log::info!("config reload requested");
 
@@ -495,6 +515,13 @@ impl Engine {
         self.config_loaded_at = stamp;
         self.last_config_bytes = bytes;
         log::info!("config reload succeeded; generation {}", self.generation);
+
+        // Rebuild the IPC snapshot immediately under the NEW config: build_status pairs
+        // snapshot ranges with config ranges by index, so serving the old snapshot
+        // against the new config would attach limited counts and policies to the wrong
+        // ranges until the next scheduled collect. This also replaces last_totals, so
+        // the metrics push cannot label stale IPs with the new config.
+        self.collect_tick();
     }
 
     /// Transactional config apply: compute a pure plan, execute every map operation
@@ -638,6 +665,9 @@ impl Engine {
             last_reload_error: self.last_reload_error.clone(),
             bridge: self.bridge.clone(),
             tap_count: self.taps.len(),
+            config_watcher_healthy: self.config_watcher_healthy,
+            config_watcher_errors_total: self.config_watcher_errors_total,
+            config_watcher_last_error: self.config_watcher_last_error.clone(),
             ranges,
         }
     }
@@ -845,6 +875,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_reload_ok: true,
         last_reload_error: String::new(),
         last_config_bytes: initial_config_bytes,
+        config_watcher_healthy: true,
+        config_watcher_errors_total: 0,
+        config_watcher_last_error: String::new(),
         bridge: config.load().bridge.clone(),
         manager,
         taps,
@@ -896,7 +929,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     log::info!("IPC listening on {SOCK_PATH}");
 
     // 6. File watcher (hot reload) + SIGHUP.
-    let (reload_tx, mut reload_rx) = mpsc::channel::<()>(8);
+    let (reload_tx, mut reload_rx) = mpsc::channel::<WatchMsg>(8);
     let _watcher = spawn_watcher(config_path.clone(), reload_tx.clone())?;
 
     // 7. Signals.
@@ -923,13 +956,17 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
             }
             _ = sighup.recv() => {
                 log::info!("SIGHUP received; reloading config");
-                let _ = reload_tx.try_send(());
+                let _ = reload_tx.try_send(WatchMsg::Reload);
             }
             maybe = reload_rx.recv() => {
-                if maybe.is_some() {
-                    // File read + parse are blocking; block_in_place keeps the IPC
-                    // tasks running on another worker while the engine works.
-                    tokio::task::block_in_place(|| engine.reload(&config_path));
+                match maybe {
+                    Some(WatchMsg::Reload) => {
+                        // File read + parse are blocking; block_in_place keeps the IPC
+                        // tasks running on another worker while the engine works.
+                        tokio::task::block_in_place(|| engine.reload(&config_path));
+                    }
+                    Some(WatchMsg::Error(e)) => engine.record_watcher_error(e),
+                    None => {}
                 }
             }
             r = config_rx.changed() => {
@@ -1048,7 +1085,7 @@ fn schedules_from(
 /// cannot re-trigger itself.
 fn spawn_watcher(
     path: PathBuf,
-    reload_tx: mpsc::Sender<()>,
+    reload_tx: mpsc::Sender<WatchMsg>,
 ) -> Result<Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>> {
     let dir = path
         .parent()
@@ -1070,8 +1107,21 @@ fn spawn_watcher(
 
     std::thread::spawn(move || {
         while let Ok(res) = rx.recv() {
-            let Ok(events) = res else {
-                continue;
+            let events = match res {
+                Ok(events) => events,
+                Err(errs) => {
+                    // Surface instead of swallowing: a dead inotify watch leaves the
+                    // daemon healthy but permanently deaf to config changes.
+                    let msg = errs
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    if reload_tx.blocking_send(WatchMsg::Error(msg)).is_err() {
+                        break; // engine loop is gone
+                    }
+                    continue;
+                }
             };
             // Only real content changes count: in-place writes, atomic renames onto the
             // target, and (re)creation. Reads (OPEN/CLOSE-read — including this daemon's
@@ -1094,7 +1144,7 @@ fn spawn_watcher(
                         .iter()
                         .any(|p| p.file_name().map(|n| n == target_name).unwrap_or(false))
             });
-            if relevant && reload_tx.blocking_send(()).is_err() {
+            if relevant && reload_tx.blocking_send(WatchMsg::Reload).is_err() {
                 break;
             }
         }
