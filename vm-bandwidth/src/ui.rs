@@ -449,18 +449,8 @@ fn fetch_trend(app: &mut UiState) {
         TrendKind::Packets => "",
     };
     let rate_window = app.rate_window_secs;
-    let make_query = |metric: &str| match &trend.target {
-        TrendTarget::Ip(ipv4) => format!(
-            "rate({metric}{{ip=\"{}\"}}[{rate_window}s]){scale}",
-            std::net::Ipv4Addr::from(*ipv4)
-        ),
-        TrendTarget::Range(name) => format!(
-            "sum(rate({metric}{{range=\"{}\"}}[{rate_window}s])){scale}",
-            crate::metrics::escape_label(name)
-        ),
-    };
-    let rx_query = make_query(rx_metric);
-    let tx_query = make_query(tx_metric);
+    let rx_query = trend_query(&trend.target, rx_metric, rate_window, scale);
+    let tx_query = trend_query(&trend.target, tx_metric, rate_window, scale);
     let base = app.metrics_url.clone();
     let client = app.trend_client.clone();
 
@@ -470,6 +460,25 @@ fn fetch_trend(app: &mut UiState) {
         let res = fetch_pair(&client, &base, rx_query, tx_query, start, end, step).await;
         let _ = res_tx.send((seq, res));
     });
+}
+
+/// Build one PromQL expression for a trend series.
+///
+/// The shape is load-bearing: `rate()` drops the metric name, so mixing both
+/// directions in one `{__name__=~...}` selector yields duplicate label sets that
+/// VictoriaMetrics rejects; and range trends must wrap the rate in `sum()` or each
+/// IP comes back as its own series.
+fn trend_query(target: &TrendTarget, metric: &str, rate_window: u64, scale: &str) -> String {
+    match target {
+        TrendTarget::Ip(ipv4) => format!(
+            "rate({metric}{{ip=\"{}\"}}[{rate_window}s]){scale}",
+            std::net::Ipv4Addr::from(*ipv4)
+        ),
+        TrendTarget::Range(name) => format!(
+            "sum(rate({metric}{{range=\"{}\"}}[{rate_window}s])){scale}",
+            crate::metrics::escape_label(name)
+        ),
+    }
 }
 
 /// Fetch the RX and TX series for one trend view.
@@ -545,4 +554,56 @@ fn parse_series(body: &str) -> Result<Series> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(addr: [u8; 4]) -> TrendTarget {
+        TrendTarget::Ip(u32::from_be_bytes(addr))
+    }
+
+    #[test]
+    fn ip_bandwidth_query_is_a_per_ip_rate_scaled_to_bits() {
+        let q = trend_query(&ip([10, 30, 10, 121]), "vmbw_rx_bytes_total", 120, " * 8");
+        assert_eq!(
+            q,
+            "rate(vmbw_rx_bytes_total{ip=\"10.30.10.121\"}[120s]) * 8"
+        );
+    }
+
+    #[test]
+    fn ip_packets_query_carries_no_scale() {
+        let q = trend_query(&ip([10, 30, 10, 121]), "vmbw_rx_packets_total", 120, "");
+        assert_eq!(q, "rate(vmbw_rx_packets_total{ip=\"10.30.10.121\"}[120s])");
+    }
+
+    #[test]
+    fn range_query_aggregates_all_ips_with_sum() {
+        let q = trend_query(
+            &TrendTarget::Range("aois_a Seednet-0".into()),
+            "vmbw_tx_bytes_total",
+            120,
+            " * 8",
+        );
+        assert_eq!(
+            q,
+            "sum(rate(vmbw_tx_bytes_total{range=\"aois_a Seednet-0\"}[120s])) * 8"
+        );
+    }
+
+    #[test]
+    fn range_label_is_prometheus_escaped() {
+        let q = trend_query(
+            &TrendTarget::Range("a\"b\\c".into()),
+            "vmbw_rx_bytes_total",
+            120,
+            "",
+        );
+        assert_eq!(
+            q,
+            "sum(rate(vmbw_rx_bytes_total{range=\"a\\\"b\\\\c\"}[120s]))"
+        );
+    }
 }

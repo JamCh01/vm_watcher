@@ -218,11 +218,7 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
 
     // Wide terminals get every column; narrower ones drop totals and IP counts
     // progressively instead of overlapping cells (same tiers as the detail page).
-    let cols = match area.width {
-        w if w >= 105 => OverviewCols::Wide,
-        w if w >= 66 => OverviewCols::Mid,
-        _ => OverviewCols::Min,
-    };
+    let cols = overview_cols(area.width);
 
     let mut rows: Vec<Row> = status
         .ranges
@@ -300,11 +296,23 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
 }
 
 /// Column density of the overview table, chosen from the available width.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum OverviewCols {
     Wide,
     Mid,
     Min,
+}
+
+/// Width thresholds for the overview tiers (see `detail_cols` for the invariant).
+const OVERVIEW_WIDE_MIN: u16 = 105;
+const OVERVIEW_MID_MIN: u16 = 66;
+
+fn overview_cols(width: u16) -> OverviewCols {
+    match width {
+        w if w >= OVERVIEW_WIDE_MIN => OverviewCols::Wide,
+        w if w >= OVERVIEW_MID_MIN => OverviewCols::Mid,
+        _ => OverviewCols::Min,
+    }
 }
 
 fn overview_row(r: &RangeSummary, cols: OverviewCols) -> Row<'static> {
@@ -424,11 +432,7 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
 
     // Wide terminals get every column; narrower ones drop to progressively compact
     // layouts instead of overlapping cells. Widths sum + gaps + border must fit.
-    let cols = match chunks[1].width {
-        w if w >= 138 => DetailCols::Wide,
-        w if w >= 101 => DetailCols::Mid,
-        _ => DetailCols::Min,
-    };
+    let cols = detail_cols(chunks[1].width);
     let (widths, headers): (&[Constraint], &[&str]) = match cols {
         DetailCols::Wide => (
             &[
@@ -490,11 +494,24 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
 }
 
 /// Column density of the detail table, chosen from the available width.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum DetailCols {
     Wide,
     Mid,
     Min,
+}
+
+/// Width thresholds for the detail tiers: every constraint set plus gaps and the
+/// table border must fit the triggering width.
+const DETAIL_WIDE_MIN: u16 = 138;
+const DETAIL_MID_MIN: u16 = 101;
+
+fn detail_cols(width: u16) -> DetailCols {
+    match width {
+        w if w >= DETAIL_WIDE_MIN => DetailCols::Wide,
+        w if w >= DETAIL_MID_MIN => DetailCols::Mid,
+        _ => DetailCols::Min,
+    }
 }
 
 fn ip_row(ip: &IpDetail, cols: DetailCols) -> Row<'static> {
@@ -816,5 +833,28 @@ fn format_duration(d: Duration) -> String {
         format!("{}s", ms / 1000)
     } else {
         format!("{}ms", ms)
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    #[test]
+    fn overview_tier_boundaries() {
+        assert_eq!(overview_cols(OVERVIEW_WIDE_MIN), OverviewCols::Wide);
+        assert_eq!(overview_cols(OVERVIEW_WIDE_MIN - 1), OverviewCols::Mid);
+        assert_eq!(overview_cols(OVERVIEW_MID_MIN), OverviewCols::Mid);
+        assert_eq!(overview_cols(OVERVIEW_MID_MIN - 1), OverviewCols::Min);
+        assert_eq!(overview_cols(0), OverviewCols::Min);
+    }
+
+    #[test]
+    fn detail_tier_boundaries() {
+        assert_eq!(detail_cols(DETAIL_WIDE_MIN), DetailCols::Wide);
+        assert_eq!(detail_cols(DETAIL_WIDE_MIN - 1), DetailCols::Mid);
+        assert_eq!(detail_cols(DETAIL_MID_MIN), DetailCols::Mid);
+        assert_eq!(detail_cols(DETAIL_MID_MIN - 1), DetailCols::Min);
+        assert_eq!(detail_cols(0), DetailCols::Min);
     }
 }
