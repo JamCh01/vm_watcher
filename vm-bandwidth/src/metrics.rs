@@ -18,7 +18,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BODY: usize = 1 << 20;
 
 /// Escape a Prometheus label value (backslash, double quote, newline).
-fn escape_label(v: &str) -> String {
+pub fn escape_label(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for c in v.chars() {
         match c {

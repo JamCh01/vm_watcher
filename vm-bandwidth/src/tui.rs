@@ -16,10 +16,11 @@ use vm_bandwidth_core::bandwidth::{format_bps, format_bytes};
 use vm_bandwidth_core::config::SortMode;
 use vm_bandwidth_core::ipc::{IpDetail, RangeDetail, Status};
 
+#[derive(Clone, Copy, PartialEq)]
 pub enum Screen {
     Overview,
     Detail,
-    /// Historical trend for one IP, served by VictoriaMetrics.
+    /// Historical trend for one IP or a whole range, served by VictoriaMetrics.
     Trend,
 }
 
@@ -46,8 +47,16 @@ pub struct TrendData {
     pub tx: Series,
 }
 
+/// What the trend screen shows: one IP or a whole IP range aggregated.
+pub enum TrendTarget {
+    Ip(u32),
+    Range(String),
+}
+
 pub struct TrendView {
-    pub ip: u32,
+    pub target: TrendTarget,
+    /// Screen that Esc returns to.
+    pub from: Screen,
     pub win: usize,
     pub kind: TrendKind,
     pub data: Option<TrendData>,
@@ -182,8 +191,12 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &UiState, area: Rect) {
     let keys = match app.screen {
-        Screen::Overview => "↑/↓ select   Enter detail   r refresh   h help   q quit",
-        Screen::Detail => "↑/↓ select   Enter trend   s sort   r refresh   Esc back   q quit",
+        Screen::Overview => {
+            "↑/↓ select   Enter detail   t range trend   r refresh   h help   q quit"
+        }
+        Screen::Detail => {
+            "↑/↓ select   Enter trend   t range trend   s sort   r refresh   Esc back   q quit"
+        }
         Screen::Trend => "←/→ window   b bandwidth   p packets   r refresh   Esc back   q quit",
     };
     let sort_hint = match app.screen {
@@ -567,12 +580,14 @@ fn sparkline(points: &[(i64, f64)], width: usize) -> (String, f64, f64, f64) {
 
 fn draw_trend(f: &mut Frame, app: &UiState, area: Rect) {
     let Some(trend) = &app.trend else {
-        f.render_widget(waiting_widget("IP Trend"), area);
+        f.render_widget(waiting_widget("Trend"), area);
         return;
     };
 
-    let ip = std::net::Ipv4Addr::from(trend.ip);
-    let mut title = format!("IP Trend: {ip}   [");
+    let mut title = match &trend.target {
+        TrendTarget::Ip(ip) => format!("IP Trend: {}   [", std::net::Ipv4Addr::from(*ip)),
+        TrendTarget::Range(name) => format!("Range Trend: {name}   ["),
+    };
     for (i, (label, _, _)) in TREND_WINDOWS.iter().enumerate() {
         if i == trend.win {
             title.push_str(&format!(" *{label}* "));
@@ -648,6 +663,7 @@ fn draw_help(f: &mut Frame) {
         )),
         Line::from("↑/↓        select IP range"),
         Line::from("Enter      open selected range"),
+        Line::from("t          trend for selected range"),
         Line::from("r          refresh now"),
         Line::from("h          toggle help"),
         Line::from("q          quit"),
@@ -657,19 +673,20 @@ fn draw_help(f: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from("↑/↓        select IP"),
+        Line::from("t          trend for the whole range"),
         Line::from("s          cycle sort (IP → RX → TX → RX+TX)"),
         Line::from("r          refresh now"),
         Line::from("Esc        back to overview"),
         Line::from("q          quit"),
         Line::from(""),
         Line::from(Span::styled(
-            "IP Trend (VictoriaMetrics)",
+            "Trend (VictoriaMetrics)",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("Enter      open trend for selected IP"),
+        Line::from("Enter      open trend for selected IP (detail)"),
         Line::from("←/→ 1-4    window: 1h / 24h / 7d / 30d"),
         Line::from("b / p      bandwidth / packets"),
-        Line::from("Esc        back to detail"),
+        Line::from("Esc        back"),
         Line::from(""),
         Line::from("any key closes this help"),
     ];

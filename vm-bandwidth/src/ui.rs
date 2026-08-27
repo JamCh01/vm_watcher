@@ -16,7 +16,7 @@ use vm_bandwidth_core::config::{self};
 use vm_bandwidth_core::ipc::{self, Request, Response};
 
 use crate::daemon::SOCK_PATH;
-use crate::tui::{self, Screen, Series, TrendKind, TrendView, UiState, TREND_WINDOWS};
+use crate::tui::{self, Screen, Series, TrendKind, TrendTarget, TrendView, UiState, TREND_WINDOWS};
 
 const REFRESH: Duration = Duration::from_secs(1);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -343,7 +343,34 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
             });
             if let Some(ip) = ip {
                 app.trend = Some(TrendView {
-                    ip,
+                    target: TrendTarget::Ip(ip),
+                    from: Screen::Detail,
+                    win: 0,
+                    kind: TrendKind::Bandwidth,
+                    data: None,
+                    fetched_at: None,
+                    error: None,
+                });
+                app.screen = Screen::Trend;
+                return UiAction::Refresh;
+            }
+        }
+        KeyCode::Char('t') if matches!(app.screen, Screen::Overview | Screen::Detail) => {
+            // Open the aggregated trend for a whole IP range.
+            let name = match app.screen {
+                Screen::Overview => app.overview.selected().and_then(|sel| {
+                    app.status
+                        .as_ref()
+                        .and_then(|s| s.ranges.get(sel))
+                        .map(|r| r.name.clone())
+                }),
+                // The guard above leaves only Detail here.
+                _ => app.detail.as_ref().map(|d| d.name.clone()),
+            };
+            if let Some(name) = name {
+                app.trend = Some(TrendView {
+                    target: TrendTarget::Range(name),
+                    from: app.screen,
                     win: 0,
                     kind: TrendKind::Bandwidth,
                     data: None,
@@ -361,8 +388,13 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
                 app.detail_index = None;
             }
             Screen::Trend => {
-                app.screen = Screen::Detail;
+                let to = app.trend.as_ref().map(|t| t.from).unwrap_or(Screen::Detail);
                 app.trend = None;
+                app.screen = to;
+                if to == Screen::Overview {
+                    app.detail = None;
+                    app.detail_index = None;
+                }
                 return UiAction::Refresh;
             }
             Screen::Overview => {}
@@ -404,10 +436,10 @@ fn fetch_trend(app: &mut UiState) {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let start = end - span as i64;
-    let ip = std::net::Ipv4Addr::from(trend.ip);
     // Two separate queries: rate() drops the metric name, so a single
     // {__name__=~"rx|tx"} selector would produce two series with identical
     // label sets, which VictoriaMetrics rejects as duplicate output timeseries.
+    // Range trends wrap the per-series rate in sum() to aggregate all IPs.
     let (rx_metric, tx_metric) = match trend.kind {
         TrendKind::Bandwidth => ("vmbw_rx_bytes_total", "vmbw_tx_bytes_total"),
         TrendKind::Packets => ("vmbw_rx_packets_total", "vmbw_tx_packets_total"),
@@ -416,40 +448,36 @@ fn fetch_trend(app: &mut UiState) {
         TrendKind::Bandwidth => " * 8",
         TrendKind::Packets => "",
     };
-    let base = app.metrics_url.clone();
     let rate_window = app.rate_window_secs;
+    let make_query = |metric: &str| match &trend.target {
+        TrendTarget::Ip(ipv4) => format!(
+            "rate({metric}{{ip=\"{}\"}}[{rate_window}s]){scale}",
+            std::net::Ipv4Addr::from(*ipv4)
+        ),
+        TrendTarget::Range(name) => format!(
+            "sum(rate({metric}{{range=\"{}\"}}[{rate_window}s])){scale}",
+            crate::metrics::escape_label(name)
+        ),
+    };
+    let rx_query = make_query(rx_metric);
+    let tx_query = make_query(tx_metric);
+    let base = app.metrics_url.clone();
     let client = app.trend_client.clone();
 
     app.trend_seq += 1;
     let seq = app.trend_seq;
     rt.spawn(async move {
-        let res = fetch_pair(
-            &client,
-            &base,
-            rate_window,
-            ip,
-            rx_metric,
-            tx_metric,
-            scale,
-            start,
-            end,
-            step,
-        )
-        .await;
+        let res = fetch_pair(&client, &base, rx_query, tx_query, start, end, step).await;
         let _ = res_tx.send((seq, res));
     });
 }
 
 /// Fetch the RX and TX series for one trend view.
-#[allow(clippy::too_many_arguments)]
 async fn fetch_pair(
     client: &reqwest::Client,
     base: &str,
-    rate_window: u64,
-    ip: std::net::Ipv4Addr,
-    rx_metric: &str,
-    tx_metric: &str,
-    scale: &str,
+    rx_query: String,
+    tx_query: String,
     start: i64,
     end: i64,
     step: u64,
@@ -457,46 +485,21 @@ async fn fetch_pair(
     // Both directions in parallel: they are independent queries against the same
     // connection pool, so the round-trip cost is paid once, not twice.
     let (rx, tx) = tokio::try_join!(
-        fetch_series(
-            client,
-            base,
-            rate_window,
-            ip,
-            rx_metric,
-            scale,
-            start,
-            end,
-            step
-        ),
-        fetch_series(
-            client,
-            base,
-            rate_window,
-            ip,
-            tx_metric,
-            scale,
-            start,
-            end,
-            step
-        ),
+        fetch_series(client, base, rx_query, start, end, step),
+        fetch_series(client, base, tx_query, start, end, step),
     )?;
     Ok(tui::TrendData { rx, tx })
 }
 
 /// One VictoriaMetrics `query_range` request, with a capped response body.
-#[allow(clippy::too_many_arguments)]
 async fn fetch_series(
     client: &reqwest::Client,
     base: &str,
-    rate_window: u64,
-    ip: std::net::Ipv4Addr,
-    metric: &str,
-    scale: &str,
+    query: String,
     start: i64,
     end: i64,
     step: u64,
 ) -> Result<Series, String> {
-    let query = format!("rate({metric}{{ip=\"{ip}\"}}[{rate_window}s]){scale}");
     let resp = client
         .get(format!("{base}/api/v1/query_range"))
         .query(&[
