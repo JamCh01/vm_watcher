@@ -473,23 +473,31 @@ range = "10.30.9.1-10.30.9.32"
 
 - 监听配置文件所在目录（兼容编辑器 atomic rename），300ms 去抖：一次正常保存 ≈ 一次
   reload。`SIGHUP` 走同一套管线。
-- 事务式：读取 → 完整解析 → 完整校验 → 生成新 EffectiveConfig → 与现有配置做
-  added/removed/changed 差分 → 一次性按安全顺序应用（新增先写白名单，删除先清限速再
-  删白名单）→ 切换 active config 并递增 `config_generation`。
+- 事务式：读取 → 完整解析 → 完整校验 → 限速器生成**纯变更计划**（不改自身状态）
+  → 按序执行全部 map 操作：白名单前缀新增 → 解除限速（先删策略后清状态）→
+  安装限速（先写状态、策略最后写，写入即生效标志）→ 白名单前缀移除 →
+  全部成功才提交限速器状态、切换配置并递增 `generation`；任一 map 操作失败则
+  逆向回滚已执行部分并保持上一份配置（详见首屏“热加载”条目）。成功后立即
+  重采集一次，IPC 快照在新配置下重建，不存在旧快照×新配置的混合窗口。
 - 校验失败：拒绝该次 reload，完整保留上一次成功配置，不清空、不中断、不退出，
   `--ui` 顶栏显示 `FAILED` 及原因，`generation` 不变。
+- 文件监听器（inotify）报错不会静默吞掉：记录日志、累计计数，经 IPC 暴露
+  （`config_watcher_healthy` / `config_watcher_errors_total` / `config_watcher_last_error`），
+  `--ui` 顶栏在不健康时显示 `WATCHER UNHEALTHY`（提示热加载可能已失效）。
 - LIMITED 状态下修改：`rate`/`burst`/`limit_window`/`algorithm` 变更立即生效并
   重置该方向限速状态；
   `limit_duration` 变更按原 `limited_since` 重算 `limited_until`（可能立即解除）；
   删除限速配置立即恢复 NORMAL；`window` 变更清空窗口重新积累。
-- 新增/删除 IP 段同步增删 `MONITORED_IPS`，并清理对应的窗口/限速/计数器状态。
+- 新增/删除 IP 段同步增删 `MONITORED_IPS` 的 CIDR 前缀（段的差分以分解后的前缀
+  集计算），并清理对应的窗口/限速/计数器状态。
 
 ## 界面（--ui）
 
-启动后进入 **IP Range Overview**：每个段的名称、范围、实时 RX/TX、累计 RX/TX、IP 数、
-Limited 数；顶栏显示 bridge、TAP 数、`Config generation`、最近一次 reload 的时间与
-状态（失败时附原因）。选中段按 `Enter` 进入 **IP Range Detail**：段内每一个 IP 的
-实时速率、窗口平均、有效策略（阈值/限速）、`NORMAL`/`LIMITED` 状态与剩余限速时间。
+启动后进入 **IP Range Overview**：每个段的名称、范围、实时 RX/TX、累计 RX/TX、
+IP 数（本次启动以来出现过流量的地址数）、Limited 数；顶栏显示 bridge、TAP 数、
+`Config generation`、最近一次 reload 的时间与状态（失败时附原因）。选中段按 `Enter`
+进入 **IP Range Detail**：段内每个已观测 IP 的实时速率、窗口平均、有效策略（阈值/
+限速）、`NORMAL`/`LIMITED` 状态与剩余限速时间。
 
 | 页面 | 按键 | 功能 |
 | --- | --- | --- |
