@@ -426,14 +426,10 @@ impl Engine {
             }
         }
         for c in rb.wl_removed.iter().rev() {
-            let _ =
-                self.monitored
-                    .insert(&TrieKey::new(u32::from(c.prefix_len), c.network), 1u8, 0);
+            let _ = self.monitored.insert(&trie_key(c), 1u8, 0);
         }
         for c in rb.wl_added.iter().rev() {
-            let _ = self
-                .monitored
-                .remove(&TrieKey::new(u32::from(c.prefix_len), c.network));
+            let _ = self.monitored.remove(&trie_key(c));
         }
     }
 
@@ -451,8 +447,6 @@ impl Engine {
         }
     }
 
-    /// Transactional config reload (§16): parse + validate fully, then apply once.
-    /// A rejected config leaves the previous one fully in place (§28).
     fn record_watcher_error(&mut self, e: String) {
         self.config_watcher_healthy = false;
         self.config_watcher_errors_total += 1;
@@ -460,6 +454,8 @@ impl Engine {
         log::error!("config watcher error (hot reload may stop working): {e}");
     }
 
+    /// Transactional config reload (§16): parse + validate fully, then apply once.
+    /// A rejected config leaves the previous one fully in place (§28).
     fn reload(&mut self, path: &Path) {
         log::info!("config reload requested");
 
@@ -532,7 +528,7 @@ impl Engine {
     fn apply_config(&mut self, new_cfg: ValidatedConfig) -> Result<()> {
         if new_cfg.bridge != self.bridge {
             anyhow::bail!(
-                "changing network.bridge ({} -> {}) is not supported by hot reload;                  restart the daemon instead",
+                "changing network.bridge ({} -> {}) is not supported by hot reload; restart the daemon instead",
                 self.bridge,
                 new_cfg.bridge
             );

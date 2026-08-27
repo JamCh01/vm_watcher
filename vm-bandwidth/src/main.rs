@@ -22,7 +22,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(
     name = "vm-bandwidth-monitor",
-    about = "Per-IP bandwidth monitoring and GCRA rate limiting for VMs behind a Linux bridge (eBPF/TC)"
+    about = "Per-IP bandwidth monitoring and pluggable-algorithm rate limiting for VMs behind a Linux bridge (eBPF/TC)"
 )]
 struct Cli {
     /// Path to the TOML configuration file (daemon mode).

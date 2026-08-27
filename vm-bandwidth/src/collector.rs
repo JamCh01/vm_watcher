@@ -52,7 +52,8 @@ pub struct RangeStats {
     pub tx_dropped_bytes: u64,
     pub rx_dropped_packets: u64,
     pub tx_dropped_packets: u64,
-    /// Every IP of the configured range, including IPs without traffic (all zeros).
+    /// IPs of this range observed since daemon start (the LPM-trie whitelist makes
+    /// ranges arbitrarily large, so idle addresses are never enumerated).
     pub ips: Vec<(u32, IpStats)>,
 }
 
