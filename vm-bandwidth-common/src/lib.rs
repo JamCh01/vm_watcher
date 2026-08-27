@@ -140,7 +140,7 @@ unsafe impl aya::Pod for LimitState {}
 /// while LIMITED consumes one entry; when full, the oldest entry is overwritten, which
 /// makes the log an *under-counting* approximation at packet rates above roughly
 /// `CAP / window` packets per second (documented in the README).
-pub const SWL_LOG_CAP: usize = 64;
+pub const SWL_LOG_CAP: usize = 1024;
 
 /// One logged packet: arrival time and wire length.
 #[repr(C)]
