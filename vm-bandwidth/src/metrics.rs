@@ -86,6 +86,49 @@ pub fn render_prom_lines(
     out
 }
 
+/// Render the policer verdict series (passed/dropped, bytes/packets) for flows
+/// with an active policy. Cumulative like the traffic counters; the daemon resets
+/// them per policy session, which `rate()`/`increase()` treat as counter resets.
+pub fn render_prom_lines_policer(
+    totals: &HashMap<u32, crate::collector::PolicerIpTotals>,
+    range_name: impl Fn(u32) -> String,
+    now_ms: i64,
+) -> String {
+    let mut out = String::with_capacity(totals.len() * 384);
+    let mut ips: Vec<u32> = totals.keys().copied().collect();
+    ips.sort_unstable();
+    for ip in ips {
+        let Some(t) = totals.get(&ip) else { continue };
+        let addr = Ipv4Addr::from(ip);
+        let range = escape_label(&range_name(ip));
+        for (name, value) in [
+            ("vmbw_policer_rx_passed_bytes_total", t.rx_passed_bytes),
+            ("vmbw_policer_tx_passed_bytes_total", t.tx_passed_bytes),
+            ("vmbw_policer_rx_passed_packets_total", t.rx_passed_packets),
+            ("vmbw_policer_tx_passed_packets_total", t.tx_passed_packets),
+            ("vmbw_policer_rx_dropped_bytes_total", t.rx_dropped_bytes),
+            ("vmbw_policer_tx_dropped_bytes_total", t.tx_dropped_bytes),
+            (
+                "vmbw_policer_rx_dropped_packets_total",
+                t.rx_dropped_packets,
+            ),
+            (
+                "vmbw_policer_tx_dropped_packets_total",
+                t.tx_dropped_packets,
+            ),
+        ] {
+            if value == 0 {
+                continue;
+            }
+            out.push_str(name);
+            out.push_str(&format!(
+                "{{ip=\"{addr}\",range=\"{range}\"}} {value} {now_ms}\n"
+            ));
+        }
+    }
+    out
+}
+
 /// Shared HTTP client. reqwest pools connections and recommends reusing one
 /// instance; the daemon builds it once and hands it to every push.
 pub fn client() -> reqwest::Client {
@@ -173,5 +216,32 @@ mod tests {
         );
         let lines = render_prom_lines(&totals, |_| "a\"b\\c".into(), 0);
         assert!(lines.contains("range=\"a\\\"b\\\\c\""), "{lines}");
+    }
+
+    #[test]
+    fn renders_policer_nonzero_only() {
+        let mut totals = HashMap::new();
+        totals.insert(
+            u32::from(Ipv4Addr::new(10, 0, 0, 2)),
+            crate::collector::PolicerIpTotals {
+                rx_passed_bytes: 100,
+                tx_dropped_bytes: 40,
+                tx_dropped_packets: 3,
+                ..Default::default()
+            },
+        );
+        totals.insert(
+            u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+            crate::collector::PolicerIpTotals::default(),
+        );
+        let lines = render_prom_lines_policer(&totals, |_| "r1".into(), 123);
+        assert!(lines.contains(
+            "vmbw_policer_rx_passed_bytes_total{ip=\"10.0.0.2\",range=\"r1\"} 100 123"
+        ));
+        assert!(lines.contains(
+            "vmbw_policer_tx_dropped_bytes_total{ip=\"10.0.0.2\",range=\"r1\"} 40 123"
+        ));
+        assert_eq!(lines.lines().count(), 3, "zero series must be skipped: {lines}");
+        assert!(!lines.contains("10.0.0.1"), "unpoliced IP must emit nothing");
     }
 }

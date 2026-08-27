@@ -30,6 +30,18 @@ pub struct TrafficValue {
     pub tx_packets: u64,
 }
 
+/// Cumulative policer verdict counters for one (ipv4, direction) flow, per-CPU.
+/// `TRAFFIC` records demand (what arrived); this records what the policer actually
+/// let through versus dropped. Only flows with an active policy get entries.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicerStats {
+    pub passed_bytes: u64,
+    pub passed_packets: u64,
+    pub dropped_bytes: u64,
+    pub dropped_packets: u64,
+}
+
 /// Direction of traffic relative to the VM. Kept as plain `u8` constants so the
 /// value is usable identically in `#![no_std]` eBPF code and userspace.
 pub const DIR_RX: u8 = 0; // packet is being received by the VM (TAP egress)
@@ -138,6 +150,9 @@ unsafe impl aya::Pod for TrafficKey6 {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficValue {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PolicerStats {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LimitKey {}

@@ -58,6 +58,11 @@ pub struct RangeSummary {
     pub ip_count: usize,
     /// Number of flows (IP+direction) currently LIMITED in this range.
     pub limited: usize,
+    /// Aggregate policer drops across the range (0 unless something is policed).
+    pub rx_dropped_bps: f64,
+    pub tx_dropped_bps: f64,
+    pub rx_dropped_bytes: u64,
+    pub tx_dropped_bytes: u64,
 }
 
 /// Everything the detail screen needs for one range (§31).
@@ -69,6 +74,11 @@ pub struct RangeDetail {
     pub tx_bps: f64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Cumulative policer drops for the range (0 unless something is policed).
+    pub rx_dropped_bytes: u64,
+    pub tx_dropped_bytes: u64,
+    pub rx_dropped_packets: u64,
+    pub tx_dropped_packets: u64,
     pub ips: Vec<IpDetail>,
 }
 
@@ -96,6 +106,11 @@ pub struct IpDetail {
     // Seconds of limiting remaining per direction (0 when NORMAL).
     pub rx_remaining: u64,
     pub tx_remaining: u64,
+    // Cumulative policer verdicts per direction (0 unless this flow is policed).
+    pub rx_dropped_bytes: u64,
+    pub tx_dropped_bytes: u64,
+    pub rx_dropped_packets: u64,
+    pub tx_dropped_packets: u64,
 }
 
 /// Encode a frame: u32 big-endian length + JSON bytes.

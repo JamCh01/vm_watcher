@@ -505,7 +505,7 @@ Limited 数；顶栏显示 bridge、TAP 数、`Config generation`、最近一次
 | 首页 | Wide | ≥105 列 | 名称、IP 范围、RX、TX、RX/TX 累计、IP 数、Limited |
 | 首页 | Mid | ≥66 列 | 名称、IP 范围、RX、TX、Limited |
 | 首页 | Min | 更窄 | 名称+范围（两行叠一格）、RX、TX、Limited |
-| 详情 | Wide | ≥138 列 | 全部 12 列（含窗口平均、分方向限速与状态、剩余时间） |
+| 详情 | Wide | ≥149 列 | 全部 13 列（含 Dropped、窗口平均、分方向限速与状态、剩余时间） |
 | 详情 | Mid | ≥101 列 | IPv4、RX/TX、累计、限速、状态、剩余时间 |
 | 详情 | Min | 更窄 | IPv4、RX、TX、状态 |
 
@@ -529,15 +529,16 @@ push_interval_secs = 60
 
 `[metrics]` 参与热加载：改动在文件监听触发后的下一个推送周期生效。数据模型：每 IP 四条累计计数器（`vmbw_{rx,tx}_{bytes,packets}_total`，
 标签 `ip`/`range`），趋势屏用 `rate()` 查询，daemon 重启造成的计数器归零由
-`rate()` 按标准 counter reset 处理。范围趋势用
+`rate()` 按标准 counter reset 处理。被限速的流另有八条裁决计数器（`vmbw_policer_{rx,tx}_{passed,dropped}_{bytes,packets}_total`）：
+TRAFFIC 记的是限速前的流量需求，这组才是实际放行/丢弃量。范围趋势用
 `sum(rate(...{range="段名"}))` 聚合段内全部 IP；单 IP 与范围的 RX/TX 两个方向查询并行发出。
 
 ## 实现要点
 
 - **单一 eBPF 对象，挂载到所有 TAP**：对象只加载一次（验证器只跑一遍），
   `tc_ingress`/`tc_egress` 直接从 `__sk_buff` 上下文读取 ifindex，同一对程序以
-  TCX/netlink 链接挂到每个 TAP；五份 map（白名单、计数、限速策略、限速状态、
-  滑窗日志）全部为 BTF 定义、天然共享，不 pin，随 daemon 生命周期存在。
+  TCX/netlink 链接挂到每个 TAP；七份 map（白名单、IPv4/IPv6 计数、限速策略、限速状态、
+  滑窗日志、限速裁决统计）全部为 BTF 定义、天然共享，不 pin，随 daemon 生命周期存在。
 - 挂载/卸载由 `AttachManager` 负责：丢弃某个链接即移除**且仅移除**本程序创建的
   TC filter；不动 `fq_codel`/`noqueue`，不清理其他程序的 filter。
 - 计数为单调累计值，用户态按相邻采样差值计算速率；计数回绕/复位或 TAP 重建时该周期
@@ -560,5 +561,7 @@ push_interval_secs = 60
   记日志）。
 - 累计流量自本次启动起计（每次启动重建 map）。
 - 限速是 policing：超限直接丢包，不做缓冲/整形；对被限流方表现为丢包重传。
+  TRAFFIC 计数发生在限速之前（流量需求）；实际放行/丢弃由 `POLICER_STATS` 记录，
+  仅对有生效策略的流建条目，展示于详情页（Wide 档 Dropped 列、页头丢弃合计、首页 Σ 行）。
 - 窗口采样粒度 = `refresh_interval_ms`；窗口长度超过 `3600 × 采样粒度` 时会截断到该
   上限（极长窗口场景）。

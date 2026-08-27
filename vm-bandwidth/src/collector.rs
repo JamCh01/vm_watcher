@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use aya::maps::{MapData, PerCpuHashMap};
-use vm_bandwidth_common::{TrafficKey, TrafficKey6, TrafficValue};
+use vm_bandwidth_common::{LimitKey, PolicerStats, TrafficKey, TrafficKey6, TrafficValue};
 
 use vm_bandwidth_core::ip_range::IpRange;
 use vm_bandwidth_core::limiter::IpTotals;
@@ -21,6 +21,18 @@ pub struct IpStats {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    // Cumulative policer verdicts (only ever nonzero for policed flows).
+    pub rx_passed_bytes: u64,
+    pub tx_passed_bytes: u64,
+    pub rx_passed_packets: u64,
+    pub tx_passed_packets: u64,
+    pub rx_dropped_bytes: u64,
+    pub tx_dropped_bytes: u64,
+    pub rx_dropped_packets: u64,
+    pub tx_dropped_packets: u64,
+    /// Live drop rates for this interval (0 when nothing was dropped).
+    pub rx_dropped_bps: f64,
+    pub tx_dropped_bps: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,6 +45,13 @@ pub struct RangeStats {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    // Aggregate policer verdicts across the range's IPs.
+    pub rx_dropped_bps: f64,
+    pub tx_dropped_bps: f64,
+    pub rx_dropped_bytes: u64,
+    pub tx_dropped_bytes: u64,
+    pub rx_dropped_packets: u64,
+    pub tx_dropped_packets: u64,
     /// Every IP of the configured range, including IPs without traffic (all zeros).
     pub ips: Vec<(u32, IpStats)>,
 }
@@ -51,6 +70,21 @@ pub struct PollResult {
     /// Aggregate IPv6 counters and rates. IPv6 has no per-IP breakdown in the
     /// snapshot and never enters the limiter.
     pub ipv6: IpStats,
+    /// Cumulative policer verdict counters per IP, for the metrics push.
+    pub policer: HashMap<u32, PolicerIpTotals>,
+}
+
+/// Cumulative policer verdicts for one IP (both directions), for metrics export.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PolicerIpTotals {
+    pub rx_passed_bytes: u64,
+    pub tx_passed_bytes: u64,
+    pub rx_passed_packets: u64,
+    pub tx_passed_packets: u64,
+    pub rx_dropped_bytes: u64,
+    pub tx_dropped_bytes: u64,
+    pub rx_dropped_packets: u64,
+    pub tx_dropped_packets: u64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -82,6 +116,7 @@ pub struct Collector {
     prev6: HashMap<TrafficKey6, TrafficValue>,
     /// Running IPv6 aggregate (cumulative counters + last-interval rates).
     ipv6: IpStats,
+    prev_policer: HashMap<LimitKey, PolicerStats>,
     last_poll: Option<Instant>,
 }
 
@@ -92,6 +127,7 @@ impl Collector {
             totals: HashMap::new(),
             prev6: HashMap::new(),
             ipv6: IpStats::default(),
+            prev_policer: HashMap::new(),
             last_poll: None,
         }
     }
@@ -101,6 +137,7 @@ impl Collector {
     pub fn prune_ips(&mut self, keep: &HashSet<u32>) {
         self.totals.retain(|ip, _| keep.contains(ip));
         self.prev.retain(|key, _| keep.contains(&key.ipv4));
+        self.prev_policer.retain(|key, _| keep.contains(&key.ipv4));
     }
 
     /// Drop previous-sample entries for TAPs that no longer exist (pairs that can never
@@ -114,6 +151,7 @@ impl Collector {
         &mut self,
         traffic: &PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
         traffic6: &PerCpuHashMap<MapData, TrafficKey6, TrafficValue>,
+        policer: &PerCpuHashMap<MapData, LimitKey, PolicerStats>,
         ranges: &[IpRange],
     ) -> PollResult {
         let now = Instant::now();
@@ -217,10 +255,62 @@ impl Collector {
             stats.rx_bps = delta.rx_bytes as f64 * 8.0 / elapsed_secs;
             stats.tx_bps = delta.tx_bytes as f64 * 8.0 / elapsed_secs;
         }
+
+        // Policer verdicts: same delta discipline, keyed by (ip, direction) and folded
+        // into the same per-IP totals. A dropped packet was already counted in TRAFFIC,
+        // so the entry exists; or_default keeps this safe either way.
+        let mut cur_policer: HashMap<LimitKey, PolicerStats> = HashMap::new();
+        for item in policer.iter() {
+            match item {
+                Ok((key, values)) => {
+                    let mut acc = PolicerStats::default();
+                    for v in values.iter() {
+                        acc.passed_bytes += v.passed_bytes;
+                        acc.passed_packets += v.passed_packets;
+                        acc.dropped_bytes += v.dropped_bytes;
+                        acc.dropped_packets += v.dropped_packets;
+                    }
+                    cur_policer.insert(key, acc);
+                }
+                Err(e) => log::warn!("reading POLICER_STATS map: {e}"),
+            }
+        }
+        if elapsed_secs > 0.0 {
+            for (key, value) in &cur_policer {
+                let Some(prev) = self.prev_policer.get(key) else {
+                    continue;
+                };
+                let d_passed_bytes = value.passed_bytes.saturating_sub(prev.passed_bytes);
+                let d_passed_packets = value.passed_packets.saturating_sub(prev.passed_packets);
+                let d_dropped_bytes = value.dropped_bytes.saturating_sub(prev.dropped_bytes);
+                let d_dropped_packets = value.dropped_packets.saturating_sub(prev.dropped_packets);
+                if d_passed_bytes | d_passed_packets | d_dropped_bytes | d_dropped_packets == 0 {
+                    continue;
+                }
+                let stats = self.totals.entry(key.ipv4).or_default();
+                if key.direction == vm_bandwidth_common::DIR_TX {
+                    stats.tx_passed_bytes += d_passed_bytes;
+                    stats.tx_passed_packets += d_passed_packets;
+                    stats.tx_dropped_bytes += d_dropped_bytes;
+                    stats.tx_dropped_packets += d_dropped_packets;
+                    stats.tx_dropped_bps = d_dropped_bytes as f64 * 8.0 / elapsed_secs;
+                } else {
+                    stats.rx_passed_bytes += d_passed_bytes;
+                    stats.rx_passed_packets += d_passed_packets;
+                    stats.rx_dropped_bytes += d_dropped_bytes;
+                    stats.rx_dropped_packets += d_dropped_packets;
+                    stats.rx_dropped_bps = d_dropped_bytes as f64 * 8.0 / elapsed_secs;
+                }
+            }
+        }
+        self.prev_policer = cur_policer;
+
         for (ip, stats) in self.totals.iter_mut() {
             if !deltas.contains_key(ip) {
                 stats.rx_bps = 0.0;
                 stats.tx_bps = 0.0;
+                stats.rx_dropped_bps = 0.0;
+                stats.tx_dropped_bps = 0.0;
             }
         }
 
@@ -240,6 +330,12 @@ impl Collector {
                 rs.tx_bytes += stats.tx_bytes;
                 rs.rx_packets += stats.rx_packets;
                 rs.tx_packets += stats.tx_packets;
+                rs.rx_dropped_bps += stats.rx_dropped_bps;
+                rs.tx_dropped_bps += stats.tx_dropped_bps;
+                rs.rx_dropped_bytes += stats.rx_dropped_bytes;
+                rs.tx_dropped_bytes += stats.tx_dropped_bytes;
+                rs.rx_dropped_packets += stats.rx_dropped_packets;
+                rs.tx_dropped_packets += stats.tx_dropped_packets;
                 rs.ips.push((ip, stats));
             }
             snap_ranges.push(rs);
@@ -261,12 +357,36 @@ impl Collector {
             })
             .collect();
 
+        let policer = self
+            .totals
+            .iter()
+            .filter(|(_, s)| {
+                s.rx_passed_bytes | s.tx_passed_bytes | s.rx_dropped_bytes | s.tx_dropped_bytes != 0
+            })
+            .map(|(ip, s)| {
+                (
+                    *ip,
+                    PolicerIpTotals {
+                        rx_passed_bytes: s.rx_passed_bytes,
+                        tx_passed_bytes: s.tx_passed_bytes,
+                        rx_passed_packets: s.rx_passed_packets,
+                        tx_passed_packets: s.tx_passed_packets,
+                        rx_dropped_bytes: s.rx_dropped_bytes,
+                        tx_dropped_bytes: s.tx_dropped_bytes,
+                        rx_dropped_packets: s.rx_dropped_packets,
+                        tx_dropped_packets: s.tx_dropped_packets,
+                    },
+                )
+            })
+            .collect();
+
         PollResult {
             snapshot: Snapshot {
                 ranges: snap_ranges,
             },
             totals,
             ipv6: self.ipv6.clone(),
+            policer,
         }
     }
 }

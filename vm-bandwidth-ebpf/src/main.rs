@@ -41,9 +41,9 @@ use network_types::{
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, SwlEntry, TrafficKey, TrafficKey6, TrafficValue, ALGO_FIXED_WINDOW,
-    ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG,
-    ALGO_TOKEN_BUCKET, SWL_LOG_CAP,
+    LimitKey, LimitPolicy, PolicerStats, SwlEntry, TrafficKey, TrafficKey6, TrafficValue,
+    ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
+    ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, SWL_LOG_CAP,
 };
 
 /// Compile-time default; userspace overrides `max_entries` at load time
@@ -324,7 +324,40 @@ unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
     };
 
     bpf_spin_unlock(lock_ptr);
+    record_verdict(&key, len_bytes, conform);
     !conform
+}
+
+/// Record a policer verdict (pass or drop) for a flow with an active policy.
+/// Failure to record never affects the verdict itself.
+#[inline(always)]
+unsafe fn record_verdict(key: &LimitKey, len_bytes: u64, passed: bool) {
+    let stats = match POLICER_STATS.get_ptr_mut(*key) {
+        Some(ptr) => &mut *ptr,
+        None => {
+            // Map full (E2BIG) or transient failure: verdict stands, stats skipped.
+            // `&` is load-bearing: passing the struct by value makes LLVM lower its
+            // zero-initialization to a memset call, which BPF cannot link.
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            if POLICER_STATS
+                .insert(key, &PolicerStats::default(), 0)
+                .is_err()
+            {
+                return;
+            }
+            match POLICER_STATS.get_ptr_mut(*key) {
+                Some(ptr) => &mut *ptr,
+                None => return,
+            }
+        }
+    };
+    if passed {
+        stats.passed_bytes += len_bytes;
+        stats.passed_packets += 1;
+    } else {
+        stats.dropped_bytes += len_bytes;
+        stats.dropped_packets += 1;
+    }
 }
 
 /// Bucket capacity in nbytes and refill rate in nbytes/ns. `rate_bps >= 100Kbps` is
@@ -548,6 +581,7 @@ unsafe fn swl_police(key: &LimitKey, policy: &LimitPolicy, len_bytes: u64) -> bo
     }
 
     bpf_spin_unlock(lock_ptr);
+    record_verdict(key, len_bytes, conform);
     !conform
 }
 

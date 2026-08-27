@@ -24,8 +24,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, LimitState, SwlRing, TrafficKey, TrafficKey6, TrafficValue,
-    ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
+    LimitKey, LimitPolicy, LimitState, PolicerStats, SwlRing, TrafficKey, TrafficKey6,
+    TrafficValue, ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
 };
 
 use vm_bandwidth_core::config::{self, ValidatedConfig};
@@ -81,6 +81,8 @@ struct Engine {
     last_snapshot: Option<crate::collector::Snapshot>,
     /// Last poll's cumulative per-IP counters, for the VictoriaMetrics push.
     last_totals: std::collections::HashMap<u32, vm_bandwidth_core::limiter::IpTotals>,
+    /// Last poll's cumulative policer verdict counters, for the VictoriaMetrics push.
+    last_policer: std::collections::HashMap<u32, crate::collector::PolicerIpTotals>,
     /// Last poll's aggregate IPv6 counters, for the VictoriaMetrics push.
     last_ipv6: crate::collector::IpStats,
 
@@ -93,6 +95,7 @@ struct Engine {
     swl_log: AyaHashMap<MapData, LimitKey, SwlRing>,
     traffic: PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
     traffic6: PerCpuHashMap<MapData, TrafficKey6, TrafficValue>,
+    policer_stats: PerCpuHashMap<MapData, LimitKey, PolicerStats>,
     /// Shared HTTP client for the VictoriaMetrics push.
     http: reqwest::Client,
 
@@ -110,12 +113,16 @@ impl Engine {
             snapshot,
             totals,
             ipv6,
-        } = self.collector.poll(&self.traffic, &self.traffic6, &ranges);
+            policer,
+        } = self
+            .collector
+            .poll(&self.traffic, &self.traffic6, &self.policer_stats, &ranges);
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         self.apply_limit_actions(&actions);
         self.last_totals = totals;
         self.last_ipv6 = ipv6;
+        self.last_policer = policer;
         self.last_snapshot = Some(snapshot);
     }
 
@@ -132,6 +139,11 @@ impl Engine {
             .unwrap_or(0);
         let mut lines =
             crate::metrics::render_prom_lines(&self.last_totals, |ip| self.range_name(ip), now_ms);
+        lines.push_str(&crate::metrics::render_prom_lines_policer(
+            &self.last_policer,
+            |ip| self.range_name(ip),
+            now_ms,
+        ));
         lines.push_str(&crate::metrics::render_prom_lines_ipv6(
             &self.last_ipv6,
             now_ms,
@@ -239,6 +251,10 @@ impl Engine {
                                     std::net::Ipv4Addr::from(*ipv4)
                                 );
                             }
+                            // Fresh verdict counters for the new policy session.
+                            // Verdict counters are created zero-initialized in eBPF on
+                            // the first verdict and deleted again in the Remove branch;
+                            // no reset needed here.
                             log::info!(
                                 "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
                                 std::net::Ipv4Addr::from(*ipv4),
@@ -260,6 +276,7 @@ impl Engine {
                     let _ = self.limit_policies.remove(&key);
                     let _ = self.limit_state.remove(&key);
                     let _ = self.swl_log.remove(&key);
+                    let _ = self.policer_stats.remove(&key);
                     log::info!(
                         "back to NORMAL {} dir={}",
                         std::net::Ipv4Addr::from(*ipv4),
@@ -401,6 +418,10 @@ impl Engine {
                     tx_bytes: rs.tx_bytes,
                     ip_count: rs.ips.len(),
                     limited,
+                    rx_dropped_bps: rs.rx_dropped_bps,
+                    tx_dropped_bps: rs.tx_dropped_bps,
+                    rx_dropped_bytes: rs.rx_dropped_bytes,
+                    tx_dropped_bytes: rs.tx_dropped_bytes,
                 });
             }
             // Aggregate IPv6 pseudo-range: counted but never policed, no per-IP
@@ -415,6 +436,10 @@ impl Engine {
                 tx_bytes: v6.tx_bytes,
                 ip_count: 0,
                 limited: 0,
+                rx_dropped_bps: 0.0,
+                tx_dropped_bps: 0.0,
+                rx_dropped_bytes: 0,
+                tx_dropped_bytes: 0,
             });
         }
         Status {
@@ -458,6 +483,10 @@ impl Engine {
                     tx_state: state_label(self.limiter.is_limited(*ip, DIR_TX)),
                     rx_remaining: self.limiter.remaining_secs(*ip, DIR_RX, now),
                     tx_remaining: self.limiter.remaining_secs(*ip, DIR_TX, now),
+                    rx_dropped_bytes: stats.rx_dropped_bytes,
+                    tx_dropped_bytes: stats.tx_dropped_bytes,
+                    rx_dropped_packets: stats.rx_dropped_packets,
+                    tx_dropped_packets: stats.tx_dropped_packets,
                 }
             })
             .collect();
@@ -468,6 +497,10 @@ impl Engine {
             tx_bps: rs.tx_bps,
             rx_bytes: rs.rx_bytes,
             tx_bytes: rs.tx_bytes,
+            rx_dropped_bytes: rs.rx_dropped_bytes,
+            tx_dropped_bytes: rs.tx_dropped_bytes,
+            rx_dropped_packets: rs.rx_dropped_packets,
+            tx_dropped_packets: rs.tx_dropped_packets,
             ips,
         })
     }
@@ -553,6 +586,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         .map_max_entries("LIMIT_POLICIES", cfg.map_max_entries)
         .map_max_entries("LIMIT_STATE", cfg.map_max_entries)
         .map_max_entries("SWL_LOG", cfg.map_max_entries)
+        .map_max_entries("POLICER_STATS", cfg.map_max_entries)
         .load(object)
         .context(
             "failed to load the eBPF object; this program needs root (CAP_BPF + CAP_NET_ADMIN), \
@@ -595,6 +629,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         base.take_map("TRAFFIC6").context("TRAFFIC6 missing")?,
     )
     .context("TRAFFIC6 has the wrong type")?;
+    let policer_stats = PerCpuHashMap::<MapData, LimitKey, PolicerStats>::try_from(
+        base.take_map("POLICER_STATS")
+            .context("POLICER_STATS missing")?,
+    )
+    .context("POLICER_STATS has the wrong type")?;
 
     // 4. Discover TAPs and attach (one loaded object, one link pair per TAP).
     let mut manager = AttachManager::new(base)?;
@@ -627,6 +666,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         limiter: Limiter::new(tick_secs),
         last_snapshot: None,
         last_totals: std::collections::HashMap::new(),
+        last_policer: std::collections::HashMap::new(),
         last_ipv6: crate::collector::IpStats::default(),
         monitored,
         limit_policies,
@@ -634,6 +674,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         swl_log,
         traffic,
         traffic6,
+        policer_stats,
         http: crate::metrics::client(),
         epoch: std::time::Instant::now(),
     };

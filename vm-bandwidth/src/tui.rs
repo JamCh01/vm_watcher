@@ -236,18 +236,21 @@ fn draw_overview(f: &mut Frame, app: &mut UiState, area: Rect) {
     });
     let limited_total: usize = status.ranges.iter().map(|r| r.limited).sum();
     let ip_total: usize = status.ranges.iter().map(|r| r.ip_count).sum();
-    rows.push(
-        total_row(
-            rx_bps,
-            tx_bps,
-            rx_bytes,
-            tx_bytes,
-            ip_total,
-            limited_total,
-            cols,
-        )
-        .style(Style::default().add_modifier(Modifier::BOLD)),
-    );
+    let dropped_bps: f64 = status
+        .ranges
+        .iter()
+        .map(|r| r.rx_dropped_bps + r.tx_dropped_bps)
+        .sum();
+    let totals = OverviewTotals {
+        rx_bps,
+        tx_bps,
+        rx_bytes,
+        tx_bytes,
+        ip_total,
+        limited: limited_total,
+        dropped_bps,
+    };
+    rows.push(total_row(&totals, cols).style(Style::default().add_modifier(Modifier::BOLD)));
 
     let (widths, headers): (&[Constraint], &[&str]) = match cols {
         OverviewCols::Wide => (
@@ -349,41 +352,58 @@ fn overview_row(r: &RangeSummary, cols: OverviewCols) -> Row<'static> {
     }
 }
 
-fn total_row(
+/// Aggregate values behind the Σ All ranges row.
+struct OverviewTotals {
     rx_bps: f64,
     tx_bps: f64,
     rx_bytes: u64,
     tx_bytes: u64,
     ip_total: usize,
     limited: usize,
-    cols: OverviewCols,
-) -> Row<'static> {
+    dropped_bps: f64,
+}
+
+fn total_row(t: &OverviewTotals, cols: OverviewCols) -> Row<'static> {
+    // Aggregate policer drop rate: the one-line answer to "how much is the limiter
+    // actually throwing away". Only shown while something is being dropped.
+    let drop_line = |prefix: &str| -> Line<'static> {
+        if t.dropped_bps > 0.0 {
+            Line::from(format!("{prefix}drop {}", format_bps(t.dropped_bps)))
+        } else {
+            Line::from(prefix.to_string())
+        }
+    };
     match cols {
         OverviewCols::Wide => Row::new(vec![
-            Cell::from("Σ All ranges"),
+            Cell::from(vec![Line::from("Σ All ranges"), drop_line("")]),
             Cell::from(""),
-            Cell::from(format_bps(rx_bps)),
-            Cell::from(format_bps(tx_bps)),
-            Cell::from(format_bytes(rx_bytes)),
-            Cell::from(format_bytes(tx_bytes)),
-            Cell::from(ip_total.to_string()),
-            Cell::from(limited.to_string()),
-        ]),
+            Cell::from(format_bps(t.rx_bps)),
+            Cell::from(format_bps(t.tx_bps)),
+            Cell::from(format_bytes(t.rx_bytes)),
+            Cell::from(format_bytes(t.tx_bytes)),
+            Cell::from(t.ip_total.to_string()),
+            Cell::from(t.limited.to_string()),
+        ])
+        .height(2),
         OverviewCols::Mid => Row::new(vec![
-            Cell::from(format!("Σ All ({ip_total} IPs)")),
+            Cell::from(vec![
+                Line::from(format!("Σ All ({ip_total} IPs)", ip_total = t.ip_total)),
+                drop_line(""),
+            ]),
             Cell::from(""),
-            Cell::from(format_bps(rx_bps)),
-            Cell::from(format_bps(tx_bps)),
-            Cell::from(limited.to_string()),
-        ]),
+            Cell::from(format_bps(t.rx_bps)),
+            Cell::from(format_bps(t.tx_bps)),
+            Cell::from(t.limited.to_string()),
+        ])
+        .height(2),
         OverviewCols::Min => Row::new(vec![
             Cell::from(vec![
                 Line::from("Σ All ranges"),
-                Line::from(format!("{ip_total} IPs")),
+                drop_line(&format!("{ip_total} IPs · ", ip_total = t.ip_total)),
             ]),
-            Cell::from(format_bps(rx_bps)),
-            Cell::from(format_bps(tx_bps)),
-            Cell::from(limited.to_string()),
+            Cell::from(format_bps(t.rx_bps)),
+            Cell::from(format_bps(t.tx_bps)),
+            Cell::from(t.limited.to_string()),
         ])
         .height(2),
     }
@@ -408,9 +428,15 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
         return;
     };
 
-    let chunks = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(area);
+    let dropped_total = detail.rx_dropped_bytes
+        | detail.tx_dropped_bytes
+        | detail.rx_dropped_packets
+        | detail.tx_dropped_packets;
+    let header_lines: u16 = if dropped_total > 0 { 3 } else { 2 };
+    let chunks =
+        Layout::vertical([Constraint::Length(2 + header_lines), Constraint::Min(1)]).split(area);
 
-    let header = vec![
+    let mut header = vec![
         Line::from(vec![
             Span::styled("Range: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(detail.name.clone()),
@@ -424,6 +450,16 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
             format_bytes(detail.tx_bytes),
         )),
     ];
+    // Drop verdicts only earn a header line while something is actually policed.
+    if dropped_total > 0 {
+        header.push(Line::from(format!(
+            "Dropped RX: {} ({} pkts)    Dropped TX: {} ({} pkts)",
+            format_bytes(detail.rx_dropped_bytes),
+            detail.rx_dropped_packets,
+            format_bytes(detail.tx_dropped_bytes),
+            detail.tx_dropped_packets,
+        )));
+    }
     f.render_widget(Paragraph::new(header).block(Block::bordered()), chunks[0]);
 
     // Sort the IPs per the current sort mode.
@@ -441,6 +477,7 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
                 Constraint::Length(12),
                 Constraint::Length(10),
                 Constraint::Length(10),
+                Constraint::Length(10),
                 Constraint::Length(12),
                 Constraint::Length(12),
                 Constraint::Length(9),
@@ -450,8 +487,8 @@ fn draw_detail(f: &mut Frame, app: &mut UiState, area: Rect) {
                 Constraint::Length(8),
             ],
             &[
-                "IPv4", "RX", "TX", "RX Total", "TX Total", "RX win", "TX win", "RX limit",
-                "TX limit", "RX st", "TX st", "Remain",
+                "IPv4", "RX", "TX", "RX Total", "TX Total", "Dropped", "RX win", "TX win",
+                "RX limit", "TX limit", "RX st", "TX st", "Remain",
             ],
         ),
         DetailCols::Mid => (
@@ -503,7 +540,7 @@ enum DetailCols {
 
 /// Width thresholds for the detail tiers: every constraint set plus gaps and the
 /// table border must fit the triggering width.
-const DETAIL_WIDE_MIN: u16 = 138;
+const DETAIL_WIDE_MIN: u16 = 149;
 const DETAIL_MID_MIN: u16 = 101;
 
 fn detail_cols(width: u16) -> DetailCols {
@@ -546,20 +583,39 @@ fn ip_row(ip: &IpDetail, cols: DetailCols) -> Row<'static> {
     let tx_limited = ip.tx_state == "LIMITED";
 
     match cols {
-        DetailCols::Wide => Row::new(vec![
-            Cell::from(std::net::Ipv4Addr::from(ip.ip).to_string()),
-            Cell::from(format_bps(ip.rx_bps)),
-            Cell::from(format_bps(ip.tx_bps)),
-            Cell::from(format_bytes(ip.rx_bytes)),
-            Cell::from(format_bytes(ip.tx_bytes)),
-            Cell::from(format_bps(ip.rx_window_bps)),
-            Cell::from(format_bps(ip.tx_window_bps)),
-            Cell::from(fmt_pol(ip.rx_limit)),
-            Cell::from(fmt_pol(ip.tx_limit)),
-            state_cell(rx_limited),
-            state_cell(tx_limited),
-            Cell::from(fmt_remain(ip.rx_remaining, ip.tx_remaining)),
-        ]),
+        DetailCols::Wide => {
+            // Cumulative policer drops (RX+TX): "-" for unpoliced flows.
+            let dropped = ip.rx_dropped_bytes.saturating_add(ip.tx_dropped_bytes);
+            let dropped_cell = Cell::from(if dropped == 0 {
+                "-".to_string()
+            } else {
+                format_bytes(dropped)
+            });
+            let dropped_cell = if dropped > 0 {
+                dropped_cell.style(
+                    Style::default()
+                        .fg(ratatui::style::Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                dropped_cell
+            };
+            Row::new(vec![
+                Cell::from(std::net::Ipv4Addr::from(ip.ip).to_string()),
+                Cell::from(format_bps(ip.rx_bps)),
+                Cell::from(format_bps(ip.tx_bps)),
+                Cell::from(format_bytes(ip.rx_bytes)),
+                Cell::from(format_bytes(ip.tx_bytes)),
+                dropped_cell,
+                Cell::from(format_bps(ip.rx_window_bps)),
+                Cell::from(format_bps(ip.tx_window_bps)),
+                Cell::from(fmt_pol(ip.rx_limit)),
+                Cell::from(fmt_pol(ip.tx_limit)),
+                state_cell(rx_limited),
+                state_cell(tx_limited),
+                Cell::from(fmt_remain(ip.rx_remaining, ip.tx_remaining)),
+            ])
+        }
         DetailCols::Mid => {
             // One combined state column (- / RX / TX / BOTH) instead of two.
             let st = match (rx_limited, tx_limited) {
