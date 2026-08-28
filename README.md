@@ -516,10 +516,12 @@ range = "10.30.9.1-10.30.9.32"
   标志——任何时刻"已武装策略 ⇒ 对应状态已存在"）→ 白名单前缀移除 →
   全部成功才提交限速器状态、切换配置并递增 `generation`；任一 map 操作失败则
   逆向回滚已执行部分并保持上一份配置。回滚同样是状态先于策略；若回滚自身也
-  失败，受影响的流保持**未武装**（fail-open），日志按错误级输出并置位
-  `dataplane_degraded`（IPC/UI 可见 `DATAPLANE DEGRADED` 与失败计数），绝不
-  静默吞掉。成功后立即重采集一次，IPC 快照在新配置下重建，不存在旧快照×新
-  配置的混合窗口。
+  失败，数据面可能与当前配置不一致——每条受影响流的最终状态以逐步
+  `RollbackFailure` 错误日志为准（可能是旧策略重新武装、新限速仍然生效、或
+  解除武装并留下有界孤儿状态），硬不变量“已武装策略 ⇒ 对应状态存在”保持。
+  日志按错误级输出并置位 `dataplane_degraded`（IPC/UI 可见 `DATAPLANE
+  DEGRADED` 与失败计数），绝不静默吞掉。成功后立即重采集一次，IPC 快照在新
+  配置下重建，不存在旧快照×新配置的混合窗口。
 - 只能重启、不能热载的字段：`network.bridge`、`collector.refresh_interval_ms`、
   `collector.map_max_entries`、`collector.swl_map_max_entries`（map 容量与窗口
   标定在启动时固定）；热载修改会被拒绝并提示重启。

@@ -114,8 +114,10 @@ struct Engine {
     config_watcher_last_error: String,
 
     /// Dataplane health: set when a rollback could not fully restore the maps.
-    /// Affected flows are unarmed (fail-open) until they re-trigger; the flag stays
-    /// on so operators can see the degradation instead of it being swallowed.
+    /// The dataplane may then differ from the active configuration; each affected
+    /// flow's exact state is carried by the per-step `RollbackFailure` logs. The
+    /// flag stays on so operators can see the degradation instead of it being
+    /// swallowed.
     dataplane_degraded: bool,
     rollback_failures_total: u64,
 
@@ -384,8 +386,13 @@ impl Engine {
     }
 
     /// Play the journal back in reverse and surface the outcome. Never silent: a
-    /// failed step logs at error severity and flags the dataplane degraded (affected
-    /// flows are unarmed / fail-open until they re-trigger).
+    /// failed step logs at error severity and flags the dataplane degraded.
+    ///
+    /// The exact post-rollback state varies per journal record: an old policy may
+    /// be re-armed, a new limit may stay armed, or a flow may end up unarmed with
+    /// a bounded orphan artifact. The only guarantee is the hard invariant
+    /// `armed policy => matching state exists`, so neither the per-step logs nor
+    /// the summary may name one specific outcome for all affected flows.
     fn rollback_map_apply(
         &mut self,
         journal: &crate::txmaps::TxJournal,
@@ -410,9 +417,8 @@ impl Engine {
             self.dataplane_degraded = true;
             self.rollback_failures_total += report.failures.len() as u64;
             log::error!(
-                "dataplane DEGRADED after rollback: {} of {} step(s) failed;                  affected flows are unarmed (fail-open) until they re-trigger",
-                report.failures.len(),
-                report.attempted
+                "{}",
+                degraded_summary(report.failures.len(), report.attempted)
             );
         }
         report
@@ -835,6 +841,21 @@ fn state_label(limited: bool) -> String {
 
 /// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
 /// Ranges are validated disjoint, so their prefix sets never overlap.
+/// Summary line for the error log emitted when a rollback leaves the dataplane
+/// inconsistent. Deliberately neutral about the outcome: after a failed rollback
+/// a flow may be re-armed with its old policy, left armed on a new limit, or
+/// unarmed with a bounded orphan artifact — per-record state differs, and only
+/// the hard invariant `armed policy => matching state exists` holds. Any wording
+/// that claims one outcome ("all flows unarmed", "all flows limited") for every
+/// affected flow is wrong by construction; point at the per-step failures instead.
+fn degraded_summary(failures: usize, attempted: usize) -> String {
+    format!(
+        "dataplane DEGRADED after rollback: {failures} of {attempted} step(s) failed; \
+         dataplane state may differ from the active configuration — \
+         inspect the per-step rollback failures above"
+    )
+}
+
 fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
     cfg.ranges.iter().flat_map(|r| r.inner.cidrs()).collect()
 }
@@ -1358,6 +1379,33 @@ fn spawn_watcher(
         }
     });
     Ok(debouncer)
+}
+
+#[cfg(test)]
+mod degraded_message_tests {
+    use super::degraded_summary;
+
+    /// The rollback state machine can leave different records in different states
+    /// (old policy re-armed, new limit still armed, unarmed with a bounded orphan).
+    /// The user-visible summary must not claim one outcome for all affected flows.
+    #[test]
+    fn summary_names_no_specific_outcome() {
+        let msg = degraded_summary(2, 5);
+        for banned in ["unarmed", "fail-open", "fail open", "limited"] {
+            assert!(
+                !msg.to_lowercase().contains(banned),
+                "summary over-generalizes: contains {banned:?} in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_keeps_counts_and_points_at_details() {
+        let msg = degraded_summary(2, 5);
+        assert!(msg.contains("2 of 5"));
+        assert!(msg.contains("per-step rollback failures"));
+        assert!(msg.contains("DEGRADED"));
+    }
 }
 
 #[cfg(test)]

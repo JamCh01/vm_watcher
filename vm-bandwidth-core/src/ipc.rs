@@ -75,9 +75,14 @@ pub struct Status {
     pub config_watcher_healthy: bool,
     pub config_watcher_errors_total: u64,
     pub config_watcher_last_error: String,
-    /// True once a map rollback could not fully restore the dataplane. Affected
-    /// flows are unarmed (fail-open) until they re-trigger; the flag persists so the
-    /// degradation stays visible. `#[serde(default)]` keeps older daemons readable.
+    /// True once a map rollback could not fully restore the dataplane. The
+    /// dataplane may then differ from the active configuration; the exact state
+    /// of each affected flow is carried by the per-step `RollbackFailure` entries
+    /// in the daemon log (an old policy may be re-armed, a new limit may stay
+    /// armed, or a flow may be unarmed with a bounded orphan artifact). The hard
+    /// invariant `armed policy => matching state exists` still holds. The flag
+    /// persists so the degradation stays visible. `#[serde(default)]` keeps older
+    /// daemons readable.
     #[serde(default)]
     pub dataplane_degraded: bool,
     #[serde(default)]

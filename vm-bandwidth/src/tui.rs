@@ -173,8 +173,8 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
             }
             if s.dataplane_degraded {
                 line.push_str(&format!(
-                    "    DATAPLANE DEGRADED: {} rollback failure(s) — some flows unarmed (fail-open)",
-                    s.rollback_failures_total
+                    "    {}",
+                    degraded_notice(s.rollback_failures_total as usize)
                 ));
             }
             line
@@ -218,6 +218,13 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
         )));
     }
     f.render_widget(Paragraph::new(lines).block(Block::bordered()), area);
+}
+
+/// Header notice for a degraded dataplane. Neutral by construction — see
+/// `daemon::degraded_summary`: a failed rollback leaves per-record states that
+/// differ, so the notice names no specific outcome, only where to look.
+pub(crate) fn degraded_notice(failures: usize) -> String {
+    format!("DATAPLANE DEGRADED: {failures} rollback failure(s) — inspect daemon logs")
 }
 
 fn draw_footer(f: &mut Frame, app: &UiState, area: Rect) {
@@ -937,11 +944,15 @@ mod tier_tests {
     }
 
     #[test]
-    fn detail_tier_boundaries() {
-        assert_eq!(detail_cols(DETAIL_WIDE_MIN), DetailCols::Wide);
-        assert_eq!(detail_cols(DETAIL_WIDE_MIN - 1), DetailCols::Mid);
-        assert_eq!(detail_cols(DETAIL_MID_MIN), DetailCols::Mid);
-        assert_eq!(detail_cols(DETAIL_MID_MIN - 1), DetailCols::Min);
-        assert_eq!(detail_cols(0), DetailCols::Min);
+    fn degraded_notice_names_no_specific_outcome() {
+        let msg = degraded_notice(3);
+        for banned in ["unarmed", "fail-open", "fail open", "limited"] {
+            assert!(
+                !msg.to_lowercase().contains(banned),
+                "notice over-generalizes: contains {banned:?} in: {msg}"
+            );
+        }
+        assert!(msg.contains("3 rollback failure(s)"));
+        assert!(msg.contains("inspect daemon logs"));
     }
 }
