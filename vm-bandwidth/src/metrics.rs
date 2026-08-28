@@ -19,8 +19,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BODY: usize = 1 << 20;
 
 /// Render the aggregate IPv6 pseudo-series (`ip="ipv6-all"`, `range="IPv6"`).
-/// IPv6 is counted per address in eBPF but surfaced as one aggregate; a single
-/// bounded series set keeps VictoriaMetrics cardinality flat.
+/// IPv6 is counted per TAP (ifindex) in eBPF (TRAFFIC6) and surfaced here as
+/// one aggregate — there is no per-address breakdown; a single bounded series
+/// set keeps VictoriaMetrics cardinality flat.
 pub fn render_prom_lines_ipv6(t: &crate::collector::IpStats, now_ms: i64) -> String {
     if t.rx_bytes | t.tx_bytes | t.rx_packets | t.tx_packets == 0 {
         return String::new();
@@ -168,7 +169,12 @@ pub fn client() -> reqwest::Client {
 /// Read a response body with a hard cap.
 pub async fn body_capped(mut resp: reqwest::Response) -> Result<String> {
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.context("reading response body")? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| e.without_url())
+        .context("reading response body")?
+    {
         if body.len() + chunk.len() > MAX_RESPONSE_BODY {
             bail!("response body exceeds {MAX_RESPONSE_BODY} bytes");
         }
@@ -178,18 +184,25 @@ pub async fn body_capped(mut resp: reqwest::Response) -> Result<String> {
 }
 
 /// Push one payload to `{base_url}/api/v1/import/prometheus`.
+///
+/// Diagnostics never carry more than scheme://host[:port] of the endpoint
+/// (`safe_endpoint_display`): reqwest errors can embed the full URL, so every
+/// error leaving this function is passed through `without_url()` and the
+/// context strings use the redacted form.
 pub async fn push(client: &reqwest::Client, base_url: &str, lines: &str) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
     let url = format!("{base_url}/api/v1/import/prometheus");
+    let safe = vm_bandwidth_core::config::safe_endpoint_display(base_url);
     let resp = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(lines.to_string())
         .send()
         .await
-        .with_context(|| format!("POST {url}"))?;
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("POST {safe}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = body_capped(resp).await.unwrap_or_default();

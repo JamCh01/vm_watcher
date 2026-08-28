@@ -269,7 +269,10 @@ impl Engine {
             let _guard = PushGuard(flag);
             match crate::metrics::push(&http, &url, &lines).await {
                 Ok(()) => log::debug!("metrics push: {} line(s)", lines.lines().count()),
-                Err(e) => log::warn!("metrics push to {url} failed: {e:#}"),
+                Err(e) => log::warn!(
+                    "metrics push to {} failed: {e:#}",
+                    vm_bandwidth_core::config::safe_endpoint_display(&url)
+                ),
             }
         });
     }
