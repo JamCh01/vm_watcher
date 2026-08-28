@@ -118,8 +118,9 @@ struct Engine {
     /// flow's exact state is carried by the per-step `RollbackFailure` logs. The
     /// flag stays on so operators can see the degradation instead of it being
     /// swallowed.
-    dataplane_degraded: bool,
-    rollback_failures_total: u64,
+    /// Dataplane rollback health (degraded flag + cumulative failure counter);
+    /// surfaced verbatim into IPC `Status`.
+    rollback_health: RollbackHealth,
 
     bridge: String,
     manager: AttachManager,
@@ -433,22 +434,7 @@ impl Engine {
     /// re-armed, new limit kept armed, or unarmed with a bounded orphan); only the
     /// hard invariant `armed policy => matching state exists` is guaranteed.
     fn surface_rollback_report(&mut self, report: &crate::txmaps::RollbackReport) {
-        for f in &report.failures {
-            log::error!(
-                "rollback failed at '{}' for {}: {}",
-                f.op,
-                std::net::Ipv4Addr::from(f.key.ipv4),
-                f.error
-            );
-        }
-        if !report.dataplane_consistent {
-            self.dataplane_degraded = true;
-            self.rollback_failures_total += report.failures.len() as u64;
-            log::error!(
-                "{}",
-                degraded_summary(report.failures.len(), report.attempted)
-            );
-        }
+        self.rollback_health.record(report);
     }
 
     fn record_watcher_error(&mut self, e: String) {
@@ -667,8 +653,8 @@ impl Engine {
             config_watcher_healthy: self.config_watcher_healthy,
             config_watcher_errors_total: self.config_watcher_errors_total,
             config_watcher_last_error: self.config_watcher_last_error.clone(),
-            dataplane_degraded: self.dataplane_degraded,
-            rollback_failures_total: self.rollback_failures_total,
+            dataplane_degraded: self.rollback_health.degraded,
+            rollback_failures_total: self.rollback_health.failures_total,
             tap_attach_failures_total: self.tap_attach_failures_total,
             metrics_push_successes_total: self.push_counters.successes(),
             metrics_push_failures_total: self.push_counters.failures(),
@@ -848,6 +834,41 @@ fn state_label(limited: bool) -> String {
 
 /// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
 /// Ranges are validated disjoint, so their prefix sets never overlap.
+/// Process-health view of dataplane rollbacks: the degraded flag and the
+/// cumulative rollback-failure counter that IPC `Status` exposes.
+#[derive(Default)]
+struct RollbackHealth {
+    degraded: bool,
+    failures_total: u64,
+}
+
+impl RollbackHealth {
+    /// Surface one rollback report — the single production wiring point that
+    /// `Engine::surface_rollback_report` delegates to. Per-step failures log
+    /// at error severity; a report that could not fully restore the dataplane
+    /// flags the degradation and adds the EXACT failure count (not one per
+    /// report). Callers pass each report exactly once; reading the fields
+    /// never mutates them.
+    fn record(&mut self, report: &crate::txmaps::RollbackReport) {
+        for f in &report.failures {
+            log::error!(
+                "rollback failed at '{}' for {}: {}",
+                f.op,
+                std::net::Ipv4Addr::from(f.key.ipv4),
+                f.error
+            );
+        }
+        if !report.dataplane_consistent {
+            self.degraded = true;
+            self.failures_total += report.failures.len() as u64;
+            log::error!(
+                "{}",
+                degraded_summary(report.failures.len(), report.attempted)
+            );
+        }
+    }
+}
+
 /// Summary line for the error log emitted when a rollback leaves the dataplane
 /// inconsistent. Deliberately neutral about the outcome: after a failed rollback
 /// a flow may be re-armed with its old policy, left armed on a new limit, or
@@ -1299,8 +1320,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         config_watcher_healthy: true,
         config_watcher_errors_total: 0,
         config_watcher_last_error: String::new(),
-        dataplane_degraded: false,
-        rollback_failures_total: 0,
+        rollback_health: RollbackHealth::default(),
         bridge: config.load().bridge.clone(),
         manager,
         taps,
@@ -2098,6 +2118,139 @@ burst = "1MiB"
         assert_eq!(maps.policies.len(), 3);
         // IP1/RX state stays behind as a bounded orphan; hard invariant holds.
         assert!(maps.artifact(&LimitKey::new(IP1, DIR_RX), ALGO_GCRA));
+        maps.assert_invariants();
+
+        // Health wiring: the SAME report the engine passes to
+        // surface_rollback_report goes through the production RollbackHealth
+        // recorder — degraded flag set, counter advanced by the EXACT failure
+        // count, and per-failure details survive (not clobbered by the apply
+        // error). IPC Status reads exactly health.degraded/failures_total.
+        let mut health = super::RollbackHealth::default();
+        health.record(&rb.report);
+        assert!(health.degraded);
+        assert_eq!(health.failures_total, 1);
+        assert_eq!(
+            health.failures_total, 1,
+            "reading health must not increment"
+        );
+        assert!(rb.message.to_string().contains("installing limit policy"));
+        assert!(format!("{:#}", rb.message).contains("write_fresh_state"));
+        assert_eq!(rb.report.failures[0].op, "re-arm removed policy");
+    }
+
+    #[test]
+    fn failed_apply_with_clean_rollback_does_not_degrade() {
+        let (mut limiter, mut maps, mut collector, old_cfg) = setup();
+        let mut w = FakeWhitelist::default();
+        let new_cfg = cfg("10.0.0.2-10.0.0.4", "120Kbps", "130Kbps");
+        let plan = limiter.plan_reload(&new_cfg, 12).expect("reload plan");
+
+        let config: ConfigArc = Arc::new(ArcSwap::from_pointee(old_cfg.clone()));
+        let old_arc = config.load_full();
+        let mut generation = 1u64;
+
+        // Forward failure only (first IP2 install's state write); the rollback
+        // itself runs clean.
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_RX));
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_TX));
+
+        let rb = super::apply_and_commit(
+            &mut maps,
+            &mut w,
+            &mut limiter,
+            &mut collector,
+            &config,
+            &mut generation,
+            &super::prefix_set(&old_cfg),
+            plan,
+            new_cfg.clone(),
+        )
+        .expect_err("apply must fail");
+
+        // Nothing committed.
+        assert_eq!(generation, 1);
+        assert!(Arc::ptr_eq(&config.load_full(), &old_arc));
+        assert!(rb.report.dataplane_consistent, "{:?}", rb.report.failures);
+
+        // A clean rollback must NOT flag the dataplane degraded nor advance
+        // the failure counter.
+        let mut health = super::RollbackHealth::default();
+        health.record(&rb.report);
+        assert!(!health.degraded, "clean rollback must not degrade");
+        assert_eq!(health.failures_total, 0);
+
+        // Fully restored: all four keys carry the old policy, no orphans.
+        assert_eq!(maps.policies.len(), 4);
+        maps.assert_invariants();
+        maps.assert_no_orphans();
+    }
+
+    #[test]
+    fn multiple_rollback_failures_accumulate_exactly_and_keep_details() {
+        let (mut limiter, mut maps, mut collector, old_cfg) = setup();
+        let mut w = FakeWhitelist::default();
+        let new_cfg = cfg("10.0.0.2-10.0.0.4", "120Kbps", "130Kbps");
+        let plan = limiter.plan_reload(&new_cfg, 12).expect("reload plan");
+
+        let config: ConfigArc = Arc::new(ArcSwap::from_pointee(old_cfg.clone()));
+        let mut generation = 1u64;
+
+        // Forward: first IP2 install fails. Rollback: BOTH IP1 re-arms fail.
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_RX));
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_TX));
+        maps.fail_next("arm_policy", LimitKey::new(IP1, DIR_RX));
+        maps.fail_next("arm_policy", LimitKey::new(IP1, DIR_TX));
+
+        let rb = super::apply_and_commit(
+            &mut maps,
+            &mut w,
+            &mut limiter,
+            &mut collector,
+            &config,
+            &mut generation,
+            &super::prefix_set(&old_cfg),
+            plan,
+            new_cfg.clone(),
+        )
+        .expect_err("apply must fail");
+
+        assert_eq!(generation, 1);
+        assert!(!rb.report.dataplane_consistent);
+        // Two failures, each with its own op/key — per-step detail preserved.
+        assert_eq!(rb.report.failures.len(), 2);
+        for f in &rb.report.failures {
+            assert_eq!(f.op, "re-arm removed policy");
+        }
+        let mut failed_keys: Vec<_> = rb.report.failures.iter().map(|f| f.key).collect();
+        failed_keys.sort_by_key(|k| (k.ipv4, k.direction));
+        assert_eq!(
+            failed_keys,
+            vec![LimitKey::new(IP1, DIR_RX), LimitKey::new(IP1, DIR_TX)]
+        );
+
+        // Counter accumulates the exact per-report failure count (not one per
+        // report): a single report with two failures adds two; a later
+        // incident's report adds its own count on top.
+        let mut health = super::RollbackHealth::default();
+        health.record(&rb.report);
+        assert_eq!(health.failures_total, 2);
+        health.record(&rb.report);
+        assert_eq!(
+            health.failures_total, 4,
+            "each recorded report adds its failure count"
+        );
+        assert!(health.degraded);
+
+        // Both IP1 directions unarmed with bounded orphan states; IP2 restored.
+        assert!(!maps.policies.contains_key(&LimitKey::new(IP1, DIR_RX)));
+        assert!(!maps.policies.contains_key(&LimitKey::new(IP1, DIR_TX)));
+        assert!(maps.artifact(&LimitKey::new(IP1, DIR_RX), ALGO_GCRA));
+        assert!(maps.artifact(&LimitKey::new(IP1, DIR_TX), ALGO_GCRA));
+        assert_eq!(
+            maps.policies.len(),
+            2,
+            "only both IP2 directions remain armed"
+        );
         maps.assert_invariants();
     }
 
