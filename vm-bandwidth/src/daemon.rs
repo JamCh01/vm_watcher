@@ -1336,7 +1336,7 @@ pub(crate) struct PushCounters {
 }
 
 impl PushCounters {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inflight: std::sync::atomic::AtomicBool::new(false),
             successes: std::sync::atomic::AtomicU64::new(0),
@@ -1348,7 +1348,7 @@ impl PushCounters {
     /// Take the single-flight slot, or count a skip when a push is already
     /// running. The returned guard releases the slot on every exit path
     /// (normal completion, HTTP error, cancellation, panic unwinding).
-    fn try_start(self: &Arc<Self>) -> Option<PushGuard> {
+    pub(crate) fn try_start(self: &Arc<Self>) -> Option<PushGuard> {
         if self
             .inflight
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -1360,31 +1360,31 @@ impl PushCounters {
         Some(PushGuard(self.clone()))
     }
 
-    fn note_success(&self) {
+    pub(crate) fn note_success(&self) {
         self.successes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn note_failure(&self) {
+    pub(crate) fn note_failure(&self) {
         self.failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn successes(&self) -> u64 {
+    pub(crate) fn successes(&self) -> u64 {
         self.successes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn failures(&self) -> u64 {
+    pub(crate) fn failures(&self) -> u64 {
         self.failures.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn skipped(&self) -> u64 {
+    pub(crate) fn skipped(&self) -> u64 {
         self.skipped.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 /// RAII holder for the in-flight push slot; see `PushCounters::try_start`.
-struct PushGuard(Arc<PushCounters>);
+pub(crate) struct PushGuard(Arc<PushCounters>);
 
 impl Drop for PushGuard {
     fn drop(&mut self) {

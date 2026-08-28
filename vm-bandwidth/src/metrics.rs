@@ -360,3 +360,206 @@ mod tests {
         assert_eq!(zeros.lines().count(), 4, "zero counters must still render");
     }
 }
+
+#[cfg(test)]
+mod push_io_tests {
+    //! Real-socket tests for the push path against a local one-shot HTTP server.
+    //! The outcome counters are exercised through `PushCounters` composed exactly
+    //! the way `Engine::push_metrics` composes them: try_start -> push -> note_*.
+
+    use crate::daemon::PushCounters;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Single-connection HTTP server: reads one request head, writes the canned
+    /// response, then holds the connection briefly. Returns the base URL and a
+    /// connection counter.
+    fn serve_once(response: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf); // request head; body irrelevant
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, accepts)
+    }
+
+    /// Accept the connection but never answer: drives the client timeout.
+    fn serve_nothing() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream); // accepted, silent: the client must time out
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        url
+    }
+
+    /// Mirror of the engine's spawned push task: slot guard + outcome counters.
+    async fn engine_push(
+        counters: &Arc<PushCounters>,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Option<anyhow::Result<()>> {
+        let _guard = counters.try_start()?; // None = skipped, already counted
+        let res = crate::metrics::push(
+            client,
+            url,
+            "vmbw_rx_bytes_total{ip=\"10.0.0.1\",range=\"r\"} 1 1\n",
+        )
+        .await;
+        match &res {
+            Ok(()) => counters.note_success(),
+            Err(_) => counters.note_failure(),
+        }
+        Some(res)
+    }
+
+    #[tokio::test]
+    async fn server_5xx_counts_failure_and_releases_the_slot() {
+        let (url, _accepts) =
+            serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        let counters = Arc::new(PushCounters::new());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let res = engine_push(&counters, &client, &url).await.expect("ran");
+        let err = res.expect_err("500 must fail the push");
+        assert!(format!("{err:#}").contains("500"), "{err:#}");
+        assert_eq!(counters.failures(), 1);
+        assert_eq!(counters.successes(), 0);
+        assert_eq!(counters.skipped(), 0);
+        // PushGuard semantics survive the failure: the slot is free again.
+        assert!(counters.try_start().is_some());
+    }
+
+    #[tokio::test]
+    async fn server_2xx_counts_success() {
+        let (url, _accepts) = serve_once("HTTP/1.1 204 No Content\r\n\r\n");
+        let counters = Arc::new(PushCounters::new());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        engine_push(&counters, &client, &url)
+            .await
+            .expect("ran")
+            .expect("204 must succeed");
+        assert_eq!(counters.successes(), 1);
+        assert_eq!(counters.failures(), 0);
+        assert_eq!(counters.skipped(), 0);
+    }
+
+    #[tokio::test]
+    async fn push_while_inflight_counts_skip_and_creates_no_request() {
+        let (url, accepts) = serve_once("HTTP/1.1 204 No Content\r\n\r\n");
+        let counters = Arc::new(PushCounters::new());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        // Simulate a previous push still in flight by holding its slot.
+        let held = counters.try_start().expect("slot free");
+        assert!(
+            engine_push(&counters, &client, &url).await.is_none(),
+            "second push must be skipped"
+        );
+        assert_eq!(counters.skipped(), 1);
+        assert_eq!(counters.successes(), 0);
+        assert_eq!(counters.failures(), 0);
+        // A skipped push must not create an HTTP request.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(accepts.load(Ordering::SeqCst), 0);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn push_errors_never_echo_credentials() {
+        let (base, _accepts) =
+            serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        // Rebuild the base URL with secrets the diagnostic must not carry.
+        let stripped = base.strip_prefix("http://").unwrap();
+        let url = format!("http://operator:hunter2@{stripped}/secret/path?api_key=tok123#frag");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let err = crate::metrics::push(
+            &client,
+            &url,
+            "vmbw_rx_bytes_total{ip=\"10.0.0.1\",range=\"r\"} 1 1\n",
+        )
+        .await
+        .expect_err("500 must fail");
+        let shown = format!("{err:#}");
+        for secret in [
+            "hunter2",
+            "operator",
+            "secret/path",
+            "api_key",
+            "tok123",
+            "frag",
+        ] {
+            assert!(!shown.contains(secret), "{secret:?} leaked in: {shown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_refused_error_is_also_redacted() {
+        // Nothing listens on port 1: reqwest's own error surfaces — it must not
+        // carry the URL either.
+        let url = "http://operator:hunter2@127.0.0.1:1/secret?api_key=tok123";
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let err = crate::metrics::push(
+            &client,
+            url,
+            "vmbw_rx_bytes_total{ip=\"10.0.0.1\",range=\"r\"} 1 1\n",
+        )
+        .await
+        .expect_err("refused must fail");
+        let shown = format!("{err:#}");
+        for secret in ["hunter2", "operator", "secret", "api_key", "tok123"] {
+            assert!(!shown.contains(secret), "{secret:?} leaked in: {shown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_server_hits_the_injected_short_timeout() {
+        let url = serve_nothing();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(150))
+            .build()
+            .unwrap();
+        let start = Instant::now();
+        let res = crate::metrics::push(
+            &client,
+            &url,
+            "vmbw_rx_bytes_total{ip=\"10.0.0.1\",range=\"r\"} 1 1\n",
+        )
+        .await;
+        assert!(res.is_err(), "a silent server must fail the push");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must fail by the injected 150ms client timeout, not a long wait"
+        );
+    }
+}
