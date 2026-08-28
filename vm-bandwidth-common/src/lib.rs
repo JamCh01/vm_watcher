@@ -1,5 +1,5 @@
 //! Data structures shared between the eBPF programs and userspace.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 /// Key of the TRAFFIC map: one counter set per (interface, IPv4) pair.
 ///
@@ -209,3 +209,149 @@ impl Default for SwlRing {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SwlRing {}
+
+// ---------------------------------------------------------------------------
+// L2 parsing, shared between the eBPF data path and userspace tests.
+// ---------------------------------------------------------------------------
+
+/// 802.1Q VLAN tag (host-order value; convert from network order before comparing).
+pub const ETHERTYPE_VLAN: u16 = 0x8100;
+/// 802.1ad provider bridging (QinQ outer tag).
+pub const ETHERTYPE_QINQ: u16 = 0x88a8;
+pub const ETHERTYPE_IPV4: u16 = 0x0800;
+pub const ETHERTYPE_IPV6: u16 = 0x86dd;
+
+/// One 802.1Q/802.1ad tag: 2 bytes TCI followed by the inner EtherType, both in
+/// network byte order on the wire.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VlanHdr {
+    pub tci: u16,
+    pub ether_type: u16,
+}
+
+/// Bytes one VLAN tag adds between EtherTypes.
+pub const VLAN_HDR_LEN: usize = 4;
+
+/// Maximum VLAN tags the data path walks (single tag + QinQ). Compile-time bound:
+/// the eBPF walk performs at most this many header loads, never a loop over data.
+pub const MAX_VLAN_TAGS: usize = 2;
+
+/// True for the two tag EtherTypes (host-order argument).
+pub fn is_vlan_tag(ether_type: u16) -> bool {
+    ether_type == ETHERTYPE_VLAN || ether_type == ETHERTYPE_QINQ
+}
+
+/// Pure VLAN-stack walk over the EtherType sequence encountered (host order).
+/// `et0` is the frame's EtherType; `et1`/`et2` are the inner EtherTypes and are only
+/// consulted when the previous one was a tag (pass 0 when they were never read).
+///
+/// Returns `Some((tags, final_ether_type))` — the L3 header starts
+/// `tags * VLAN_HDR_LEN` octets after the Ethernet header — or `None` when the stack
+/// is deeper than [`MAX_VLAN_TAGS`], in which case callers give up (fail open).
+pub fn vlan_walk(et0: u16, et1: u16, et2: u16) -> Option<(usize, u16)> {
+    let mut tags = 0;
+    let mut et = et0;
+    if is_vlan_tag(et) {
+        tags = 1;
+        et = et1;
+        if is_vlan_tag(et) {
+            tags = 2;
+            et = et2;
+            if is_vlan_tag(et) {
+                return None;
+            }
+        }
+    }
+    Some((tags, et))
+}
+
+#[cfg(test)]
+mod l2_tests {
+    use super::*;
+
+    // Wire shape sanity: the eBPF ctx.load offsets rely on this.
+    #[test]
+    fn vlan_header_is_four_bytes_aligned_two() {
+        assert_eq!(core::mem::size_of::<VlanHdr>(), 4);
+        assert_eq!(core::mem::align_of::<VlanHdr>(), 2);
+    }
+
+    fn walk(ets: &[u16]) -> Option<(usize, u16)> {
+        // Mirror how the data path feeds the walk: one EtherType per tag level.
+        vlan_walk(
+            ets.first().copied().unwrap_or(0),
+            ets.get(1).copied().unwrap_or(0),
+            ets.get(2).copied().unwrap_or(0),
+        )
+    }
+
+    // Frame vectors: (untagged / tagged, inner payload) -> expected walk outcome.
+    #[test]
+    fn untagged_frames_pass_straight_through() {
+        assert_eq!(walk(&[ETHERTYPE_IPV4]), Some((0, ETHERTYPE_IPV4)));
+        assert_eq!(walk(&[ETHERTYPE_IPV6]), Some((0, ETHERTYPE_IPV6)));
+        // ARP and anything else: no tags, final type handed to the caller's match.
+        assert_eq!(walk(&[0x0806]), Some((0, 0x0806)));
+    }
+
+    #[test]
+    fn single_8021q_tag() {
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_IPV4]),
+            Some((1, ETHERTYPE_IPV4))
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_IPV6]),
+            Some((1, ETHERTYPE_IPV6))
+        );
+        // VLAN + ARP: walked, but the inner type is not IP.
+        assert_eq!(walk(&[ETHERTYPE_VLAN, 0x0806]), Some((1, 0x0806)));
+    }
+
+    #[test]
+    fn single_8021ad_tag() {
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_IPV4]),
+            Some((1, ETHERTYPE_IPV4))
+        );
+    }
+
+    #[test]
+    fn qinq_double_tag() {
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_VLAN, ETHERTYPE_IPV4]),
+            Some((2, ETHERTYPE_IPV4))
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_VLAN, ETHERTYPE_IPV6]),
+            Some((2, ETHERTYPE_IPV6))
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_VLAN, 0x0806]),
+            Some((2, 0x0806))
+        );
+    }
+
+    #[test]
+    fn deeper_stacks_are_given_up() {
+        // Three tags: beyond MAX_VLAN_TAGS -> None (fail open).
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_VLAN, ETHERTYPE_VLAN,]),
+            None
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_VLAN, ETHERTYPE_VLAN]),
+            None
+        );
+    }
+
+    #[test]
+    fn truncated_walk_inputs_are_safe() {
+        // The data path passes 0 for EtherTypes it never managed to read; a tag whose
+        // inner field is unreadable never matches IP, it degrades to give-up-or-no-IP.
+        assert_eq!(walk(&[ETHERTYPE_VLAN]), Some((1, 0)));
+        assert_eq!(walk(&[ETHERTYPE_VLAN, ETHERTYPE_VLAN]), Some((2, 0)));
+        assert_eq!(walk(&[]), Some((0, 0)));
+    }
+}

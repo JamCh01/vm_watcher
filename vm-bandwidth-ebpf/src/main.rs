@@ -8,6 +8,11 @@
 //! The interface index is read straight from the skb context, so no per-interface
 //! reloading of the object is needed.
 //!
+//! L2 handling: untagged frames and frames with up to `MAX_VLAN_TAGS` (2) 802.1Q/802.1ad
+//! tags (single tag and QinQ) are walked to their inner IPv4/IPv6 header so tagged VM
+//! traffic is counted and policed like untagged traffic. Deeper stacks, truncated tags
+//! and non-IP payloads fail open like every other unhandled frame.
+//!
 //! Every path — parse failure, IP not whitelisted, map pressure, missing or invalid
 //! policy, arithmetic anomaly — ends in `TC_ACT_PIPE`: traffic is never dropped unless
 //! a policer explicitly classifies a packet as non-conforming while a valid limit is
@@ -38,13 +43,14 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use network_types::{
-    eth::{EthHdr, EtherType},
+    eth::EthHdr,
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, PolicerStats, SwlEntry, TrafficKey, TrafficKey6, TrafficValue,
-    ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
-    ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, SWL_LOG_CAP,
+    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, PolicerStats, SwlEntry, TrafficKey, TrafficKey6,
+    TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
+    ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, ETHERTYPE_IPV4,
+    ETHERTYPE_IPV6, SWL_LOG_CAP, VLAN_HDR_LEN,
 };
 
 /// Compile-time default; userspace overrides `max_entries` at load time
@@ -148,13 +154,40 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
         Ok(e) => e,
         Err(_) => return TC_ACT_PIPE,
     };
-    match eth.ether_type() {
-        Ok(EtherType::Ipv4) => {}
-        Ok(EtherType::Ipv6) => return handle_v6(ctx, is_tx),
-        // ARP, LLDP, STP, VLAN, ... are not counted.
+
+    // Walk the VLAN stack (bounded by common::MAX_VLAN_TAGS: one load per level, no
+    // loop over data). A truncated tag header fails open like any other parse failure.
+    let et0 = u16::from_be(eth.ether_type);
+    let mut et1 = 0u16;
+    let mut et2 = 0u16;
+    if is_vlan_tag(et0) {
+        let v: VlanHdr = match ctx.load(EthHdr::LEN) {
+            Ok(v) => v,
+            Err(_) => return TC_ACT_PIPE,
+        };
+        et1 = u16::from_be(v.ether_type);
+        if is_vlan_tag(et1) {
+            let v: VlanHdr = match ctx.load(EthHdr::LEN + VLAN_HDR_LEN) {
+                Ok(v) => v,
+                Err(_) => return TC_ACT_PIPE,
+            };
+            et2 = u16::from_be(v.ether_type);
+        }
+    }
+    let (tags, ether_type) = match vlan_walk(et0, et1, et2) {
+        // Deeper stack than supported: give up (fail open).
+        None => return TC_ACT_PIPE,
+        Some(t) => t,
+    };
+    let l3_off = EthHdr::LEN + tags * VLAN_HDR_LEN;
+
+    match ether_type {
+        ETHERTYPE_IPV4 => {}
+        ETHERTYPE_IPV6 => return handle_v6(ctx, is_tx, l3_off),
+        // ARP, LLDP, STP and other non-IP payloads are not counted.
         _ => return TC_ACT_PIPE,
     }
-    let ip: Ipv4Hdr = match ctx.load(EthHdr::LEN) {
+    let ip: Ipv4Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
         Err(_) => return TC_ACT_PIPE,
     };
@@ -230,8 +263,8 @@ unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
 /// IPv6 accounting: counted like IPv4 but never policed and never whitelisted
 /// (config has no IPv6 ranges). Every error path fails open, same as IPv4.
 #[inline(always)]
-fn handle_v6(ctx: &TcContext, is_tx: bool) -> i32 {
-    let ip: Ipv6Hdr = match ctx.load(EthHdr::LEN) {
+fn handle_v6(ctx: &TcContext, is_tx: bool, l3_off: usize) -> i32 {
+    let ip: Ipv6Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
         Err(_) => return TC_ACT_PIPE,
     };
