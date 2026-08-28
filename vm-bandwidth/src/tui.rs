@@ -131,14 +131,28 @@ impl UiState {
 }
 
 pub fn draw(f: &mut Frame, app: &mut UiState) {
-    let chunks = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(f.area());
+    let area = f.area();
+    // The header grows with the number of notices it carries; the body and the
+    // footer always keep their minimum space, and on tiny terminals the least
+    // important header lines are dropped first (see `fit_header_lines`).
+    const FOOTER_ROWS: u16 = 1;
+    const BODY_MIN_ROWS: u16 = 1;
+    const HEADER_BORDER_ROWS: u16 = 2;
+    let header_max = area.height.saturating_sub(FOOTER_ROWS + BODY_MIN_ROWS);
+    let max_content = header_max.saturating_sub(HEADER_BORDER_ROWS) as usize;
+    let lines = fit_header_lines(header_lines(app), max_content);
+    let header_rows = ((lines.len() as u16) + HEADER_BORDER_ROWS)
+        .min(header_max.max(HEADER_BORDER_ROWS))
+        .min(area.height);
 
-    draw_header(f, app, chunks[0]);
+    let chunks = Layout::vertical([
+        Constraint::Length(header_rows),
+        Constraint::Min(1),
+        Constraint::Length(FOOTER_ROWS),
+    ])
+    .split(area);
+
+    f.render_widget(Paragraph::new(lines).block(Block::bordered()), chunks[0]);
     match app.screen {
         Screen::Overview => draw_overview(f, app, chunks[1]),
         Screen::Detail => draw_detail(f, app, chunks[1]),
@@ -151,7 +165,25 @@ pub fn draw(f: &mut Frame, app: &mut UiState) {
     }
 }
 
-fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
+/// One header line plus its keep-priority for tiny terminals: when the terminal
+/// is too short to hold every line, the lowest priorities are dropped first and
+/// the remaining lines keep their visual order. Priority follows the operator's
+/// need to know: daemon error first, then dataplane degradation, watcher health,
+/// config/reload failure, protocol note, and plain info last.
+struct HeaderLine {
+    prio: u8,
+    line: Line<'static>,
+}
+
+const PRIO_PLAIN: u8 = 1;
+const PRIO_NOTE: u8 = 2;
+const PRIO_CONFIG_FAILURE: u8 = 3;
+const PRIO_WATCHER: u8 = 4;
+const PRIO_DEGRADED: u8 = 5;
+const PRIO_ERROR: u8 = 6;
+
+/// Build every header line the current state asks for (no truncation here).
+fn header_lines(app: &UiState) -> Vec<HeaderLine> {
     let status = app.status.as_ref();
     let tap_count = status.map(|s| s.tap_count).unwrap_or(0);
     let generation = status.map(|s| s.generation).unwrap_or(0);
@@ -165,59 +197,107 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
             if !s.last_reload_ok && !s.last_reload_error.is_empty() {
                 line.push_str(&format!("    Error: {}", s.last_reload_error));
             }
-            if !s.config_watcher_healthy {
-                line.push_str(&format!(
-                    "    WATCHER UNHEALTHY: {} error(s), last: {}",
-                    s.config_watcher_errors_total, s.config_watcher_last_error
-                ));
-            }
-            if s.dataplane_degraded {
-                line.push_str(&format!(
-                    "    {}",
-                    degraded_notice(s.rollback_failures_total as usize)
-                ));
-            }
             line
         }
         _ => format!("Config generation: {generation}"),
     };
 
     let mut lines = vec![
-        Line::from(Span::styled(
-            "VM Bandwidth Monitor",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!(
-            "Bridge: {}    TAP Interfaces: {}    Refresh: {}",
-            app.bridge,
-            tap_count,
-            format_duration(app.refresh_interval)
-        )),
-        Line::from(reload_line),
+        HeaderLine {
+            prio: PRIO_PLAIN,
+            line: Line::from(Span::styled(
+                "VM Bandwidth Monitor",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        },
+        HeaderLine {
+            prio: PRIO_PLAIN,
+            line: Line::from(format!(
+                "Bridge: {}    TAP Interfaces: {}    Refresh: {}",
+                app.bridge,
+                tap_count,
+                format_duration(app.refresh_interval)
+            )),
+        },
+        HeaderLine {
+            prio: PRIO_CONFIG_FAILURE,
+            line: Line::from(reload_line),
+        },
     ];
+    if let Some(s) = status {
+        if !s.config_watcher_healthy {
+            lines.push(HeaderLine {
+                prio: PRIO_WATCHER,
+                line: Line::from(Span::styled(
+                    format!(
+                        "WATCHER UNHEALTHY: {} error(s), last: {}",
+                        s.config_watcher_errors_total, s.config_watcher_last_error
+                    ),
+                    Style::default().fg(ratatui::style::Color::Yellow),
+                )),
+            });
+        }
+        if s.dataplane_degraded {
+            lines.push(HeaderLine {
+                prio: PRIO_DEGRADED,
+                line: Line::from(Span::styled(
+                    degraded_notice(s.rollback_failures_total as usize),
+                    Style::default()
+                        .fg(ratatui::style::Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            });
+        }
+    }
     if let Some(w) = &app.config_warning {
-        lines.push(Line::from(Span::styled(
-            format!("config: {w}"),
-            Style::default()
-                .fg(ratatui::style::Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push(HeaderLine {
+            prio: PRIO_CONFIG_FAILURE,
+            line: Line::from(Span::styled(
+                format!("config: {w}"),
+                Style::default()
+                    .fg(ratatui::style::Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        });
     }
     if let Some(n) = &app.protocol_note {
-        lines.push(Line::from(Span::styled(
-            format!("protocol: {n}"),
-            Style::default().fg(ratatui::style::Color::Yellow),
-        )));
+        lines.push(HeaderLine {
+            prio: PRIO_NOTE,
+            line: Line::from(Span::styled(
+                format!("protocol: {n}"),
+                Style::default().fg(ratatui::style::Color::Yellow),
+            )),
+        });
     }
     if let Some(err) = &app.error {
-        lines.push(Line::from(Span::styled(
-            format!("daemon: {err}"),
-            Style::default()
-                .fg(ratatui::style::Color::Red)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push(HeaderLine {
+            prio: PRIO_ERROR,
+            line: Line::from(Span::styled(
+                format!("daemon: {err}"),
+                Style::default()
+                    .fg(ratatui::style::Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        });
     }
-    f.render_widget(Paragraph::new(lines).block(Block::bordered()), area);
+    lines
+}
+
+/// Shrink the header to at most `max_content` lines by dropping the lowest
+/// keep-priorities; ties keep their visual order. Never reorders what it keeps.
+fn fit_header_lines(lines: Vec<HeaderLine>, max_content: usize) -> Vec<Line<'static>> {
+    if lines.len() <= max_content {
+        return lines.into_iter().map(|h| h.line).collect();
+    }
+    let mut ranked: Vec<usize> = (0..lines.len()).collect();
+    ranked.sort_by_key(|&i| (std::cmp::Reverse(lines[i].prio), i));
+    let keep: std::collections::BTreeSet<usize> = ranked.into_iter().take(max_content).collect();
+    lines
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, h)| h.line)
+        .collect()
 }
 
 /// Header notice for a degraded dataplane. Neutral by construction — see
@@ -927,6 +1007,130 @@ fn format_duration(d: Duration) -> String {
         format!("{}s", ms / 1000)
     } else {
         format!("{}ms", ms)
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Position;
+
+    fn render(app: &mut UiState, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|f| draw(f, app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| {
+                        buf.cell(Position { x, y })
+                            .map(|c| c.symbol().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn base_app() -> UiState {
+        UiState::new("br0".to_string(), Duration::from_secs(1), SortMode::Ip)
+    }
+
+    fn alarmed_status() -> Status {
+        Status {
+            protocol_version: 1,
+            generation: 3,
+            config_loaded_at: "t0".to_string(),
+            last_reload_at: "t1".to_string(),
+            last_reload_ok: false,
+            last_reload_error: "bad field".to_string(),
+            bridge: "br0".to_string(),
+            tap_count: 2,
+            config_watcher_healthy: false,
+            config_watcher_errors_total: 4,
+            config_watcher_last_error: "inotify failed".to_string(),
+            dataplane_degraded: true,
+            rollback_failures_total: 2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_notices_keeps_compact_header_with_body_and_footer() {
+        let mut app = base_app();
+        let text = render(&mut app, 100, 20);
+        let rows: Vec<&str> = text.split('\n').collect();
+        assert!(rows[0].starts_with('┌'), "header top border: {}", rows[0]);
+        assert!(rows[1].contains("VM Bandwidth Monitor"));
+        assert!(
+            rows[4].starts_with('└'),
+            "header bottom border at row 4: {}",
+            rows[4]
+        );
+        assert!(
+            !rows[5].starts_with('│'),
+            "body must start right after the 5-row header"
+        );
+        assert!(text.contains("quit"), "footer missing: {text}");
+    }
+
+    #[test]
+    fn every_notice_visible_on_a_tall_terminal() {
+        let mut app = base_app();
+        app.status = Some(alarmed_status());
+        app.config_warning = Some("swl experimental".to_string());
+        app.protocol_note = Some("daemon newer".to_string());
+        app.error = Some("daemon gone".to_string());
+        let text = render(&mut app, 120, 40);
+        for needle in [
+            "WATCHER UNHEALTHY",
+            "DATAPLANE DEGRADED",
+            "config: swl experimental",
+            "protocol: daemon newer",
+            "daemon: daemon gone",
+            "Error: bad field",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        assert!(text.contains("quit"), "footer missing");
+    }
+
+    #[test]
+    fn short_terminal_drops_low_priority_lines_but_keeps_critical_ones() {
+        let mut app = base_app();
+        app.status = Some(alarmed_status());
+        app.config_warning = Some("swl experimental".to_string());
+        app.protocol_note = Some("daemon newer".to_string());
+        app.error = Some("daemon gone".to_string());
+        // 8 rows total: footer 1 + body min 1 → header ≤ 6 rows = 4 content lines.
+        let text = render(&mut app, 120, 8);
+        for needle in [
+            "daemon: daemon gone",
+            "DATAPLANE DEGRADED",
+            "WATCHER UNHEALTHY",
+        ] {
+            assert!(
+                text.contains(needle),
+                "critical line lost: {needle:?}\n{text}"
+            );
+        }
+        assert!(text.contains("quit"), "footer lost on short terminal");
+    }
+
+    #[test]
+    fn tiny_terminals_do_not_panic() {
+        for (w, h) in [(30u16, 1u16), (20, 3), (10, 2), (80, 4)] {
+            let mut app = base_app();
+            app.status = Some(alarmed_status());
+            app.error = Some("daemon gone".to_string());
+            render(&mut app, w, h); // must return without panicking
+        }
     }
 }
 
