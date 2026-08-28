@@ -34,7 +34,7 @@ pub struct TrafficValue {
 /// `TRAFFIC` records demand (what arrived); this records what the policer actually
 /// let through versus dropped. Only flows with an active policy get entries.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PolicerStats {
     pub passed_bytes: u64,
     pub passed_packets: u64,
@@ -71,7 +71,7 @@ pub const ALGO_GCRA: u32 = 5;
 /// Deliberately *not* keyed by ifindex: the same IP+direction must share a single
 /// rate budget across all CPUs and whichever TAP the packet currently traverses.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LimitKey {
     pub ipv4: u32,
     pub direction: u8,
@@ -102,7 +102,7 @@ impl LimitKey {
 ///   Unused by the window algorithms.
 /// * `window_ns` — window length for the window algorithms; 0 otherwise.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LimitPolicy {
     pub enabled: u8,
     pub _pad0: [u8; 3],
@@ -133,7 +133,7 @@ pub struct LimitPolicy {
 /// object so BTF describes it to the verifier); the userspace view only ever writes it
 /// (install/reset) or deletes it, so the lock field is simply carried as zeroed bytes.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LimitState {
     pub a: u64,
     pub b: u64,
@@ -171,7 +171,7 @@ pub const SWL_LOG_CAP: usize = 1024;
 
 /// One logged packet: arrival time and wire length.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SwlEntry {
     pub ts_ns: u64,
     pub len: u32,
@@ -182,7 +182,7 @@ pub struct SwlEntry {
 /// value also carries a `struct bpf_spin_lock` (declared in the eBPF object); userspace
 /// only inserts a zeroed ring or deletes it.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwlRing {
     pub head: u32,
     pub _pad: u32,
