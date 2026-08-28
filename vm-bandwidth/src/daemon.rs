@@ -69,18 +69,6 @@ enum WatchMsg {
     Error(String),
 }
 
-/// Rollback bookkeeping for one transactional map apply: filled as operations
-/// succeed, played back in reverse on the first failure.
-#[derive(Default)]
-struct MapRollback {
-    wl_added: Vec<Cidr>,
-    wl_removed: Vec<Cidr>,
-    /// Executed Remove actions with the policy they displaced (None = was absent).
-    removes: Vec<(LimitKey, Option<LimitPolicy>)>,
-    /// Executed Install actions with the policy they displaced (None = fresh flow).
-    installs: Vec<(LimitKey, Option<LimitPolicy>)>,
-}
-
 /// Whitelist-trie key for one prefix. The kernel LPM trie matches bits in MEMORY-byte
 /// order, so the address goes in network byte order — a host-order u32 would reverse
 /// the octets and only match by accident while all variance stays inside one octet.
@@ -121,6 +109,12 @@ struct Engine {
     config_watcher_errors_total: u64,
     config_watcher_last_error: String,
 
+    /// Dataplane health: set when a rollback could not fully restore the maps.
+    /// Affected flows are unarmed (fail-open) until they re-trigger; the flag stays
+    /// on so operators can see the degradation instead of it being swallowed.
+    dataplane_degraded: bool,
+    rollback_failures_total: u64,
+
     bridge: String,
     manager: AttachManager,
     taps: Vec<Tap>,
@@ -139,7 +133,6 @@ struct Engine {
     whitelist_capacity: u32,
 
     monitored: LpmTrie<MapData, u32, u8>,
-    #[allow(dead_code)] // kept alive so its map fd stays open
     limit_policies: AyaHashMap<MapData, LimitKey, LimitPolicy>,
     limit_state: AyaHashMap<MapData, LimitKey, LimitState>,
     /// Bounded sliding-window-log rings; only populated for flows limited with
@@ -191,11 +184,11 @@ impl Engine {
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         if !actions.is_empty() {
-            let mut rb = MapRollback::default();
-            if let Err(e) = self.execute_limit_actions(&actions, &mut rb) {
+            let mut journal = crate::txmaps::TxJournal::default();
+            if let Err(e) = self.execute_limit_actions(&actions, &mut journal) {
                 // A half-applied batch is worse than none: roll the dataplane back and
                 // let the flows re-evaluate from NORMAL on their next threshold cross.
-                self.rollback_map_apply(&rb);
+                self.rollback_map_apply(&journal);
                 for action in &actions {
                     let (ipv4, direction) = match action {
                         LimitAction::Install {
@@ -308,41 +301,35 @@ impl Engine {
         }
     }
 
-    /// Execute limit actions against the eBPF maps transactionally. Removes run first
-    /// (they free capacity); per flow the write order is:
-    ///   Install: STATE FIRST, POLICY LAST — the policy is the arming marker, so a
-    ///            failed state write can never leave an armed policy without state;
-    ///   Remove:  POLICY FIRST, state after — a failed cleanup can never leave an armed
-    ///            policy behind a "removed" verdict.
-    /// Every map operation propagates its error; on the first failure the caller plays
-    /// back `rb` in reverse.
+    /// Execute limit actions against the eBPF maps transactionally via the
+    /// [`txmaps`] layer: removes first (they free capacity), installs after. For each
+    /// flow the order is disarm -> clear foreign artifacts -> fresh state -> arm LAST;
+    /// the journal exists before the first destructive write of every action.
     fn execute_limit_actions(
         &mut self,
         actions: &[LimitAction],
-        rb: &mut MapRollback,
+        journal: &mut crate::txmaps::TxJournal,
     ) -> Result<()> {
-        // Pass 1: removals (disarm, then clean up).
+        let mut maps = EngineMaps {
+            policies: &mut self.limit_policies,
+            state: &mut self.limit_state,
+            swl: &mut self.swl_log,
+            policer: &mut self.policer_stats,
+        };
+
+        // Pass 1: removals.
         for action in actions {
             let LimitAction::Remove { ipv4, direction } = action else {
                 continue;
             };
             let key = LimitKey::new(*ipv4, *direction);
             let addr = std::net::Ipv4Addr::from(*ipv4);
-            let old = self.get_policy(&key)?;
-            self.limit_policies
-                .remove(&key)
+            crate::txmaps::remove_limit(&mut maps, journal, key)
                 .with_context(|| format!("removing limit policy for {addr} dir={direction}"))?;
-            rb.removes.push((key, old));
-            map_gone(self.limit_state.remove(&key))
-                .with_context(|| format!("removing limit state for {addr}"))?;
-            map_gone(self.swl_log.remove(&key))
-                .with_context(|| format!("removing sliding-window log for {addr}"))?;
-            map_gone(self.policer_stats.remove(&key))
-                .with_context(|| format!("removing policer stats for {addr}"))?;
             log::info!("back to NORMAL {addr} dir={direction}");
         }
 
-        // Pass 2: installs (state first, policy as the arming marker last).
+        // Pass 2: installs.
         for action in actions {
             let LimitAction::Install {
                 ipv4,
@@ -357,14 +344,6 @@ impl Engine {
             };
             let key = LimitKey::new(*ipv4, *direction);
             let addr = std::net::Ipv4Addr::from(*ipv4);
-            let old = self.get_policy(&key)?;
-            let old_was_swl = old
-                .map(|p| p.algorithm == ALGO_SLIDING_WINDOW_LOG)
-                .unwrap_or(false);
-
-            self.write_fresh_state(&key, *algorithm)
-                .with_context(|| format!("initialising limit state for {addr}"))?;
-
             let policy = LimitPolicy {
                 enabled: 1,
                 _pad0: [0; 3],
@@ -373,21 +352,8 @@ impl Engine {
                 burst_bytes: *burst_bytes,
                 window_ns: *window_ns,
             };
-            self.limit_policies
-                .insert(key, policy, 0)
+            crate::txmaps::install_limit(&mut maps, journal, key, policy)
                 .with_context(|| format!("installing limit policy for {addr} dir={direction}"))?;
-            rb.installs.push((key, old));
-
-            // Drop the displaced algorithm's artifact only after the new policy is
-            // armed, so no window exists where an armed policy points at dead state.
-            if old_was_swl && *algorithm != ALGO_SLIDING_WINDOW_LOG {
-                map_gone(self.swl_log.remove(&key))
-                    .with_context(|| format!("removing stale sliding-window log for {addr}"))?;
-            } else if old.is_some() && *algorithm == ALGO_SLIDING_WINDOW_LOG {
-                map_gone(self.limit_state.remove(&key))
-                    .with_context(|| format!("removing stale limit state for {addr}"))?;
-            }
-
             log::info!(
                 "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
                 addr,
@@ -401,72 +367,39 @@ impl Engine {
         Ok(())
     }
 
-    /// Read the currently armed policy for a flow (None = not policed). Propagates
-    /// errors other than absence.
-    fn get_policy(&self, key: &LimitKey) -> Result<Option<LimitPolicy>> {
-        match self.limit_policies.get(key, 0) {
-            Ok(p) => Ok(Some(p)),
-            Err(MapError::KeyNotFound) => Ok(None),
-            Err(e) => Err(e.into()),
+    /// Play the journal back in reverse and surface the outcome. Never silent: a
+    /// failed step logs at error severity and flags the dataplane degraded (affected
+    /// flows are unarmed / fail-open until they re-trigger).
+    fn rollback_map_apply(
+        &mut self,
+        journal: &crate::txmaps::TxJournal,
+    ) -> crate::txmaps::RollbackReport {
+        let mut maps = EngineMaps {
+            policies: &mut self.limit_policies,
+            state: &mut self.limit_state,
+            swl: &mut self.swl_log,
+            policer: &mut self.policer_stats,
+        };
+        let mut wl = EngineWhitelist(&mut self.monitored);
+        let report = crate::txmaps::rollback_journal(&mut maps, &mut wl, journal);
+        for f in &report.failures {
+            log::error!(
+                "rollback failed at '{}' for {}: {}",
+                f.op,
+                std::net::Ipv4Addr::from(f.key.ipv4),
+                f.error
+            );
         }
-    }
-
-    /// Zero-initialise the runtime-state map matching `algorithm` (the data path never
-    /// creates lock-bearing values).
-    fn write_fresh_state(&mut self, key: &LimitKey, algorithm: u32) -> Result<()> {
-        if algorithm == ALGO_SLIDING_WINDOW_LOG {
-            self.swl_log
-                .insert(*key, SwlRing::default(), 0)
-                .map_err(Into::into)
-        } else {
-            self.limit_state
-                .insert(*key, LimitState::default(), 0)
-                .map_err(Into::into)
+        if !report.dataplane_consistent {
+            self.dataplane_degraded = true;
+            self.rollback_failures_total += report.failures.len() as u64;
+            log::error!(
+                "dataplane DEGRADED after rollback: {} of {} step(s) failed;                  affected flows are unarmed (fail-open) until they re-trigger",
+                report.failures.len(),
+                report.attempted
+            );
         }
-    }
-
-    /// Best-effort reverse of everything recorded in `rb`, played back in reverse order.
-    /// Restored algorithm state is FRESH — kernel-side state is unrecoverable once
-    /// overwritten, so a rolled-back flow restarts its budget from zero.
-    fn rollback_map_apply(&mut self, rb: &MapRollback) {
-        for (key, old) in rb.installs.iter().rev() {
-            let _ = self.limit_policies.remove(key);
-            match old {
-                Some(old) => {
-                    // Re-arm the displaced policy with fresh state.
-                    if self.limit_policies.insert(*key, *old, 0).is_ok() {
-                        let _ = self.write_fresh_state(key, old.algorithm);
-                    } else {
-                        log::warn!(
-                            "rollback: failed to re-arm policy for {}",
-                            std::net::Ipv4Addr::from(key.ipv4)
-                        );
-                    }
-                }
-                None => {
-                    let _ = self.limit_state.remove(key);
-                    let _ = self.swl_log.remove(key);
-                }
-            }
-        }
-        for (key, old) in rb.removes.iter().rev() {
-            if let Some(old) = old {
-                if self.limit_policies.insert(*key, *old, 0).is_ok() {
-                    let _ = self.write_fresh_state(key, old.algorithm);
-                } else {
-                    log::warn!(
-                        "rollback: failed to restore policy for {}",
-                        std::net::Ipv4Addr::from(key.ipv4)
-                    );
-                }
-            }
-        }
-        for c in rb.wl_removed.iter().rev() {
-            let _ = self.monitored.insert(&trie_key(c), 1u8, 0);
-        }
-        for c in rb.wl_added.iter().rev() {
-            let _ = self.monitored.remove(&trie_key(c));
-        }
+        report
     }
 
     /// Human-readable algorithm name for log lines.
@@ -607,9 +540,9 @@ impl Engine {
             .plan_reload(&new_cfg, now)
             .map_err(anyhow::Error::msg)?;
 
-        let mut rb = MapRollback::default();
-        if let Err(e) = self.apply_maps(&plan.actions, &old_prefixes, &new_prefixes, &mut rb) {
-            self.rollback_map_apply(&rb);
+        let mut journal = crate::txmaps::TxJournal::default();
+        if let Err(e) = self.apply_maps(&plan.actions, &old_prefixes, &new_prefixes, &mut journal) {
+            self.rollback_map_apply(&journal);
             return Err(e);
         }
 
@@ -620,26 +553,28 @@ impl Engine {
         Ok(())
     }
 
-    /// §27 ordering with rollback bookkeeping: whitelist additions first, limit-map
-    /// actions second, whitelist removals last.
+    /// §27 ordering with journal bookkeeping: whitelist additions first, limit-map
+    /// actions second, whitelist removals last. Each successful operation is
+    /// journaled immediately, so any mid-way failure rolls back exactly what ran.
     fn apply_maps(
         &mut self,
         actions: &[LimitAction],
         old_prefixes: &HashSet<Cidr>,
         new_prefixes: &HashSet<Cidr>,
-        rb: &mut MapRollback,
+        journal: &mut crate::txmaps::TxJournal,
     ) -> Result<()> {
-        for c in new_prefixes.difference(old_prefixes) {
-            self.monitored
-                .insert(&trie_key(c), 1u8, 0)
-                .with_context(|| format!("whitelisting {}", c.display()))?;
-            rb.wl_added.push(*c);
+        let additions: Vec<Cidr> = new_prefixes.difference(old_prefixes).copied().collect();
+        {
+            let mut wl = EngineWhitelist(&mut self.monitored);
+            crate::txmaps::apply_whitelist_additions(&mut wl, journal, &additions)
+                .context("whitelisting new prefixes")?;
         }
-        self.execute_limit_actions(actions, rb)?;
-        for c in old_prefixes.difference(new_prefixes) {
-            map_gone(self.monitored.remove(&trie_key(c)))
-                .with_context(|| format!("dropping whitelist prefix {}", c.display()))?;
-            rb.wl_removed.push(*c);
+        self.execute_limit_actions(actions, journal)?;
+        let removals: Vec<Cidr> = old_prefixes.difference(new_prefixes).copied().collect();
+        {
+            let mut wl = EngineWhitelist(&mut self.monitored);
+            crate::txmaps::apply_whitelist_removals(&mut wl, journal, &removals)
+                .context("dropping removed whitelist prefixes")?;
         }
         Ok(())
     }
@@ -700,6 +635,8 @@ impl Engine {
             config_watcher_healthy: self.config_watcher_healthy,
             config_watcher_errors_total: self.config_watcher_errors_total,
             config_watcher_last_error: self.config_watcher_last_error.clone(),
+            dataplane_degraded: self.dataplane_degraded,
+            rollback_failures_total: self.rollback_failures_total,
             ranges,
         }
     }
@@ -765,6 +702,72 @@ impl Engine {
                 },
             },
         }
+    }
+}
+
+/// The engine's limit maps behind the [`crate::txmaps::LimitMaps`] trait. Absence-tolerant
+/// cleanup ops go through [`map_gone`]; the policy read maps `KeyNotFound` to `None`.
+struct EngineMaps<'a> {
+    policies: &'a mut AyaHashMap<MapData, LimitKey, LimitPolicy>,
+    state: &'a mut AyaHashMap<MapData, LimitKey, LimitState>,
+    swl: &'a mut AyaHashMap<MapData, LimitKey, SwlRing>,
+    policer: &'a mut PerCpuHashMap<MapData, LimitKey, PolicerStats>,
+}
+
+impl crate::txmaps::LimitMaps for EngineMaps<'_> {
+    fn get_policy(&mut self, key: &LimitKey) -> Result<Option<LimitPolicy>> {
+        match self.policies.get(key, 0) {
+            Ok(p) => Ok(Some(p)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn arm_policy(&mut self, key: &LimitKey, policy: LimitPolicy) -> Result<()> {
+        self.policies.insert(*key, policy, 0).map_err(Into::into)
+    }
+
+    fn disarm_policy(&mut self, key: &LimitKey) -> Result<()> {
+        map_gone(self.policies.remove(key))
+    }
+
+    fn write_fresh_state(&mut self, key: &LimitKey, algorithm: u32) -> Result<()> {
+        // The data path never constructs lock-bearing values; userspace installs a
+        // zeroed artifact of the shape the algorithm expects.
+        if algorithm == ALGO_SLIDING_WINDOW_LOG {
+            self.swl
+                .insert(*key, SwlRing::default(), 0)
+                .map_err(Into::into)
+        } else {
+            self.state
+                .insert(*key, LimitState::default(), 0)
+                .map_err(Into::into)
+        }
+    }
+
+    fn clear_state(&mut self, key: &LimitKey, algorithm: u32) -> Result<()> {
+        if algorithm == ALGO_SLIDING_WINDOW_LOG {
+            map_gone(self.swl.remove(key))
+        } else {
+            map_gone(self.state.remove(key))
+        }
+    }
+
+    fn clear_policer(&mut self, key: &LimitKey) -> Result<()> {
+        map_gone(self.policer.remove(key))
+    }
+}
+
+/// The whitelist trie behind [`crate::txmaps::WhitelistOps`].
+struct EngineWhitelist<'a>(&'a mut LpmTrie<MapData, u32, u8>);
+
+impl crate::txmaps::WhitelistOps for EngineWhitelist<'_> {
+    fn wl_insert(&mut self, cidr: &Cidr) -> Result<()> {
+        self.0.insert(&trie_key(cidr), 1u8, 0).map_err(Into::into)
+    }
+
+    fn wl_remove(&mut self, cidr: &Cidr) -> Result<()> {
+        map_gone(self.0.remove(&trie_key(cidr)))
     }
 }
 
@@ -910,6 +913,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         config_watcher_healthy: true,
         config_watcher_errors_total: 0,
         config_watcher_last_error: String::new(),
+        dataplane_degraded: false,
+        rollback_failures_total: 0,
         bridge: config.load().bridge.clone(),
         manager,
         taps,

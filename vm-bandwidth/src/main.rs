@@ -11,7 +11,6 @@ mod interface;
 mod metrics;
 mod tc;
 mod tui;
-#[allow(dead_code)] // wired into the engine in the next change
 mod txmaps;
 mod ui;
 

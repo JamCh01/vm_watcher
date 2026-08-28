@@ -166,6 +166,12 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
                     s.config_watcher_errors_total, s.config_watcher_last_error
                 ));
             }
+            if s.dataplane_degraded {
+                line.push_str(&format!(
+                    "    DATAPLANE DEGRADED: {} rollback failure(s) — some flows unarmed (fail-open)",
+                    s.rollback_failures_total
+                ));
+            }
             line
         }
         _ => format!("Config generation: {generation}"),

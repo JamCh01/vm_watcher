@@ -48,6 +48,13 @@ pub struct Status {
     pub config_watcher_healthy: bool,
     pub config_watcher_errors_total: u64,
     pub config_watcher_last_error: String,
+    /// True once a map rollback could not fully restore the dataplane. Affected
+    /// flows are unarmed (fail-open) until they re-trigger; the flag persists so the
+    /// degradation stays visible. `#[serde(default)]` keeps older daemons readable.
+    #[serde(default)]
+    pub dataplane_degraded: bool,
+    #[serde(default)]
+    pub rollback_failures_total: u64,
     pub ranges: Vec<RangeSummary>,
 }
 

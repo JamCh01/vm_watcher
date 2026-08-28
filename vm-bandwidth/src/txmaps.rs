@@ -76,15 +76,6 @@ pub struct TxJournal {
     pub wl_removed: Vec<Cidr>,
 }
 
-impl TxJournal {
-    pub fn is_empty(&self) -> bool {
-        self.installs.is_empty()
-            && self.removes.is_empty()
-            && self.wl_added.is_empty()
-            && self.wl_removed.is_empty()
-    }
-}
-
 /// One failed rollback step.
 #[derive(Debug)]
 pub struct RollbackFailure {
