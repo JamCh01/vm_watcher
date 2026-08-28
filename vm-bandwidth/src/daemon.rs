@@ -158,9 +158,14 @@ struct Engine {
     /// Single-flight flag plus process-lifetime push outcome counters
     /// (see push_metrics / PushCounters).
     push_counters: Arc<PushCounters>,
-    /// TAP attach failures since daemon start (any attach class incl. backoff
-    /// rejections); engine-owned, updated only by the engine task.
+    /// TAP attach failures since daemon start. Counts only attach ATTEMPTS that
+    /// failed; TAPs skipped because their backoff window has not expired are
+    /// neither attempts nor failures (they are retried by a later scan).
+    /// Engine-owned, updated only by the engine task.
     tap_attach_failures_total: u64,
+    /// Counter-map keys whose removal failed transiently; retried on every TAP
+    /// rescan (bounded maintenance cycle) until removed or confirmed absent.
+    pending_removes: PendingRemovals,
 
     epoch: std::time::Instant,
 }
@@ -188,14 +193,14 @@ impl Engine {
             "TRAFFIC",
             "idle eviction",
             &stale_traffic,
-            |k| std::net::Ipv4Addr::from(k.ipv4).to_string(),
+            traffic_key_display,
             |k| self.traffic.remove(k),
         );
         let idle6 = remove_counter_keys(
             "TRAFFIC6",
             "idle eviction",
             &stale_traffic6,
-            |k| format!("ifindex {k}"),
+            traffic6_key_display,
             |k| self.traffic6.remove(k),
         );
         if idle4.attempted + idle6.attempted > 0 {
@@ -351,12 +356,40 @@ impl Engine {
                     new_taps.iter().map(|t| t.ifindex).collect();
                 let old_ifindexes: std::collections::HashSet<u32> =
                     self.taps.iter().map(|t| t.ifindex).collect();
+
+                // Retry transient removal failures from earlier cycles on EVERY
+                // rescan (the bounded maintenance cycle), independent of whether
+                // the TAP set changed — a failed prune from a previous scan must
+                // not wait for the next set change or the idle threshold.
+                let retry = self
+                    .pending_removes
+                    .retry_traffic(&new_ifindexes, |k| self.traffic.remove(k));
+                if retry.cancelled_reused + retry.removed + retry.still_pending > 0 {
+                    if retry.still_pending == 0 {
+                        log::debug!(
+                            "pending TRAFFIC removals: {} removed, {} cancelled (ifindex live again)",
+                            retry.removed,
+                            retry.cancelled_reused
+                        );
+                    } else {
+                        log::warn!(
+                            "pending TRAFFIC removals: {} removed, {} cancelled, {} still failing (retried next scan)",
+                            retry.removed,
+                            retry.cancelled_reused,
+                            retry.still_pending
+                        );
+                    }
+                }
+
                 if new_ifindexes != old_ifindexes {
                     // Drop counters of vanished TAPs so the TRAFFIC map does not fill up
-                    // with dead (ifindex, IP) keys as VMs churn (§33).
+                    // with dead (ifindex, IP) keys as VMs churn (§33). Keys already
+                    // pending were retried above; skip them this pass.
                     let mut stale = Vec::new();
                     for (key, _) in self.traffic.iter().flatten() {
-                        if !new_ifindexes.contains(&key.ifindex) {
+                        if !new_ifindexes.contains(&key.ifindex)
+                            && !self.pending_removes.traffic.contains(&key)
+                        {
                             stale.push(key);
                         }
                     }
@@ -364,21 +397,29 @@ impl Engine {
                         "TRAFFIC",
                         "stale-TAP prune",
                         &stale,
-                        |k| std::net::Ipv4Addr::from(k.ipv4).to_string(),
+                        traffic_key_display,
                         |k| self.traffic.remove(k),
                     );
+                    // Keys whose removal failed stay pending and are retried next
+                    // scan; userspace tracking follows ifindex liveness regardless
+                    // (a re-baseline is safe: deltas are saturating and an absent
+                    // prev starts the next poll at zero delta).
+                    self.collector.prune_ifindexes(&new_ifindexes);
+                    if !pruned.failed_keys.is_empty() {
+                        self.pending_removes.traffic.extend(pruned.failed_keys);
+                    }
                     if pruned.attempted > 0 {
                         if pruned.failed == 0 {
                             log::debug!("pruned {} stale TRAFFIC key(s)", pruned.removed);
                         } else {
                             log::warn!(
-                                "stale-TAP prune incomplete: removed {}/{} TRAFFIC key(s) — see per-key failures",
+                                "stale-TAP prune incomplete: removed {}/{} TRAFFIC key(s), {} pending for retry",
                                 pruned.removed,
-                                pruned.attempted
+                                pruned.attempted,
+                                pruned.failed
                             );
                         }
                     }
-                    self.collector.prune_ifindexes(&new_ifindexes);
                 }
                 self.taps = new_taps;
             }
@@ -822,12 +863,86 @@ fn degraded_summary(failures: usize, attempted: usize) -> String {
     )
 }
 
-/// Outcome of a bulk counter-map removal.
+/// Outcome of a bulk counter-map removal. `failed_keys` carries the exact keys
+/// that need a retry so callers can keep them pending (never lost in a count).
 #[derive(Debug, PartialEq)]
-struct RemovalStats {
+struct RemovalStats<K> {
     attempted: usize,
     removed: usize,
     failed: usize,
+    failed_keys: Vec<K>,
+}
+
+/// Transiently-failed TRAFFIC removals, retried on every bounded maintenance
+/// cycle (TAP rescan) until removed or confirmed absent.
+///
+/// Bounded by construction: every pending key was present in the TRAFFIC map
+/// when its removal failed, and entries leave the set the moment a retry
+/// removes the key, confirms it absent, or finds its ifindex live again — so
+/// the set can never exceed the TRAFFIC map's own cardinality
+/// (`map_max_entries`). No tasks, no timers: the rescan loop is the only
+/// driver, so there is no busy-loop path.
+#[derive(Default)]
+struct PendingRemovals {
+    traffic: HashSet<TrafficKey>,
+}
+
+/// Outcome of one pending-removal retry pass.
+struct PendingRetryStats {
+    /// Keys whose ifindex is a live TAP again: cancelled WITHOUT any deletion
+    /// attempt (the counters may now belong to the new TAP — see ifindex reuse).
+    cancelled_reused: usize,
+    removed: usize,
+    still_pending: usize,
+}
+
+impl PendingRemovals {
+    /// Retry every pending TRAFFIC removal once. Keys whose ifindex is live
+    /// again are cancelled, not deleted: a reused ifindex means the counters
+    /// may now be LIVE counters of the new TAP, and the collector rebaselines
+    /// them on its next poll (absent prev => zero delta for that poll).
+    fn retry_traffic<F>(
+        &mut self,
+        live_ifindexes: &HashSet<u32>,
+        mut remove: F,
+    ) -> PendingRetryStats
+    where
+        F: FnMut(&TrafficKey) -> Result<(), MapError>,
+    {
+        let mut stats = PendingRetryStats {
+            cancelled_reused: 0,
+            removed: 0,
+            still_pending: 0,
+        };
+        // Drain first: every key is either resolved or re-inserted below, so
+        // the set never accumulates duplicates across passes.
+        let keys: Vec<TrafficKey> = self.traffic.drain().collect();
+        for key in keys {
+            if live_ifindexes.contains(&key.ifindex) {
+                stats.cancelled_reused += 1;
+                log::debug!(
+                    "pending TRAFFIC removal cancelled: {}",
+                    traffic_key_display(&key)
+                );
+                continue;
+            }
+            match remove(&key) {
+                Ok(()) => stats.removed += 1,
+                Err(e) if key_already_absent(&e) => stats.removed += 1,
+                Err(e) => {
+                    // First occurrence logged warn at prune time; retries stay
+                    // per-key debug plus one aggregate warn per pass (no storm).
+                    log::debug!(
+                        "TRAFFIC remove retry failed for {}: {e}",
+                        traffic_key_display(&key)
+                    );
+                    stats.still_pending += 1;
+                    self.traffic.insert(key);
+                }
+            }
+        }
+        stats
+    }
 }
 
 /// Remove keys from a counter map without stopping at individual failures.
@@ -847,8 +962,9 @@ fn remove_counter_keys<K, D, F>(
     keys: &[K],
     display: D,
     mut remove: F,
-) -> RemovalStats
+) -> RemovalStats<K>
 where
+    K: Copy,
     D: Fn(&K) -> String,
     F: FnMut(&K) -> Result<(), MapError>,
 {
@@ -856,6 +972,7 @@ where
         attempted: keys.len(),
         removed: 0,
         failed: 0,
+        failed_keys: Vec::new(),
     };
     for key in keys {
         match remove(key) {
@@ -863,6 +980,7 @@ where
             Err(e) if key_already_absent(&e) => stats.removed += 1,
             Err(e) => {
                 stats.failed += 1;
+                stats.failed_keys.push(*key);
                 log::warn!(
                     "{map_name} remove failed during {op} for {}: {e}",
                     display(key)
@@ -871,6 +989,20 @@ where
         }
     }
     stats
+}
+
+/// Unambiguous counter-key rendering for logs: family + address + ifindex, so
+/// two keys with the same IP on different TAPs are never conflated.
+fn traffic_key_display(k: &TrafficKey) -> String {
+    format!(
+        "ipv4 {} ifindex {}",
+        std::net::Ipv4Addr::from(k.ipv4),
+        k.ifindex
+    )
+}
+
+fn traffic6_key_display(k: &u32) -> String {
+    format!("ipv6-aggregate ifindex {k}")
 }
 
 /// Typed absent-key detection for `remove_counter_keys` — no string matching.
@@ -1191,6 +1323,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         http: crate::metrics::client(),
         push_counters: Arc::new(PushCounters::new()),
         tap_attach_failures_total: startup_attach_failures as u64,
+        pending_removes: PendingRemovals::default(),
         epoch: std::time::Instant::now(),
     };
     // Apply the initial limiter policy index (no LIMITs yet; just builds lookups).
@@ -1678,7 +1811,8 @@ mod removal_tests {
             RemovalStats {
                 attempted: 3,
                 removed: 3,
-                failed: 0
+                failed: 0,
+                failed_keys: vec![]
             }
         );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -1706,7 +1840,8 @@ mod removal_tests {
             RemovalStats {
                 attempted: 3,
                 removed: 2,
-                failed: 1
+                failed: 1,
+                failed_keys: vec![2]
             }
         );
     }
@@ -1729,7 +1864,8 @@ mod removal_tests {
             RemovalStats {
                 attempted: 2,
                 removed: 0,
-                failed: 2
+                failed: 2,
+                failed_keys: vec![7, 8]
             }
         );
     }
@@ -1758,7 +1894,8 @@ mod removal_tests {
             RemovalStats {
                 attempted: 5,
                 removed: 4,
-                failed: 1
+                failed: 1,
+                failed_keys: vec![5]
             }
         );
     }
@@ -1785,6 +1922,8 @@ mod removal_tests {
         assert_eq!(stats.removed + stats.failed, stats.attempted);
         assert_eq!(stats.removed, 2);
         assert_ne!(stats.removed, stats.attempted);
+        // Only the actually-failed keys are handed back for retry bookkeeping.
+        assert_eq!(stats.failed_keys, vec![2, 4]);
     }
 }
 
@@ -2016,6 +2155,223 @@ burst = "1MiB"
         }
         maps.assert_invariants();
         maps.assert_no_orphans();
+    }
+}
+
+#[cfg(test)]
+mod pending_removal_tests {
+    //! Lifecycle tests for transient counter-removal failures: the production
+    //! retry path is `PendingRemovals::retry_traffic` (called from every TAP
+    //! rescan) fed by `remove_counter_keys().failed_keys` (the prune path) —
+    //! exactly what `Engine::rescan_taps` wires.
+
+    use super::{remove_counter_keys, traffic_key_display, PendingRemovals};
+    use aya::maps::MapError;
+    use std::collections::{HashMap, HashSet};
+    use vm_bandwidth_common::TrafficKey;
+
+    /// Scripted TRAFFIC map: presence + per-key injected failure counts.
+    #[derive(Default)]
+    struct FakeTraffic {
+        present: HashSet<TrafficKey>,
+        /// Remaining injected transient failures per key; decremented per attempt.
+        fail_times: HashMap<TrafficKey, u32>,
+        /// Keys that never succeed (until removed from this set).
+        fail_forever: HashSet<TrafficKey>,
+        calls: HashMap<TrafficKey, u32>,
+    }
+
+    impl FakeTraffic {
+        fn insert(&mut self, k: TrafficKey) {
+            self.present.insert(k);
+        }
+        fn remove(&mut self, k: &TrafficKey) -> Result<(), MapError> {
+            *self.calls.entry(*k).or_insert(0) += 1;
+            if self.fail_forever.contains(k) {
+                return Err(MapError::IoError(std::io::Error::other("injected")));
+            }
+            if let Some(n) = self.fail_times.get_mut(k) {
+                if *n > 0 {
+                    *n -= 1;
+                    return Err(MapError::IoError(std::io::Error::other(
+                        "injected transient",
+                    )));
+                }
+            }
+            self.present.remove(k);
+            Ok(())
+        }
+    }
+
+    fn key(ifindex: u32, ip: [u8; 4]) -> TrafficKey {
+        TrafficKey {
+            ifindex,
+            ipv4: u32::from_be_bytes(ip),
+        }
+    }
+
+    fn absent_enoent() -> MapError {
+        MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: std::io::Error::from_raw_os_error(2), // ENOENT
+        })
+    }
+
+    #[test]
+    fn transient_failure_is_retried_next_cycle_and_cleans_up() {
+        let mut map = FakeTraffic::default();
+        let k = key(9, [10, 0, 0, 1]);
+        map.insert(k);
+        map.fail_times.insert(k, 1);
+        let mut pending = PendingRemovals::default();
+
+        // Cycle 1 (the prune attempt): transient failure -> key stays in the map
+        // AND enters the pending set.
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "stale-TAP prune",
+            &[k],
+            traffic_key_display,
+            |k| map.remove(k),
+        );
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.failed_keys, vec![k]);
+        pending.traffic.extend(stats.failed_keys);
+        assert!(map.present.contains(&k), "failed key must stay in the map");
+        assert_eq!(pending.traffic.len(), 1);
+
+        // Cycle 2 (next maintenance pass): retried immediately — no idle
+        // threshold, no TAP-set-change requirement — and fully cleaned.
+        let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+        assert_eq!(retry.removed, 1);
+        assert_eq!(retry.still_pending, 0);
+        assert!(!map.present.contains(&k), "map cleaned after retry");
+        assert!(pending.traffic.is_empty(), "pending cleaned after retry");
+    }
+
+    #[test]
+    fn absent_key_is_success_not_permanent_retry() {
+        let mut pending = PendingRemovals::default();
+        let k = key(9, [10, 0, 0, 2]);
+        pending.traffic.insert(k); // a failure recorded on an earlier pass
+
+        let retry = pending.retry_traffic(&HashSet::new(), |_| Err(MapError::KeyNotFound));
+        assert_eq!(retry.removed, 1);
+        assert_eq!(retry.still_pending, 0);
+        assert!(
+            pending.traffic.is_empty(),
+            "absent must not enter permanent retry"
+        );
+
+        // The ENOENT syscall variant (aya 0.14's delete-elem shape) behaves alike.
+        pending.traffic.insert(k);
+        let retry = pending.retry_traffic(&HashSet::new(), |_| Err(absent_enoent()));
+        assert_eq!(retry.removed, 1);
+        assert!(pending.traffic.is_empty());
+    }
+
+    #[test]
+    fn mixed_batch_cleans_successes_and_retries_the_failure() {
+        let mut map = FakeTraffic::default();
+        let ok_k = key(1, [10, 0, 0, 1]);
+        let absent_k = key(1, [10, 0, 0, 2]); // never in the map
+        let bad_k = key(1, [10, 0, 0, 3]);
+        map.insert(ok_k);
+        map.insert(bad_k);
+        map.fail_times.insert(bad_k, 1);
+        let mut pending = PendingRemovals::default();
+
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "stale-TAP prune",
+            &[ok_k, absent_k, bad_k],
+            traffic_key_display,
+            |k| map.remove(k),
+        );
+        assert_eq!(stats.attempted, 3);
+        assert_eq!(stats.removed, 2, "success + confirmed-absent both clean");
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.failed_keys, vec![bad_k]);
+        pending.traffic.extend(stats.failed_keys);
+        assert!(!map.present.contains(&ok_k), "successful key cleaned");
+        assert!(map.present.contains(&bad_k), "failed key retained");
+
+        // Next pass resolves the remainder.
+        let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+        assert_eq!(retry.removed, 1);
+        assert!(!map.present.contains(&bad_k));
+        assert!(pending.traffic.is_empty());
+    }
+
+    #[test]
+    fn reused_ifindex_cancels_pending_without_deleting_live_counters() {
+        let mut map = FakeTraffic::default();
+        let k = key(7, [10, 0, 0, 9]);
+        map.insert(k); // counters now belong to the NEW tap reusing ifindex 7
+        let mut pending = PendingRemovals::default();
+        pending.traffic.insert(k);
+
+        let mut live = HashSet::new();
+        live.insert(7);
+        let retry = pending.retry_traffic(&live, |k| map.remove(k));
+        assert_eq!(retry.cancelled_reused, 1);
+        assert_eq!(retry.removed, 0);
+        assert_eq!(
+            map.calls.get(&k).copied().unwrap_or(0),
+            0,
+            "no deletion attempt may touch a reused ifindex"
+        );
+        assert!(
+            map.present.contains(&k),
+            "live counters of the reused ifindex must survive"
+        );
+        assert!(
+            pending.traffic.is_empty(),
+            "cancelled key leaves the pending set"
+        );
+    }
+
+    #[test]
+    fn repeated_failures_stay_bounded_and_retriable_without_busy_loop() {
+        let mut map = FakeTraffic::default();
+        let k = key(3, [10, 0, 1, 1]);
+        map.insert(k);
+        map.fail_forever.insert(k);
+        let mut pending = PendingRemovals::default();
+        pending.traffic.insert(k);
+
+        for pass in 0..3u32 {
+            let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+            assert_eq!(retry.still_pending, 1, "pass {pass}");
+            assert_eq!(retry.removed, 0, "pass {pass}");
+            assert_eq!(
+                pending.traffic.len(),
+                1,
+                "pending set must stay bounded, never duplicate (pass {pass})"
+            );
+        }
+        // Exactly one attempt per maintenance pass: no in-pass retry loop.
+        assert_eq!(map.calls.get(&k).copied(), Some(3));
+
+        // Recovery stays possible once the error clears.
+        map.fail_forever.remove(&k);
+        let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+        assert_eq!(retry.removed, 1);
+        assert!(pending.traffic.is_empty());
+        assert!(!map.present.contains(&k));
+    }
+
+    #[test]
+    fn display_distinguishes_same_ip_on_different_ifindexes() {
+        let a = key(3, [10, 0, 0, 5]);
+        let b = key(9, [10, 0, 0, 5]);
+        let (da, db) = (traffic_key_display(&a), traffic_key_display(&b));
+        assert_ne!(da, db, "same IP on different TAPs must not conflate");
+        for d in [&da, &db] {
+            assert!(d.contains("ipv4 10.0.0.5"), "{d}");
+        }
+        assert!(da.contains("ifindex 3"), "{da}");
+        assert!(db.contains("ifindex 9"), "{db}");
     }
 }
 
