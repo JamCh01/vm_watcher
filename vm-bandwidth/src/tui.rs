@@ -1148,6 +1148,15 @@ mod tier_tests {
     }
 
     #[test]
+    fn detail_tier_boundaries() {
+        assert_eq!(detail_cols(DETAIL_WIDE_MIN), DetailCols::Wide);
+        assert_eq!(detail_cols(DETAIL_WIDE_MIN - 1), DetailCols::Mid);
+        assert_eq!(detail_cols(DETAIL_MID_MIN), DetailCols::Mid);
+        assert_eq!(detail_cols(DETAIL_MID_MIN - 1), DetailCols::Min);
+        assert_eq!(detail_cols(0), DetailCols::Min);
+    }
+
+    #[test]
     fn degraded_notice_names_no_specific_outcome() {
         let msg = degraded_notice(3);
         for banned in ["unarmed", "fail-open", "fail open", "limited"] {
