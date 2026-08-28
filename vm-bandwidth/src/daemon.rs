@@ -252,9 +252,10 @@ impl Engine {
         let http = self.http.clone();
         let url = cfg.metrics_url.clone();
         tokio::spawn(async move {
-            let result = crate::metrics::push(&http, &url, &lines).await;
-            flag.store(false, std::sync::atomic::Ordering::Release);
-            match result {
+            // The flag lives in an RAII guard: normal completion, HTTP errors,
+            // cancellation and panic unwinding all drop it and release the flag.
+            let _guard = PushGuard(flag);
+            match crate::metrics::push(&http, &url, &lines).await {
                 Ok(()) => log::debug!("metrics push: {} line(s)", lines.lines().count()),
                 Err(e) => log::warn!("metrics push to {url} failed: {e:#}"),
             }
@@ -1071,6 +1072,17 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     Ok(())
 }
 
+/// RAII holder for the in-flight metrics-push flag. Dropping the guard covers every
+/// exit path of the spawned task — normal completion, HTTP error, future cancellation
+/// and panic unwinding — so the flag can never stay set and silently stop pushes.
+struct PushGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for PushGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Open (creating if needed) the lock file at a fixed path and take an exclusive,
 /// non-blocking flock. A second live holder fails with a clear error.
 fn acquire_instance_lock(path: &str) -> Result<File> {
@@ -1222,6 +1234,44 @@ fn spawn_watcher(
         }
     });
     Ok(debouncer)
+}
+
+#[cfg(test)]
+mod push_guard_tests {
+    use crate::daemon::PushGuard;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn guard_releases_on_normal_drop() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = PushGuard(flag.clone());
+        }
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn guard_releases_on_panic_unwind() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let f = flag.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = PushGuard(f);
+            panic!("simulated push-task panic");
+        });
+        assert!(result.is_err());
+        assert!(!flag.load(Ordering::Acquire), "flag stuck after panic");
+    }
+
+    #[test]
+    fn guard_releases_on_simulated_cancellation() {
+        // A cancelled future drops its locals; model that by dropping the guard
+        // mid-flight without ever reaching completion.
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = PushGuard(flag.clone());
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire), "flag stuck after cancel");
+    }
 }
 
 #[cfg(test)]

@@ -126,11 +126,18 @@ pub struct MetricsConfig {
     /// screen explains that metrics are off.
     #[serde(default)]
     pub enabled: bool,
-    /// VictoriaMetrics base URL, e.g. `http://127.0.0.1:8428`. The daemon posts to
+    /// VictoriaMetrics base URL, e.g. `http://127.0.0.1:8428` (localhost) or
+    /// `https://vm.example.com:8428` (remote). The daemon posts to
     /// `{url}/api/v1/import/prometheus`; the `--ui` trend screen queries
-    /// `{url}/api/v1/query_range`. Plain HTTP only (the built-in client has no TLS).
+    /// `{url}/api/v1/query_range`. Remote URLs must use HTTPS; plain HTTP is only
+    /// accepted for loopback hosts unless `allow_insecure_http` is set.
     #[serde(default = "default_metrics_url")]
     pub url: String,
+    /// Explicit opt-in for remote plain-HTTP metrics URLs (per-customer bandwidth
+    /// figures would cross the network unencrypted and unauthenticated). Off by
+    /// default; localhost HTTP never needs it.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     /// How often cumulative per-IP counters are pushed, in seconds.
     #[serde(default = "default_push_interval_secs")]
     pub push_interval_secs: u64,
@@ -149,6 +156,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             url: default_metrics_url(),
+            allow_insecure_http: false,
             push_interval_secs: default_push_interval_secs(),
         }
     }
@@ -357,6 +365,38 @@ fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// URL policy for the metrics endpoint, enforced with a real URL parser (no string
+/// prefix guessing): https anywhere; http only for loopback hosts unless the operator
+/// explicitly accepts insecure remote transport.
+fn validate_metrics_url(raw: &str, allow_insecure_http: bool) -> Result<(), String> {
+    use url::Host;
+    let url = url::Url::parse(raw).map_err(|e| format!("metrics.url is not a valid URL: {e}"))?;
+    if url.host().is_none() {
+        return Err("metrics.url must include a host".to_string());
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match url.host() {
+                Some(Host::Domain("localhost")) => true,
+                Some(Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            };
+            if loopback || allow_insecure_http {
+                Ok(())
+            } else {
+                Err(format!(
+                    "metrics.url {raw:?}: remote plain HTTP would send customer bandwidth                      figures unencrypted; use https:// or set allow_insecure_http = true                      to accept the risk"
+                ))
+            }
+        }
+        other => Err(format!(
+            "metrics.url scheme must be http:// or https://; got {other:?}"
+        )),
+    }
+}
+
 /// Sliding Window Log is gated behind `[experimental] enable_sliding_window_log`:
 /// refuse configs that select it without the explicit switch.
 fn check_swl_enabled(
@@ -454,18 +494,10 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         }
     };
 
-    // Metrics section: validate only what the built-in HTTP client can actually do.
+    // Metrics section: validate the URL against what the client can actually do.
     let metrics = &config.metrics;
     if metrics.enabled {
-        if !metrics.url.starts_with("http://") {
-            return Err(format!(
-                "metrics.url must start with http:// (no TLS support); got {:?}",
-                metrics.url
-            ));
-        }
-        if metrics.url.trim_end_matches('/').len() <= "http://".len() {
-            return Err("metrics.url must include a host".to_string());
-        }
+        validate_metrics_url(&metrics.url, metrics.allow_insecure_http)?;
         if !(5..=3600).contains(&metrics.push_interval_secs) {
             return Err(format!(
                 "metrics.push_interval_secs must be within 5..=3600; got {}",
@@ -630,17 +662,74 @@ range = "10.0.0.1-10.0.0.2"
         assert_eq!(cfg.metrics_url, "http://127.0.0.1:8428");
         assert_eq!(cfg.metrics_push_interval_secs, 30);
 
-        let text = format!("{EXAMPLE}\n[metrics]\nenabled = true\nurl = \"https://vm:8428\"\n");
-        assert!(load_str(&text).unwrap_err().contains("http://"));
+        // https is fine; unknown schemes are not.
+        let text = format!(
+            "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"https://vm:8428\"
+"
+        );
+        assert!(load_str(&text).is_ok());
+        let text = format!(
+            "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"ftp://vm:8428\"
+"
+        );
+        assert!(load_str(&text).unwrap_err().contains("scheme"));
 
         let text = format!(
-            "{EXAMPLE}\n[metrics]\nenabled = true\nurl = \"http://x\"\npush_interval_secs = 1\n"
+            "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"http://127.0.0.1:8428\"
+push_interval_secs = 1
+"
         );
         assert!(load_str(&text).unwrap_err().contains("push_interval_secs"));
 
         // disabled section skips all validation
-        let text = format!("{EXAMPLE}\n[metrics]\nenabled = false\nurl = \"nonsense\"\n");
+        let text = format!(
+            "{EXAMPLE}
+[metrics]
+enabled = false
+url = \"nonsense\"
+"
+        );
         assert!(load_str(&text).is_ok());
+    }
+
+    #[test]
+    fn metrics_url_policy() {
+        fn url_cfg(url: &str, extra: &str) -> String {
+            format!(
+                "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"{url}\"
+{extra}"
+            )
+        }
+        // Loopback HTTP: always fine.
+        assert!(load_str(&url_cfg("http://127.0.0.1:8428", "")).is_ok());
+        assert!(load_str(&url_cfg("http://localhost:8428", "")).is_ok());
+        assert!(load_str(&url_cfg("http://[::1]:8428", "")).is_ok());
+        // Remote HTTP: refused unless explicitly accepted.
+        let err = load_str(&url_cfg("http://10.1.2.3:8428", "")).unwrap_err();
+        assert!(err.contains("allow_insecure_http"), "{err}");
+        assert!(load_str(&url_cfg(
+            "http://10.1.2.3:8428",
+            "allow_insecure_http = true
+"
+        ))
+        .is_ok());
+        // Remote HTTPS: fine without any flag.
+        assert!(load_str(&url_cfg("https://vm.example.com:8428", "")).is_ok());
+        // Garbage: parser error, host required.
+        assert!(load_str(&url_cfg("not a url", "")).is_err());
+        assert!(load_str(&url_cfg("http://", "")).is_err());
     }
 
     #[test]

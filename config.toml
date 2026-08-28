@@ -16,7 +16,8 @@ default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | t
 # dist/docker-compose.yml（docker compose up -d）。
 [metrics]
 enabled = false
-url = "http://127.0.0.1:8428"     # VictoriaMetrics 地址（仅支持 http://）
+url = "http://127.0.0.1:8428"     # VictoriaMetrics 地址：本机用 http://，远程必须用 https://
+                                  # （远程 http:// 需显式 allow_insecure_http = true 才会接受）
 push_interval_secs = 60           # 推送周期（5..=3600）
 
 # 实验性能力开关。sliding_window_log 每包在自旋锁内扫描 1024 条日志环，
