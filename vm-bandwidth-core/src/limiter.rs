@@ -455,6 +455,7 @@ mod tests {
             refresh_interval_ms: 1000,
             interface_scan_interval_secs: 5,
             map_max_entries: 8192,
+            swl_map_max_entries: 256,
             show_interface: false,
             show_packets: false,
             default_sort: SortMode::Ip,

@@ -50,6 +50,8 @@ pub struct Config {
     pub display: DisplayConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
     #[serde(default, rename = "ip_ranges")]
     pub ip_ranges: Vec<IpRangeEntry>,
 }
@@ -72,6 +74,10 @@ fn default_map_max_entries() -> u32 {
     8192
 }
 
+fn default_swl_map_max_entries() -> u32 {
+    256
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorConfig {
@@ -81,6 +87,13 @@ pub struct CollectorConfig {
     pub interface_scan_interval_secs: u64,
     #[serde(default = "default_map_max_entries")]
     pub map_max_entries: u32,
+    /// Capacity of the sliding-window-log map ONLY. Each entry reserves one 1024-slot
+    /// ring (~16.4 KiB), preallocated by the kernel at load — keep this at the number
+    /// of flows you actually intend to limit with `sliding_window_log`, not at the
+    /// general map size. Default 256 ≈ 4 MiB; `map_max_entries` (8192) would reserve
+    /// ~134 MiB for a feature that is off by default.
+    #[serde(default = "default_swl_map_max_entries")]
+    pub swl_map_max_entries: u32,
 }
 
 impl Default for CollectorConfig {
@@ -89,8 +102,21 @@ impl Default for CollectorConfig {
             refresh_interval_ms: default_refresh_interval_ms(),
             interface_scan_interval_secs: default_scan_interval_secs(),
             map_max_entries: default_map_max_entries(),
+            swl_map_max_entries: default_swl_map_max_entries(),
         }
     }
+}
+
+/// Capability switches for features that are expensive or experimental. Sliding
+/// Window Log is deliberately NOT a normal algorithm choice: every packet scans a
+/// 1024-entry ring under a spin lock, and the ring under-counts (gets lenient) above
+/// roughly `1024 / limit_window` packets per second.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentalConfig {
+    /// Allow `algorithm = "sliding_window_log"` in policies. Off by default.
+    #[serde(default)]
+    pub enable_sliding_window_log: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -301,6 +327,9 @@ const MAX_RATE_BPS: u64 = 1_000_000_000_000; // 1 Tbps
 const MAX_BURST_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 const MIN_LIMIT_WINDOW_SECS: u64 = 1;
 const MAX_LIMIT_WINDOW_SECS: u64 = 60;
+/// Sanity cap on the SWL map: 65536 rings ≈ 1 GiB of kernel memory. The value exists
+/// to catch unit typos (e.g. 256000); any real deployment needs far fewer SWL flows.
+const MAX_SWL_MAP_ENTRIES: u32 = 65536;
 
 fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> {
     for (name, value) in [
@@ -328,6 +357,28 @@ fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Sliding Window Log is gated behind `[experimental] enable_sliding_window_log`:
+/// refuse configs that select it without the explicit switch.
+fn check_swl_enabled(
+    eff: &policy::EffectivePolicy,
+    enabled: bool,
+    what: &str,
+) -> Result<(), String> {
+    let uses_swl = |d: &Option<policy::DirPolicy>| {
+        d.map(|p| p.algorithm == vm_bandwidth_common::ALGO_SLIDING_WINDOW_LOG)
+            .unwrap_or(false)
+    };
+    if (uses_swl(&eff.rx) || uses_swl(&eff.tx)) && !enabled {
+        return Err(format!(
+            "policy for {what}: algorithm = \"sliding_window_log\" requires \
+             [experimental] enable_sliding_window_log = true — every packet scans a \
+             1024-entry ring under a spin lock and the log gets lenient above roughly \
+             1024/limit_window packets per second; it is not a general-purpose choice"
+        ));
+    }
+    Ok(())
+}
+
 /// Config after full validation; everything downstream consumes this.
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {
@@ -335,6 +386,7 @@ pub struct ValidatedConfig {
     pub refresh_interval_ms: u64,
     pub interface_scan_interval_secs: u64,
     pub map_max_entries: u32,
+    pub swl_map_max_entries: u32,
     pub show_interface: bool,
     pub show_packets: bool,
     pub default_sort: SortMode,
@@ -381,6 +433,14 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     }
     if config.collector.map_max_entries == 0 {
         return Err("collector.map_max_entries must be > 0".to_string());
+    }
+    if config.collector.swl_map_max_entries == 0 {
+        return Err("collector.swl_map_max_entries must be > 0".to_string());
+    }
+    if config.collector.swl_map_max_entries > MAX_SWL_MAP_ENTRIES {
+        return Err(format!(
+            "collector.swl_map_max_entries must be at most {MAX_SWL_MAP_ENTRIES}              (each entry preallocates ~16.4 KiB of kernel memory)"
+        ));
     }
     let default_sort = match config.display.default_sort.as_str() {
         "ip" => SortMode::Ip,
@@ -430,7 +490,8 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         };
 
         // The range default must itself be internally consistent.
-        policy::resolve(&policy, None, &scope)?;
+        let eff = policy::resolve(&policy, None, &scope)?;
+        check_swl_enabled(&eff, config.experimental.enable_sliding_window_log, &scope)?;
 
         let mut overrides = HashMap::new();
         for ov in &entry.overrides {
@@ -459,7 +520,13 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
                 .into_fields(&format!("{scope} override {}", ov.ip))?;
             check_policy_bounds(&fields, &format!("{scope} override {}", ov.ip))?;
             // The merged result must be complete (inheritance fills what is missing).
-            policy::resolve(&policy, Some(&fields), &format!("{} ip {}", scope, ov.ip))?;
+            let ov_scope = format!("{} ip {}", scope, ov.ip);
+            let eff = policy::resolve(&policy, Some(&fields), &ov_scope)?;
+            check_swl_enabled(
+                &eff,
+                config.experimental.enable_sliding_window_log,
+                &ov_scope,
+            )?;
             if overrides.insert(ip, fields).is_some() {
                 return Err(format!("{scope}: duplicate override for ip {}", ov.ip));
             }
@@ -477,6 +544,7 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         refresh_interval_ms: config.collector.refresh_interval_ms,
         interface_scan_interval_secs: config.collector.interface_scan_interval_secs,
         map_max_entries: config.collector.map_max_entries,
+        swl_map_max_entries: config.collector.swl_map_max_entries,
         show_interface: config.display.show_interface,
         show_packets: config.display.show_packets,
         default_sort,
@@ -702,6 +770,102 @@ range = "10.0.0.1-10.0.0.2"
         let text = POLICY_EXAMPLE.replace("burst = \"4MiB\"", "burst = \"2GiB\"");
         let err = load_str(&text).unwrap_err();
         assert!(err.contains("at most 1GiB"), "{err}");
+    }
+
+    const SWL_POLICY: &str = r#"
+[network]
+bridge = "br0"
+
+[[ip_ranges]]
+name = "Range-A"
+range = "10.30.8.1-10.30.8.16"
+
+  [ip_ranges.policy]
+  rx_threshold = "1Gbps"
+  tx_threshold = "500Mbps"
+  window = "5m"
+  trigger_ratio = "80%"
+  rx_limit = "500Mbps"
+  tx_limit = "200Mbps"
+  limit_duration = "30m"
+  algorithm = "sliding_window_log"
+  limit_window = "10s"
+"#;
+
+    #[test]
+    fn swl_requires_explicit_experimental_switch() {
+        let err = load_str(SWL_POLICY).unwrap_err();
+        assert!(err.contains("enable_sliding_window_log"), "{err}");
+
+        let text = format!(
+            "{SWL_POLICY}
+[experimental]
+enable_sliding_window_log = true
+"
+        );
+        assert!(load_str(&text).is_ok());
+    }
+
+    #[test]
+    fn swl_switch_required_for_overrides_too() {
+        // Range default is plain GCRA; a single override switches to SWL — the gate
+        // must fire for the merged override policy too.
+        let base = r#"
+[network]
+bridge = "br0"
+
+[[ip_ranges]]
+name = "Range-A"
+range = "10.30.8.1-10.30.8.16"
+
+  [ip_ranges.policy]
+  rx_threshold = "1Gbps"
+  tx_threshold = "500Mbps"
+  window = "5m"
+  trigger_ratio = "80%"
+  rx_limit = "500Mbps"
+  tx_limit = "200Mbps"
+  limit_duration = "30m"
+  burst = "4MiB"
+
+  [[ip_ranges.overrides]]
+  ip = "10.30.8.3"
+  algorithm = "sliding_window_log"
+  limit_window = "10s"
+"#;
+        let err = load_str(base).unwrap_err();
+        assert!(err.contains("enable_sliding_window_log"), "{err}");
+
+        let text = format!("{base}\n[experimental]\nenable_sliding_window_log = true\n");
+        assert!(load_str(&text).is_ok());
+    }
+
+    #[test]
+    fn swl_map_capacity_validated() {
+        let cfg = load_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.swl_map_max_entries, 256); // conservative default
+
+        let text = EXAMPLE.replace(
+            "map_max_entries = 8192",
+            "map_max_entries = 8192
+swl_map_max_entries = 64",
+        );
+        assert_eq!(load_str(&text).unwrap().swl_map_max_entries, 64);
+
+        let text = EXAMPLE.replace(
+            "map_max_entries = 8192",
+            "map_max_entries = 8192
+swl_map_max_entries = 0",
+        );
+        assert!(load_str(&text).is_err());
+
+        let text = EXAMPLE.replace(
+            "map_max_entries = 8192",
+            "map_max_entries = 8192
+swl_map_max_entries = 999999",
+        );
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("16.4 KiB"), "{err}");
     }
 
     #[test]

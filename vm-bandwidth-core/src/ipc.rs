@@ -55,6 +55,12 @@ pub struct Status {
     pub dataplane_degraded: bool,
     #[serde(default)]
     pub rollback_failures_total: u64,
+    /// Sliding-window-log map: configured capacity vs entries currently installed.
+    /// Each entry preallocates ~16.4 KiB of kernel memory.
+    #[serde(default)]
+    pub swl_map_capacity: u32,
+    #[serde(default)]
+    pub swl_map_used: u32,
     pub ranges: Vec<RangeSummary>,
 }
 

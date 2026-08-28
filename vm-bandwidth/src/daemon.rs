@@ -521,6 +521,12 @@ impl Engine {
                  (the eBPF maps are sized once at startup); restart the daemon instead"
             );
         }
+        if new_cfg.swl_map_max_entries != cur.swl_map_max_entries {
+            anyhow::bail!(
+                "changing collector.swl_map_max_entries is not supported by hot reload \
+                 (the eBPF maps are sized once at startup); restart the daemon instead"
+            );
+        }
 
         let old_prefixes = prefix_set(&cur);
         let new_prefixes = prefix_set(&new_cfg);
@@ -639,6 +645,8 @@ impl Engine {
             config_watcher_last_error: self.config_watcher_last_error.clone(),
             dataplane_degraded: self.dataplane_degraded,
             rollback_failures_total: self.rollback_failures_total,
+            swl_map_capacity: self.config.load().swl_map_max_entries,
+            swl_map_used: self.swl_log.iter().filter_map(|i| i.ok()).count() as u32,
             ranges,
         }
     }
@@ -836,7 +844,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         .map_max_entries("MONITORED_IPS", whitelist_capacity)
         .map_max_entries("LIMIT_POLICIES", cfg.map_max_entries)
         .map_max_entries("LIMIT_STATE", cfg.map_max_entries)
-        .map_max_entries("SWL_LOG", cfg.map_max_entries)
+        // SWL rings are ~16.4 KiB each and preallocated; they get their own small
+        // capacity (config::swl_map_max_entries) instead of the general map size.
+        .map_max_entries("SWL_LOG", cfg.swl_map_max_entries)
         .map_max_entries("POLICER_STATS", cfg.map_max_entries)
         .load(object)
         .context(
