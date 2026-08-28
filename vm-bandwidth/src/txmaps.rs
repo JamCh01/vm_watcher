@@ -797,6 +797,276 @@ mod tests {
         m.assert_no_orphans();
     }
 
+    // ---------- rollback disarm-failure scenarios (merge blockers) ----------
+
+    /// A batch where a second flow fails so that rollback runs, used to exercise one
+    /// record's rollback while another record drives the abort.
+    fn batch_with_failing_flow(m: &mut FakeMaps, journal: &mut TxJournal, second_key: LimitKey) {
+        m.fail_next("write_fresh_state", second_key);
+        assert!(install_limit(m, journal, second_key, policy(ALGO_GCRA)).is_err());
+    }
+
+    // 13. Forward disarm fails during an UPDATE: the old policy and its state must
+    //     be completely untouched, no new state written, hard invariant intact.
+    #[test]
+    fn forward_disarm_failure_on_update_leaves_old_intact() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let k = key(20);
+        let old = policy(ALGO_GCRA);
+        install_limit(&mut m, &mut j, k, old).unwrap();
+        j = TxJournal::default();
+        m.log.clear();
+
+        m.fail_next("disarm_policy", k);
+        let mut new = policy(ALGO_GCRA);
+        new.rate_bps = 42;
+        assert!(install_limit(&mut m, &mut j, k, new).is_err());
+
+        let report = rollback_journal(&mut m, &mut w, &j);
+        assert_eq!(
+            m.policies.get(&k).copied(),
+            Some(old),
+            "old policy untouched"
+        );
+        assert_eq!(m.policies.get(&k).unwrap().rate_bps, 1_000_000);
+        assert!(m.artifact(&k, ALGO_GCRA), "old state untouched");
+        assert_eq!(
+            m.state.get(&k).copied(),
+            Some(ALGO_GCRA),
+            "state was never rewritten"
+        );
+        assert!(
+            !m.log.iter().any(|c| c.starts_with("write_fresh_state")),
+            "no new state write may happen: {:?}",
+            m.log
+        );
+        assert!(report.dataplane_consistent);
+        m.assert_invariants();
+    }
+
+    // 14. Forward disarm fails during a REMOVE: old policy+state stay intact and the
+    //     rollback must not rewrite the in-use state.
+    #[test]
+    fn forward_disarm_failure_on_remove_keeps_old_pair() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let k = key(21);
+        let old = policy(ALGO_GCRA);
+        install_limit(&mut m, &mut j, k, old).unwrap();
+        j = TxJournal::default();
+
+        m.fail_next("disarm_policy", k);
+        assert!(remove_limit(&mut m, &mut j, k).is_err());
+        m.log.clear();
+
+        let report = rollback_journal(&mut m, &mut w, &j);
+        assert_eq!(m.policies.get(&k).copied(), Some(old));
+        assert!(m.artifact(&k, ALGO_GCRA));
+        assert!(
+            m.log.is_empty(),
+            "rollback must not touch the live pair: {:?}",
+            m.log
+        );
+        assert!(report.dataplane_consistent);
+        m.assert_invariants();
+    }
+
+    // 15. Rollback cannot disarm the new policy: the new policy + its state stay (a
+    //     pair that satisfies the hard invariant), the old policy is NOT restored,
+    //     and the failure is reported with exact op and key.
+    #[test]
+    fn rollback_disarm_failure_keeps_new_pair_and_reports() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let (a, b) = (key(22), key(23));
+        let old = policy(ALGO_GCRA);
+        install_limit(&mut m, &mut j, a, old).unwrap();
+        j = TxJournal::default();
+
+        // Update A succeeds (old disarmed, new armed); B fails and drives rollback.
+        let mut new = policy(ALGO_GCRA);
+        new.rate_bps = 42;
+        install_limit(&mut m, &mut j, a, new).unwrap();
+        batch_with_failing_flow(&mut m, &mut j, b);
+
+        m.fail_next("disarm_policy", a);
+        let report = rollback_journal(&mut m, &mut w, &j);
+
+        assert_eq!(
+            m.policies.get(&a).copied(),
+            Some(new),
+            "new policy stays armed"
+        );
+        assert!(m.artifact(&a, ALGO_GCRA), "new state stays");
+        assert_ne!(
+            m.policies.get(&a).unwrap().rate_bps,
+            1_000_000,
+            "old policy must NOT be restored"
+        );
+        assert!(!report.dataplane_consistent);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].key, a);
+        assert!(
+            report.failures[0].op.starts_with("disarm new policy"),
+            "{}",
+            report.failures[0].op
+        );
+        m.assert_invariants();
+    }
+
+    // 16. Rollback disarms the new policy but clearing its state fails: the restore
+    //     of the old policy still proceeds (bounded orphan beats corrupted flow).
+    #[test]
+    fn rollback_clear_state_failure_still_restores_old() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let k = key(24);
+        install_limit(&mut m, &mut j, k, policy(ALGO_TOKEN_BUCKET)).unwrap();
+        j = TxJournal::default();
+
+        // bucket -> SWL switch: arming the new policy fails, so rollback must clear
+        // the fresh ring and restore the bucket policy.
+        m.fail_next("arm_policy", k);
+        assert!(install_limit(&mut m, &mut j, k, policy(ALGO_SLIDING_WINDOW_LOG)).is_err());
+
+        m.fail_next("clear_state", k);
+        let report = rollback_journal(&mut m, &mut w, &j);
+
+        let armed = m.policies.get(&k).expect("old policy restored");
+        assert_eq!(armed.algorithm, ALGO_TOKEN_BUCKET);
+        assert!(m.artifact(&k, ALGO_TOKEN_BUCKET), "old state restored");
+        // The ring could not be removed: bounded orphan, reported, invariant intact.
+        assert!(m.rings.contains_key(&k));
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].op.contains("clear new state"));
+        assert!(!report.dataplane_consistent);
+        m.assert_invariants();
+    }
+
+    // 17/18. Same as 15 but across algorithm switches in both directions: the armed
+    //        pair that stays behind is always complete (policy + matching artifact).
+    #[test]
+    fn rollback_disarm_failure_on_state_to_swl_switch() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let (a, b) = (key(25), key(26));
+        install_limit(&mut m, &mut j, a, policy(ALGO_TOKEN_BUCKET)).unwrap();
+        j = TxJournal::default();
+
+        install_limit(&mut m, &mut j, a, policy(ALGO_SLIDING_WINDOW_LOG)).unwrap();
+        batch_with_failing_flow(&mut m, &mut j, b);
+
+        m.fail_next("disarm_policy", a);
+        let report = rollback_journal(&mut m, &mut w, &j);
+        assert_eq!(
+            m.policies.get(&a).unwrap().algorithm,
+            ALGO_SLIDING_WINDOW_LOG,
+            "new SWL policy stays armed"
+        );
+        assert!(m.rings.contains_key(&a), "ring stays with the armed policy");
+        assert!(m.state.is_empty(), "bucket state was cleared forward");
+        assert!(!report.dataplane_consistent);
+        m.assert_invariants();
+    }
+
+    #[test]
+    fn rollback_disarm_failure_on_swl_to_state_switch() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let (a, b) = (key(27), key(28));
+        install_limit(&mut m, &mut j, a, policy(ALGO_SLIDING_WINDOW_LOG)).unwrap();
+        j = TxJournal::default();
+
+        install_limit(&mut m, &mut j, a, policy(ALGO_GCRA)).unwrap();
+        batch_with_failing_flow(&mut m, &mut j, b);
+
+        m.fail_next("disarm_policy", a);
+        let report = rollback_journal(&mut m, &mut w, &j);
+        assert_eq!(
+            m.policies.get(&a).unwrap().algorithm,
+            ALGO_GCRA,
+            "new GCRA policy stays armed"
+        );
+        assert!(
+            m.state.contains_key(&a),
+            "state stays with the armed policy"
+        );
+        assert!(m.rings.is_empty(), "ring was cleared forward");
+        assert!(!report.dataplane_consistent);
+        m.assert_invariants();
+    }
+
+    // 19. Same-algorithm update, rollback disarm fails: the NEW rate stays armed with
+    //     its state; the old policy is not resurrected.
+    #[test]
+    fn rollback_disarm_failure_on_same_algorithm_update() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let (a, b) = (key(29), key(30));
+        install_limit(&mut m, &mut j, a, policy(ALGO_GCRA)).unwrap();
+        j = TxJournal::default();
+
+        let mut new = policy(ALGO_GCRA);
+        new.rate_bps = 2_000_000;
+        install_limit(&mut m, &mut j, a, new).unwrap();
+        batch_with_failing_flow(&mut m, &mut j, b);
+
+        m.fail_next("disarm_policy", a);
+        let report = rollback_journal(&mut m, &mut w, &j);
+        assert_eq!(m.policies.get(&a).copied(), Some(new));
+        assert_eq!(m.policies.get(&a).unwrap().rate_bps, 2_000_000);
+        assert!(m.artifact(&a, ALGO_GCRA));
+        assert!(!report.dataplane_consistent);
+        m.assert_invariants();
+    }
+
+    // 20. Mixed batch: one record's rollback fails, the others still roll back, and
+    //     the report carries the complete picture.
+    #[test]
+    fn mixed_batch_continues_after_one_record_fails() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let (a, b, c) = (key(31), key(32), key(33));
+        install_limit(&mut m, &mut j, a, policy(ALGO_GCRA)).unwrap();
+        install_limit(&mut m, &mut j, b, policy(ALGO_TOKEN_BUCKET)).unwrap();
+        j = TxJournal::default();
+
+        // A: update (succeeds, becomes armed); B: remove (succeeds); C: install fails.
+        let mut a2 = policy(ALGO_GCRA);
+        a2.rate_bps = 7;
+        install_limit(&mut m, &mut j, a, a2).unwrap();
+        remove_limit(&mut m, &mut j, b).unwrap();
+        m.fail_next("write_fresh_state", c);
+        assert!(install_limit(&mut m, &mut j, c, policy(ALGO_GCRA)).is_err());
+
+        // During rollback A's disarm fails; B must still be restored.
+        m.fail_next("disarm_policy", a);
+        let report = rollback_journal(&mut m, &mut w, &j);
+
+        assert_eq!(report.attempted, 3);
+        assert_eq!(report.succeeded, 2, "C no-op and B restore succeed");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].key, a);
+        // A keeps the new pair; B is fully restored; C absent.
+        assert_eq!(m.policies.get(&a).copied(), Some(a2));
+        assert!(m.artifact(&a, ALGO_GCRA));
+        let b_pol = m.policies.get(&b).expect("B restored");
+        assert_eq!(b_pol.algorithm, ALGO_TOKEN_BUCKET);
+        assert!(m.artifact(&b, ALGO_TOKEN_BUCKET));
+        assert!(!m.policies.contains_key(&c));
+        assert!(!report.dataplane_consistent);
+        m.assert_invariants();
+    }
+
     // 12. Mixed batch with a mid-batch failure: after rollback the observable
     //     dataplane is exactly the pre-batch state (modulo fresh state resets, which
     //     are unrecoverable by design) and every invariant holds.
