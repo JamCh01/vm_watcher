@@ -371,14 +371,27 @@ impl Collector {
             self.ipv6.tx_bps = d6.tx_bytes as f64 * 8.0 / elapsed_secs;
         }
 
+        // Cumulative counters and instantaneous rates are updated separately: the rates
+        // are recomputed purely from THIS poll's deltas. Zero every rate field first,
+        // then fill what moved — a direction without a new delta can never leak the
+        // previous round's value into this one.
+        for stats in self.totals.values_mut() {
+            stats.rx_bps = 0.0;
+            stats.tx_bps = 0.0;
+            stats.rx_dropped_bps = 0.0;
+            stats.tx_dropped_bps = 0.0;
+        }
+
         for (ip, delta) in &deltas {
             let stats = self.totals.entry(*ip).or_default();
             stats.rx_bytes += delta.rx_bytes;
             stats.tx_bytes += delta.tx_bytes;
             stats.rx_packets += delta.rx_packets;
             stats.tx_packets += delta.tx_packets;
-            stats.rx_bps = delta.rx_bytes as f64 * 8.0 / elapsed_secs;
-            stats.tx_bps = delta.tx_bytes as f64 * 8.0 / elapsed_secs;
+            if elapsed_secs > 0.0 {
+                stats.rx_bps = delta.rx_bytes as f64 * 8.0 / elapsed_secs;
+                stats.tx_bps = delta.tx_bytes as f64 * 8.0 / elapsed_secs;
+            }
         }
 
         // Policer verdicts: same delta discipline, keyed by (ip, direction) and folded
@@ -413,15 +426,6 @@ impl Collector {
             }
         }
         self.prev_policer = cur_policer;
-
-        for (ip, stats) in self.totals.iter_mut() {
-            if !deltas.contains_key(ip) {
-                stats.rx_bps = 0.0;
-                stats.tx_bps = 0.0;
-                stats.rx_dropped_bps = 0.0;
-                stats.tx_dropped_bps = 0.0;
-            }
-        }
 
         // Per-range aggregation over OBSERVED IPs only (the LPM-trie whitelist makes
         // ranges arbitrarily large, so enumerating them is impossible by design).
