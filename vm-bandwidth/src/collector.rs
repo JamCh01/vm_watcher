@@ -105,6 +105,15 @@ pub struct Snapshot {
     pub ranges: Vec<RangeStats>,
 }
 
+/// Per-CPU map values aggregated for one poll — the boundary between reading the
+/// kernel maps and the pure delta math (see [`Collector::apply_poll`]).
+#[derive(Debug, Default)]
+pub struct PollInputs {
+    pub cur: HashMap<TrafficKey, TrafficValue>,
+    pub cur6: HashMap<TrafficKey6, TrafficValue>,
+    pub cur_policer: HashMap<LimitKey, PolicerStats>,
+}
+
 /// One collector poll: the TUI-facing snapshot plus per-IP cumulative totals
 /// (aggregated across all TAPs) for the limiter's rolling-window deltas.
 #[derive(Debug)]
@@ -234,6 +243,62 @@ impl Collector {
             }
         }
 
+        let mut cur6: HashMap<TrafficKey6, TrafficValue> = HashMap::new();
+        for item in traffic6.iter() {
+            match item {
+                Ok((key, values)) => {
+                    let mut acc = TrafficValue::default();
+                    for v in values.iter() {
+                        acc.rx_bytes += v.rx_bytes;
+                        acc.tx_bytes += v.tx_bytes;
+                        acc.rx_packets += v.rx_packets;
+                        acc.tx_packets += v.tx_packets;
+                    }
+                    cur6.insert(key, acc);
+                }
+                Err(e) => log::warn!("reading TRAFFIC6 map: {e}"),
+            }
+        }
+        let mut cur_policer: HashMap<LimitKey, PolicerStats> = HashMap::new();
+        for item in policer.iter() {
+            match item {
+                Ok((key, values)) => {
+                    let mut acc = PolicerStats::default();
+                    for v in values.iter() {
+                        acc.passed_bytes += v.passed_bytes;
+                        acc.passed_packets += v.passed_packets;
+                        acc.dropped_bytes += v.dropped_bytes;
+                        acc.dropped_packets += v.dropped_packets;
+                    }
+                    cur_policer.insert(key, acc);
+                }
+                Err(e) => log::warn!("reading POLICER_STATS map: {e}"),
+            }
+        }
+
+        let inputs = PollInputs {
+            cur,
+            cur6,
+            cur_policer,
+        };
+        self.apply_poll(inputs, elapsed_secs, ranges)
+    }
+
+    /// Pure delta/rate math over one poll's aggregated map values. Split out of
+    /// [`Collector::poll`] so consecutive-poll semantics (rate resets, eviction,
+    /// TAP rebuilds) are unit-testable without kernel maps.
+    fn apply_poll(
+        &mut self,
+        inputs: PollInputs,
+        elapsed_secs: f64,
+        ranges: &[IpRange],
+    ) -> PollResult {
+        let PollInputs {
+            cur,
+            cur6,
+            cur_policer,
+        } = inputs;
+
         // Per-IP deltas. New keys (first observation) get no delta: their rate starts at 0.
         // saturating_sub turns counter resets into zero deltas, never negative rates.
         let mut deltas: HashMap<u32, Delta> = HashMap::new();
@@ -271,22 +336,6 @@ impl Collector {
 
         // IPv6: identical delta logic, collapsed into one grand total — there is no
         // per-address breakdown and no IPv6 limit policy to feed.
-        let mut cur6: HashMap<TrafficKey6, TrafficValue> = HashMap::new();
-        for item in traffic6.iter() {
-            match item {
-                Ok((key, values)) => {
-                    let mut acc = TrafficValue::default();
-                    for v in values.iter() {
-                        acc.rx_bytes += v.rx_bytes;
-                        acc.tx_bytes += v.tx_bytes;
-                        acc.rx_packets += v.rx_packets;
-                        acc.tx_packets += v.tx_packets;
-                    }
-                    cur6.insert(key, acc);
-                }
-                Err(e) => log::warn!("reading TRAFFIC6 map: {e}"),
-            }
-        }
         let mut d6 = Delta::default();
         if elapsed_secs > 0.0 {
             for (key, value) in &cur6 {
@@ -335,22 +384,6 @@ impl Collector {
         // Policer verdicts: same delta discipline, keyed by (ip, direction) and folded
         // into the same per-IP totals. A dropped packet was already counted in TRAFFIC,
         // so the entry exists; or_default keeps this safe either way.
-        let mut cur_policer: HashMap<LimitKey, PolicerStats> = HashMap::new();
-        for item in policer.iter() {
-            match item {
-                Ok((key, values)) => {
-                    let mut acc = PolicerStats::default();
-                    for v in values.iter() {
-                        acc.passed_bytes += v.passed_bytes;
-                        acc.passed_packets += v.passed_packets;
-                        acc.dropped_bytes += v.dropped_bytes;
-                        acc.dropped_packets += v.dropped_packets;
-                    }
-                    cur_policer.insert(key, acc);
-                }
-                Err(e) => log::warn!("reading POLICER_STATS map: {e}"),
-            }
-        }
         if elapsed_secs > 0.0 {
             for (key, value) in &cur_policer {
                 let Some(prev) = self.prev_policer.get(key) else {
@@ -492,6 +525,256 @@ mod tests {
                                                             // A key gone from the map stops being tracked: it must re-idle from zero.
         assert!(t.observe(&nothing, &nothing).is_empty());
         assert!(t.observe(&present, &nothing).is_empty());
+    }
+
+    // ---------- consecutive-poll tests (drive the pure apply_poll directly) ----------
+
+    fn ip4(a: u8, b: u8, c: u8, d: u8) -> u32 {
+        u32::from_be_bytes([a, b, c, d])
+    }
+
+    fn tkey(ifindex: u32, ip: u32) -> TrafficKey {
+        TrafficKey { ifindex, ipv4: ip }
+    }
+
+    fn tval(rx_bytes: u64, tx_bytes: u64) -> TrafficValue {
+        TrafficValue {
+            rx_bytes,
+            tx_bytes,
+            rx_packets: rx_bytes / 100,
+            tx_packets: tx_bytes / 100,
+        }
+    }
+
+    /// One per-direction policer entry with `dropped` dropped bytes.
+    fn pstats(dropped: u64) -> PolicerStats {
+        PolicerStats {
+            passed_bytes: 1000,
+            passed_packets: 10,
+            dropped_bytes: dropped,
+            dropped_packets: dropped / 100,
+        }
+    }
+
+    /// One poll round at a fixed 1s cadence over one range covering every address,
+    /// so the snapshot carries the per-IP instantaneous stats the assertions need.
+    fn round(
+        c: &mut Collector,
+        traffic: &[(TrafficKey, TrafficValue)],
+        policer: &[(LimitKey, PolicerStats)],
+    ) -> PollResult {
+        let inputs = PollInputs {
+            cur: traffic.iter().copied().collect(),
+            cur6: HashMap::new(),
+            cur_policer: policer.iter().copied().collect(),
+        };
+        let all = IpRange {
+            name: "all".to_string(),
+            start: 0,
+            end: u32::MAX,
+        };
+        c.apply_poll(inputs, 1.0, &[all])
+    }
+
+    fn ip_stats(r: &PollResult, ip: u32) -> &IpStats {
+        r.snapshot.ranges[0]
+            .ips
+            .iter()
+            .find(|(i, _)| *i == ip)
+            .map(|(_, s)| s)
+            .expect("ip present in snapshot")
+    }
+
+    // 1. First round is the baseline: no deltas, zero rates.
+    #[test]
+    fn first_round_is_baseline() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 1);
+        round(&mut c, &[(tkey(3, ip), tval(5000, 0))], &[]);
+        let r = round(&mut c, &[(tkey(3, ip), tval(9000, 0))], &[]);
+        assert_eq!(ip_stats(&r, ip).rx_bytes, 4000);
+        assert!((ip_stats(&r, ip).rx_bps - 32000.0).abs() < 1e-9);
+    }
+
+    // 2. A policer drop delta shows up as an RX drop rate.
+    #[test]
+    fn rx_drop_appears_on_delta() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 2);
+        let k = LimitKey::new(ip, vm_bandwidth_common::DIR_RX);
+        round(&mut c, &[(tkey(3, ip), tval(1000, 0))], &[(k, pstats(0))]);
+        let r = round(&mut c, &[(tkey(3, ip), tval(2000, 0))], &[(k, pstats(400))]);
+        assert!((ip_stats(&r, ip).rx_dropped_bps - 3200.0).abs() < 1e-9);
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 400);
+    }
+
+    // 3. Traffic keeps flowing but there is no NEW drop: the drop rate must go back
+    //    to zero this round (regression: it used to linger from the previous round).
+    #[test]
+    fn drop_rate_resets_when_no_new_drops() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 3);
+        let k = LimitKey::new(ip, vm_bandwidth_common::DIR_RX);
+        round(&mut c, &[(tkey(3, ip), tval(1000, 0))], &[(k, pstats(0))]);
+        let r = round(&mut c, &[(tkey(3, ip), tval(2000, 0))], &[(k, pstats(400))]);
+        assert!(ip_stats(&r, ip).rx_dropped_bps > 0.0);
+        // Third round: fresh traffic delta, unchanged policer counters.
+        let r = round(&mut c, &[(tkey(3, ip), tval(3000, 0))], &[(k, pstats(400))]);
+        assert_eq!(
+            ip_stats(&r, ip).rx_dropped_bps,
+            0.0,
+            "phantom drop rate lingered across polls"
+        );
+        // Cumulative dropped bytes are NOT reset.
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 400);
+    }
+
+    // 4. Only TX drops this round: RX drop rate must be zero.
+    #[test]
+    fn tx_only_drops_zero_rx_rate() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 4);
+        let rx = LimitKey::new(ip, vm_bandwidth_common::DIR_RX);
+        let tx = LimitKey::new(ip, vm_bandwidth_common::DIR_TX);
+        round(
+            &mut c,
+            &[(tkey(3, ip), tval(1000, 1000))],
+            &[(rx, pstats(0)), (tx, pstats(0))],
+        );
+        let r = round(
+            &mut c,
+            &[(tkey(3, ip), tval(2000, 2000))],
+            &[(rx, pstats(300)), (tx, pstats(500))],
+        );
+        assert!(ip_stats(&r, ip).rx_dropped_bps > 0.0);
+        assert!(ip_stats(&r, ip).tx_dropped_bps > 0.0);
+        // Next round: only TX drops again.
+        let r = round(
+            &mut c,
+            &[(tkey(3, ip), tval(3000, 3000))],
+            &[(rx, pstats(300)), (tx, pstats(900))],
+        );
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bps, 0.0);
+        assert!(ip_stats(&r, ip).tx_dropped_bps > 0.0);
+    }
+
+    // 5. Only RX drops this round: TX drop rate must be zero.
+    #[test]
+    fn rx_only_drops_zero_tx_rate() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 5);
+        let rx = LimitKey::new(ip, vm_bandwidth_common::DIR_RX);
+        let tx = LimitKey::new(ip, vm_bandwidth_common::DIR_TX);
+        round(
+            &mut c,
+            &[(tkey(3, ip), tval(1000, 1000))],
+            &[(rx, pstats(0)), (tx, pstats(0))],
+        );
+        let r = round(
+            &mut c,
+            &[(tkey(3, ip), tval(2000, 2000))],
+            &[(rx, pstats(300)), (tx, pstats(500))],
+        );
+        assert!(ip_stats(&r, ip).rx_dropped_bps > 0.0);
+        assert!(ip_stats(&r, ip).tx_dropped_bps > 0.0);
+        let r = round(
+            &mut c,
+            &[(tkey(3, ip), tval(3000, 3000))],
+            &[(rx, pstats(700)), (tx, pstats(500))],
+        );
+        assert!(ip_stats(&r, ip).rx_dropped_bps > 0.0);
+        assert_eq!(ip_stats(&r, ip).tx_dropped_bps, 0.0);
+    }
+
+    // 6. Policer counters going backwards (session reset) saturate to a zero delta.
+    #[test]
+    fn policer_counter_reset_is_safe() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 6);
+        let k = LimitKey::new(ip, vm_bandwidth_common::DIR_RX);
+        round(&mut c, &[(tkey(3, ip), tval(1000, 0))], &[(k, pstats(900))]);
+        let r = round(&mut c, &[(tkey(3, ip), tval(2000, 0))], &[(k, pstats(0))]);
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bps, 0.0);
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 0);
+    }
+
+    // 7. TAP rebuild (new ifindex for the same IP): no phantom deltas, counting
+    //    resumes from the new baseline.
+    #[test]
+    fn ifindex_rebuild_rebaselines() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 7);
+        round(&mut c, &[(tkey(5, ip), tval(1000, 0))], &[]);
+        let r = round(&mut c, &[(tkey(5, ip), tval(2000, 0))], &[]);
+        assert_eq!(ip_stats(&r, ip).rx_bytes, 1000);
+        // TAP gone: prune like rescan does.
+        c.prune_ifindexes(&HashSet::new());
+        round(&mut c, &[], &[]);
+        // Recreated TAP, fresh counters.
+        round(&mut c, &[(tkey(9, ip), tval(500, 0))], &[]);
+        let r = round(&mut c, &[(tkey(9, ip), tval(800, 0))], &[]);
+        assert!(
+            (ip_stats(&r, ip).rx_bps - 2400.0).abs() < 1e-9,
+            "new baseline counted"
+        );
+    }
+
+    // 8. Idle eviction: a frozen key is reported after the threshold; when the daemon
+    //    removes it and traffic returns on a fresh entry, no wrapped spike appears.
+    #[test]
+    fn idle_eviction_and_reappearance() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 8);
+        let key = tkey(3, ip);
+        // Baseline + enough frozen rounds to trip the eviction threshold.
+        round(&mut c, &[(key, tval(1000, 0))], &[]);
+        let mut stale = Vec::new();
+        for _ in 0..IDLE_EVICT_POLLS {
+            let r = round(&mut c, &[(key, tval(1000, 0))], &[]);
+            stale = r.stale_traffic;
+        }
+        assert_eq!(stale, vec![key]);
+        // Daemon removed the key; the IP's totals are gone with it.
+        let r = round(&mut c, &[], &[]);
+        assert!(!r.totals.contains_key(&ip));
+        // Traffic returns on a recreated entry: rebaselined, no spike.
+        round(&mut c, &[(key, tval(100, 0))], &[]);
+        let r = round(&mut c, &[(key, tval(160, 0))], &[]);
+        assert!((ip_stats(&r, ip).rx_bps - 480.0).abs() < 1e-9);
+    }
+
+    // 9. The same IP on two TAPs aggregates into one total.
+    #[test]
+    fn same_ip_across_taps_aggregates() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 9);
+        round(
+            &mut c,
+            &[(tkey(3, ip), tval(1000, 0)), (tkey(4, ip), tval(500, 0))],
+            &[],
+        );
+        let r = round(
+            &mut c,
+            &[(tkey(3, ip), tval(2000, 0)), (tkey(4, ip), tval(900, 0))],
+            &[],
+        );
+        assert_eq!(ip_stats(&r, ip).rx_bytes, 1400);
+        assert!((ip_stats(&r, ip).rx_bps - (1400.0 * 8.0)).abs() < 1e-9);
+    }
+
+    // 10. Traffic and policer counters first appear in different rounds: each gets its
+    //     own baseline when it appears.
+    #[test]
+    fn traffic_and_policer_appear_in_different_rounds() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 10);
+        let k = LimitKey::new(ip, vm_bandwidth_common::DIR_RX);
+        round(&mut c, &[(tkey(3, ip), tval(1000, 0))], &[]);
+        // Policer entry appears one round late: baseline round for it.
+        round(&mut c, &[(tkey(3, ip), tval(2000, 0))], &[(k, pstats(100))]);
+        let r = round(&mut c, &[(tkey(3, ip), tval(3000, 0))], &[(k, pstats(350))]);
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 250);
+        assert!((ip_stats(&r, ip).rx_dropped_bps - 2000.0).abs() < 1e-9);
     }
 
     #[test]
