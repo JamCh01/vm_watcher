@@ -1,0 +1,128 @@
+# 内核/数据面验证手册（仅限一次性测试环境）
+
+本手册的所有步骤都**禁止在生产宿主机执行**：它们会创建网络设备、挂载测试程序、
+注入流量。请在一台可随时销毁的 Linux VM 或 `unshare -n` netns 环境中进行。
+
+约定：
+
+```bash
+TESTHOST="一次性 VM/netns"      # 内核版本尽量接近生产（生产当前为 6.12）
+BIN=./vm-bandwidth-monitor      # 与生产同版本构建（release，含 eBPF 对象）
+```
+
+---
+
+## 1. VLAN / QinQ 解析验证（用户态向量测试已通过，此处验证真实内核路径）
+
+用户态已用帧向量钉死判定逻辑（`vm-bandwidth-common` 的 `vlan_walk` 测试）；
+真实内核验证走 netns + veth + VLAN 子接口：
+
+```bash
+# 准备：一对 veth，一端模拟 "VM"，另一端挂本程序
+ip netns add vmtest
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns vmtest
+ip link add br-test type bridge
+ip link set veth0 master br-test
+ip link set br-test up
+
+# VM 侧打单层 802.1Q 标签
+ip netns exec vmtest ip link add link veth1 name veth1.100 type vlan id 100
+ip netns exec vmtest ip addr add 10.99.0.2/24 dev veth1.100
+ip netns exec vmtest ip link set veth1 up
+ip netns exec vmtest ip link set veth1.100 up
+
+# 配置：把 10.99.0.0 段加入白名单，bridge = br-test
+# 启动 daemon（前台，RUST_LOG=debug），然后：
+ip netns exec vmtest ping -c 5 10.99.0.1 || true     # 产生带标签的 ICMP
+```
+
+判定：
+
+- [ ] `--ui` / IPC 中该段出现 10.99.0.2 且计数随流量增长（单层 802.1Q 进入计数与限速）；
+- [ ] 同法用 `type vlan` 之上再套一层验证 QinQ（内层计数正确）；
+- [ ] 三层标签：计数不增长且不崩溃（fail-open 放弃）；
+- [ ] 截断帧：`scapy`/`mausezahn` 发送短于 4 字节标签的帧，程序不退出、不误计。
+
+清理：`ip netns del vmtest; ip link del br-test`。
+
+## 2. GSO/TSO/超大 skb 判定（oversized 观测项）
+
+数据面对 `len > 65535` 的包放行（`MAX_POLICED_LEN`），并用 `OVERSIZED` map 计数
+（仅在该流有武装策略时）。判定该环境是否真的会把超大帧递给 TAP 的 TC 挂钩：
+
+```bash
+# 0) 给测试段的策略配一个很低的阈值使其必然 LIMITED（观察期保持武装）
+# 1) 基线：默认 offload
+ethtool -k "$TAP" | grep -E 'gso|gro|tso|gso_max_size'
+cat /sys/class/net/"$TAP"/gso_max_size        # 若 > 65536 说明支持 BIG TCP
+# 2) 跑满流量（测试 VM 内 iperf3 大窗口多线程），读取：
+#    - IPC Status.oversized_rx_packets / oversized_tx_packets（或 vmbw_oversized_* 指标）
+# 3) 关闭 offload 再测一轮对照：
+ethtool -K "$TAP" tso off gso off gro off
+# 4) 若内核支持 BIG TCP，打开再测：
+ip link set dev "$TAP" gso_max_size 196608     # 仅测试机！
+```
+
+判定矩阵（把结果写回发布说明）：
+
+| 场景 | oversized 计数 | 结论 |
+|---|---|---|
+| 默认 | 0 | 该平台无超大帧抵达，当前放行语义无实际绕过 |
+| 默认 | >0 且随流量增长 | **真实绕过存在**：需要实现按实际字节收费的超大帧处理（不得 clamp 低估、不得误杀），升级为发布阻断项 |
+| 仅 BIG TCP 打开 | >0 | 记录为已知限制，并在平台侧禁用 BIG TCP 或实现处理 |
+
+**未在此完成裁决前，不得声称 GSO 风险已关闭。**
+
+## 3. 传统（<6.6）内核的 legacy TC 回退
+
+生产为 6.12（TCX 路径），旧内核回退仅由 `FakeBackend` 测试覆盖。需要一台 <6.6
+的一次性内核（如 Debian 12 的 6.1）：
+
+- [ ] 启动后日志为 "reusing existing clsact" 或 "created clsact for legacy TC attach"
+      （不是 TCX）；
+- [ ] `tc filter show dev $TAP ingress`/`egress` 能看到本程序 filter；
+- [ ] 停止后：本程序创建的 clsact 按设计**保留**（日志有说明），根 qdisc 未动；
+- [ ] 预先 `tc qdisc add dev $TAP ingress`（legacy 独占 qdisc）再启动：
+      日志应诊断 "legacy ingress qdisc conflicts"，且该 TAP 无半挂载
+      （没有只挂 ingress 不挂 egress 的状态）。
+
+## 4. SWL 性能/语义基准（仅在显式启用后）
+
+```toml
+[experimental]
+enable_sliding_window_log = true
+[collector]
+swl_map_max_entries = 4
+```
+
+- [ ] 低包率流（< 1024/limit_window pps）：限速贴合配额（对照 `swl.rs` 参考模型）；
+- [ ] 高包率流（远超 1024/window pps）：判定偏宽松（放行量超配额），与模型预测一致；
+- [ ] `bpftool map show` 记录 `SWL_LOG` 实际 `bytes_memlock`/内存，核对 `条数 × 16.4 KiB`；
+- [ ] `perf top` 观察 `swl_police` 占比，记录该算法可接受的包率上限（写回文档）。
+
+## 5. 双 TAP 源地址欺骗测试（验证外部反欺骗是否真的生效）
+
+验证的是**平台侧**的反欺骗（本程序不实现），在测试环境复制生产拓扑：
+
+```bash
+# 两台测试 VM（或两个 netns），各自 TAP 挂同一桥：
+#   VM-A 合法持有 10.0.0.10；VM-B 合法持有 10.0.0.20
+# 在 VM-B 内伪造 A 的源地址发包：
+ip addr add 10.0.0.99/24 dev eth0          # B 自己的临时地址
+# 用 scapy/mausezahn 以 src=10.0.0.10 发送流量
+```
+
+判定：
+
+- [ ] **平台反欺骗已生效**：伪造源地址的包在桥/过滤层被丢弃，本程序计数中
+      10.0.0.10 的流量不来自 B 的 TAP；
+- [ ] 若伪造包通过了过滤层：说明外部反欺骗**未生效**，`[security]` 确认不成立——
+      必须先修平台过滤，而不是把 `acknowledge` 置真。
+
+同样的步骤对 IPv6 源地址重复一次（隐私地址轮换场景）。
+
+---
+
+以上任何一项的结果变化（内核升级、offload 策略变化、平台过滤规则变化）都应重新
+执行对应章节，并把结论记录到发布说明与 `known-limitations`。
