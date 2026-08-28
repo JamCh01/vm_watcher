@@ -87,6 +87,20 @@ pub struct Status {
     pub dataplane_degraded: bool,
     #[serde(default)]
     pub rollback_failures_total: u64,
+    /// Operational counters, cumulative since daemon start (additive protocol
+    /// fields: older daemons omit them, `#[serde(default)]` → 0).
+    ///
+    /// `metrics_push_successes_total` can lag reality by one push interval: a
+    /// push cannot observe its own success while it is still running, so the
+    /// value is final only once the NEXT push completes.
+    #[serde(default)]
+    pub tap_attach_failures_total: u64,
+    #[serde(default)]
+    pub metrics_push_successes_total: u64,
+    #[serde(default)]
+    pub metrics_push_failures_total: u64,
+    #[serde(default)]
+    pub metrics_push_skipped_total: u64,
     /// Anti-spoofing contract (see config `[security]`): which mode is in effect,
     /// whether THIS program enforces it (currently always false — external), and that
     /// the operator acknowledgement is on file.
@@ -276,7 +290,38 @@ mod tests {
         let json = r#"{"type":"status","generation":1,"config_loaded_at":"","last_reload_at":"","last_reload_ok":true,"last_reload_error":"","bridge":"br0","tap_count":0,"config_watcher_healthy":true,"config_watcher_errors_total":0,"config_watcher_last_error":"","dataplane_degraded":false,"rollback_failures_total":0,"swl_map_capacity":0,"swl_map_used":0,"ranges":[]}"#;
         let resp: Response = serde_json::from_str(json).unwrap();
         match resp {
-            Response::Status(s) => assert_eq!(s.protocol_version, 0),
+            Response::Status(s) => {
+                assert_eq!(s.protocol_version, 0);
+                // Additive operational fields: an older daemon omits them entirely
+                // and the client must read zeros, not an error.
+                assert_eq!(s.tap_attach_failures_total, 0);
+                assert_eq!(s.metrics_push_successes_total, 0);
+                assert_eq!(s.metrics_push_failures_total, 0);
+                assert_eq!(s.metrics_push_skipped_total, 0);
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operational_counters_round_trip() {
+        let status = Status {
+            protocol_version: PROTOCOL_VERSION,
+            tap_attach_failures_total: 7,
+            metrics_push_successes_total: 100,
+            metrics_push_failures_total: 3,
+            metrics_push_skipped_total: 1,
+            ..Default::default()
+        };
+        let frame = encode(&Response::Status(Box::new(status))).unwrap();
+        let back: Response = decode(&frame[4..]).unwrap();
+        match back {
+            Response::Status(s) => {
+                assert_eq!(s.tap_attach_failures_total, 7);
+                assert_eq!(s.metrics_push_successes_total, 100);
+                assert_eq!(s.metrics_push_failures_total, 3);
+                assert_eq!(s.metrics_push_skipped_total, 1);
+            }
             other => panic!("expected status, got {other:?}"),
         }
     }

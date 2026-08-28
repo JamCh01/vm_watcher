@@ -603,6 +603,11 @@ push_interval_secs = 60
 TRAFFIC 记的是限速前的流量需求，这组才是实际放行/丢弃量。范围趋势用
 `sum(rate(...{range="段名"}))` 聚合段内全部 IP；单 IP 与范围的 RX/TX 两个方向查询并行发出。
 
+另有四条进程级运维累计计数器（固定标签 `instance="process"`，基数恒定）：
+`vmbw_tap_attach_failures_total`（TAP 挂载失败）、`vmbw_metrics_push_{successes,failures,skipped}_total`（推送成功/失败/因上一推送未结束而跳过）。
+注意成功计数天然滞后一轮：一次推送在自身完成前无法计入自己的成功，payload
+里携带的是本次推送开始前的累计值；失败与跳过在渲染时即为当前值。
+
 ## 实现要点
 
 - **单一 eBPF 对象，挂载到所有 TAP**：对象只加载一次（验证器只跑一遍），

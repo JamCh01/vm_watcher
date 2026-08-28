@@ -155,8 +155,12 @@ struct Engine {
     policer_stats: PerCpuHashMap<MapData, LimitKey, PolicerStats>,
     /// Shared HTTP client for the VictoriaMetrics push.
     http: reqwest::Client,
-    /// At most one metrics push in flight (see push_metrics).
-    push_inflight: Arc<std::sync::atomic::AtomicBool>,
+    /// Single-flight flag plus process-lifetime push outcome counters
+    /// (see push_metrics / PushCounters).
+    push_counters: Arc<PushCounters>,
+    /// TAP attach failures since daemon start (any attach class incl. backoff
+    /// rejections); engine-owned, updated only by the engine task.
+    tap_attach_failures_total: u64,
 
     epoch: std::time::Instant,
 }
@@ -250,29 +254,39 @@ impl Engine {
             &self.oversized,
             now_ms,
         ));
+        lines.push_str(&crate::metrics::render_prom_lines_process(
+            self.tap_attach_failures_total,
+            self.push_counters.successes(),
+            self.push_counters.failures(),
+            self.push_counters.skipped(),
+            now_ms,
+        ));
         if lines.is_empty() {
             return;
         }
-        if self
-            .push_inflight
-            .swap(true, std::sync::atomic::Ordering::Acquire)
-        {
+        let Some(guard) = self.push_counters.try_start() else {
             log::debug!("metrics push skipped: previous push still in flight");
             return;
-        }
-        let flag = self.push_inflight.clone();
+        };
+        let counters = self.push_counters.clone();
         let http = self.http.clone();
         let url = cfg.metrics_url.clone();
         tokio::spawn(async move {
-            // The flag lives in an RAII guard: normal completion, HTTP errors,
-            // cancellation and panic unwinding all drop it and release the flag.
-            let _guard = PushGuard(flag);
+            // The in-flight flag lives in an RAII guard: normal completion, HTTP
+            // errors, cancellation and panic unwinding all drop it and release it.
+            let _guard = guard;
             match crate::metrics::push(&http, &url, &lines).await {
-                Ok(()) => log::debug!("metrics push: {} line(s)", lines.lines().count()),
-                Err(e) => log::warn!(
-                    "metrics push to {} failed: {e:#}",
-                    vm_bandwidth_core::config::safe_endpoint_display(&url)
-                ),
+                Ok(()) => {
+                    counters.note_success();
+                    log::debug!("metrics push: {} line(s)", lines.lines().count());
+                }
+                Err(e) => {
+                    counters.note_failure();
+                    log::warn!(
+                        "metrics push to {} failed: {e:#}",
+                        vm_bandwidth_core::config::safe_endpoint_display(&url)
+                    );
+                }
             }
         });
     }
@@ -291,6 +305,7 @@ impl Engine {
         match interface::discover_taps(&self.bridge) {
             Ok(found) => {
                 let (added, failed) = self.manager.reconcile(&found);
+                self.tap_attach_failures_total += failed as u64;
                 if added > 0 || failed > 0 {
                     log::info!("scan: {added} attached, {failed} failed");
                 }
@@ -669,6 +684,10 @@ impl Engine {
             config_watcher_last_error: self.config_watcher_last_error.clone(),
             dataplane_degraded: self.dataplane_degraded,
             rollback_failures_total: self.rollback_failures_total,
+            tap_attach_failures_total: self.tap_attach_failures_total,
+            metrics_push_successes_total: self.push_counters.successes(),
+            metrics_push_failures_total: self.push_counters.failures(),
+            metrics_push_skipped_total: self.push_counters.skipped(),
             anti_spoof_mode: self.config.load().ip_ownership.clone(),
             anti_spoof_enforced_by_program: false,
             anti_spoof_acknowledged: true,
@@ -971,9 +990,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     // 4. Discover TAPs and attach (one loaded object, one link pair per TAP).
     let mut manager = AttachManager::new(base)?;
     let mut taps = Vec::new();
+    let mut startup_attach_failures = 0usize;
     match interface::discover_taps(&cfg.bridge) {
         Ok(found) => {
             let (added, failed) = manager.reconcile(&found);
+            startup_attach_failures = failed;
             log::info!("initial scan: {added} TAP(s) attached, {failed} failed");
             taps = manager.taps();
         }
@@ -1018,7 +1039,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         traffic6,
         policer_stats,
         http: crate::metrics::client(),
-        push_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        push_counters: Arc::new(PushCounters::new()),
+        tap_attach_failures_total: startup_attach_failures as u64,
         epoch: std::time::Instant::now(),
     };
     // Apply the initial limiter policy index (no LIMITs yet; just builds lookups).
@@ -1148,14 +1170,77 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     Ok(())
 }
 
-/// RAII holder for the in-flight metrics-push flag. Dropping the guard covers every
-/// exit path of the spawned task — normal completion, HTTP error, future cancellation
-/// and panic unwinding — so the flag can never stay set and silently stop pushes.
-struct PushGuard(Arc<std::sync::atomic::AtomicBool>);
+/// Process-lifetime outcome counters for the metrics push path plus the
+/// single-flight flag.
+///
+/// All counters are monotonic and purely observational: no decision reads them
+/// with a happens-before dependency on other data, so `Ordering::Relaxed` is
+/// correct for the increments and loads (each thread sees a coherent value
+/// eventually; cross-thread freshness is irrelevant for diagnostics). The
+/// inflight flag itself still uses an atomic swap/store pair for exclusion.
+pub(crate) struct PushCounters {
+    inflight: std::sync::atomic::AtomicBool,
+    successes: std::sync::atomic::AtomicU64,
+    failures: std::sync::atomic::AtomicU64,
+    skipped: std::sync::atomic::AtomicU64,
+}
+
+impl PushCounters {
+    fn new() -> Self {
+        Self {
+            inflight: std::sync::atomic::AtomicBool::new(false),
+            successes: std::sync::atomic::AtomicU64::new(0),
+            failures: std::sync::atomic::AtomicU64::new(0),
+            skipped: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Take the single-flight slot, or count a skip when a push is already
+    /// running. The returned guard releases the slot on every exit path
+    /// (normal completion, HTTP error, cancellation, panic unwinding).
+    fn try_start(self: &Arc<Self>) -> Option<PushGuard> {
+        if self
+            .inflight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        Some(PushGuard(self.clone()))
+    }
+
+    fn note_success(&self) {
+        self.successes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note_failure(&self) {
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn successes(&self) -> u64 {
+        self.successes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn skipped(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// RAII holder for the in-flight push slot; see `PushCounters::try_start`.
+struct PushGuard(Arc<PushCounters>);
 
 impl Drop for PushGuard {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.0
+            .inflight
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1413,39 +1498,60 @@ mod degraded_message_tests {
 
 #[cfg(test)]
 mod push_guard_tests {
-    use crate::daemon::PushGuard;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::daemon::PushCounters;
     use std::sync::Arc;
 
     #[test]
     fn guard_releases_on_normal_drop() {
-        let flag = Arc::new(AtomicBool::new(true));
+        let counters = Arc::new(PushCounters::new());
         {
-            let _guard = PushGuard(flag.clone());
+            let _guard = counters.try_start().expect("slot free");
         }
-        assert!(!flag.load(Ordering::Acquire));
+        assert!(
+            counters.try_start().is_some(),
+            "slot must be free after the guard drops"
+        );
     }
 
     #[test]
     fn guard_releases_on_panic_unwind() {
-        let flag = Arc::new(AtomicBool::new(true));
-        let f = flag.clone();
+        let counters = Arc::new(PushCounters::new());
+        let c = counters.clone();
         let result = std::panic::catch_unwind(move || {
-            let _guard = PushGuard(f);
+            let _guard = c.try_start().expect("slot free");
             panic!("simulated push-task panic");
         });
         assert!(result.is_err());
-        assert!(!flag.load(Ordering::Acquire), "flag stuck after panic");
+        assert!(
+            counters.try_start().is_some(),
+            "slot stuck after panic unwinding"
+        );
     }
 
     #[test]
     fn guard_releases_on_simulated_cancellation() {
         // A cancelled future drops its locals; model that by dropping the guard
         // mid-flight without ever reaching completion.
-        let flag = Arc::new(AtomicBool::new(true));
-        let guard = PushGuard(flag.clone());
+        let counters = Arc::new(PushCounters::new());
+        let guard = counters.try_start().expect("slot free");
         drop(guard);
-        assert!(!flag.load(Ordering::Acquire), "flag stuck after cancel");
+        assert!(counters.try_start().is_some(), "slot stuck after cancel");
+    }
+
+    #[test]
+    fn concurrent_start_counts_a_skip_and_keeps_outcomes_separate() {
+        let counters = Arc::new(PushCounters::new());
+        let guard = counters.try_start().expect("slot free");
+        assert!(counters.try_start().is_none(), "second start must skip");
+        assert!(counters.try_start().is_none());
+        counters.note_success();
+        counters.note_failure();
+        drop(guard);
+        // Outcomes are independent of skips; all counters stay monotonic.
+        assert_eq!(counters.successes(), 1);
+        assert_eq!(counters.failures(), 1);
+        assert_eq!(counters.skipped(), 2);
+        assert!(counters.try_start().is_some(), "slot free after drop");
     }
 }
 

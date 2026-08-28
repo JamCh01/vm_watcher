@@ -63,6 +63,36 @@ pub fn render_prom_lines_oversized(
     out
 }
 
+/// Process-lifetime operational counters: attach failures and metrics-push
+/// outcomes. Fixed label set (`instance="process"`) → exactly four series,
+/// constant cardinality. Rendered even when zero so `rate()`/`increase()` have
+/// a continuous series from daemon start.
+///
+/// Success-lag semantics: a push cannot observe its own outcome while it is
+/// still running, so the success value in any payload is the count from BEFORE
+/// that push — success lags by at most one push interval by construction.
+/// failures/skipped are current at render time (they happen before the render).
+pub fn render_prom_lines_process(
+    tap_attach_failures: u64,
+    push_successes: u64,
+    push_failures: u64,
+    push_skipped: u64,
+    now_ms: i64,
+) -> String {
+    let mut out = String::with_capacity(256);
+    for (name, value) in [
+        ("vmbw_tap_attach_failures_total", tap_attach_failures),
+        ("vmbw_metrics_push_successes_total", push_successes),
+        ("vmbw_metrics_push_failures_total", push_failures),
+        ("vmbw_metrics_push_skipped_total", push_skipped),
+    ] {
+        out.push_str(&format!(
+            "{name}{{instance=\"process\"}} {value} {now_ms}\n"
+        ));
+    }
+    out
+}
+
 /// Escape a Prometheus label value (backslash, double quote, newline).
 pub fn escape_label(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
@@ -309,5 +339,24 @@ mod tests {
             !lines.contains("10.0.0.1"),
             "unpoliced IP must emit nothing"
         );
+    }
+
+    #[test]
+    fn process_counters_render_fixed_series_with_current_values() {
+        let lines = super::render_prom_lines_process(2, 10, 3, 1, 123);
+        for needle in [
+            "vmbw_tap_attach_failures_total{instance=\"process\"} 2 123",
+            "vmbw_metrics_push_successes_total{instance=\"process\"} 10 123",
+            "vmbw_metrics_push_failures_total{instance=\"process\"} 3 123",
+            "vmbw_metrics_push_skipped_total{instance=\"process\"} 1 123",
+        ] {
+            assert!(lines.contains(needle), "missing {needle:?} in:\n{lines}");
+        }
+        // Exactly four series, constant cardinality, cumulative semantics: the
+        // values are whatever the daemon accumulated — the renderer adds nothing
+        // and drops nothing (zero values still render so rate() sees continuity).
+        assert_eq!(lines.lines().count(), 4, "{lines}");
+        let zeros = super::render_prom_lines_process(0, 0, 0, 0, 1);
+        assert_eq!(zeros.lines().count(), 4, "zero counters must still render");
     }
 }
