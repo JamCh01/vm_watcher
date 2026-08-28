@@ -1098,4 +1098,86 @@ mod tests {
         m.assert_invariants();
         m.assert_no_orphans();
     }
+
+    // 21. Forward clear_state failure during a GCRA -> SWL switch: the abort
+    //     happens before the new state write, and the rollback re-arms the old
+    //     GCRA policy on top of its never-cleared artifact. Final maps equal the
+    //     pre-update content; no SWL ring exists; report is clean.
+    #[test]
+    fn forward_clear_state_failure_rolls_back_to_armed_old_policy() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let k = key(25);
+        let old = policy(ALGO_GCRA);
+        install_limit(&mut m, &mut j, k, old).unwrap();
+        j = TxJournal::default();
+
+        m.fail_next("clear_state", k);
+        assert!(install_limit(&mut m, &mut j, k, policy(ALGO_SLIDING_WINDOW_LOG)).is_err());
+        m.log.clear();
+
+        let report = rollback_journal(&mut m, &mut w, &j);
+
+        // Final map content equals the pre-update state, field for field.
+        assert_eq!(m.policies.get(&k).copied(), Some(old), "old GCRA re-armed");
+        assert_eq!(
+            m.state.get(&k).copied(),
+            Some(ALGO_GCRA),
+            "old GCRA state present with correct algorithm"
+        );
+        assert!(m.rings.is_empty(), "SWL ring must not exist");
+        // Rollback itself ran clean: report agrees with the maps.
+        assert!(report.dataplane_consistent);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.succeeded, 1);
+        // No armed policy may lack its state.
+        m.assert_invariants();
+        m.assert_no_orphans();
+    }
+
+    // 22. Rollback re-arm failure: forward arm of the NEW policy fails, then the
+    //     rollback's restore of the OLD state succeeds but re-arming the old
+    //     policy fails. End state: old policy NOT armed (never falsely marked
+    //     armed), its state remains as a BOUNDED orphan, the hard invariant
+    //     holds, and the report carries the exact op and key.
+    #[test]
+    fn rollback_rearm_failure_leaves_bounded_orphan_state() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let k = key(26);
+        let old = policy(ALGO_GCRA);
+        install_limit(&mut m, &mut j, k, old).unwrap();
+        j = TxJournal::default();
+
+        // Both arm attempts fail: the forward arm of the new SWL policy and the
+        // rollback's re-arm of the old GCRA policy.
+        m.fail_next("arm_policy", k);
+        m.fail_next("arm_policy", k);
+        assert!(install_limit(&mut m, &mut j, k, policy(ALGO_SLIDING_WINDOW_LOG)).is_err());
+
+        let report = rollback_journal(&mut m, &mut w, &j);
+
+        // Old policy is not armed — and therefore not falsely marked armed.
+        assert!(!m.policies.contains_key(&k), "old policy must not be armed");
+        // The restored state stays behind as a bounded orphan.
+        assert_eq!(
+            m.state.get(&k).copied(),
+            Some(ALGO_GCRA),
+            "restored old state remains as bounded orphan"
+        );
+        assert!(m.rings.is_empty(), "new SWL ring must be cleared");
+        // Hard invariant: armed policy => state exists. With nothing armed it
+        // holds trivially, while the soft no-orphan property is (expectedly) not
+        // met — assert the hard one.
+        m.assert_invariants();
+        assert!(!report.dataplane_consistent);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].key, k);
+        assert_eq!(report.failures[0].op, "re-arm old policy");
+    }
 }
