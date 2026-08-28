@@ -82,6 +82,15 @@ pub struct Status {
     pub dataplane_degraded: bool,
     #[serde(default)]
     pub rollback_failures_total: u64,
+    /// Anti-spoofing contract (see config `[security]`): which mode is in effect,
+    /// whether THIS program enforces it (currently always false — external), and that
+    /// the operator acknowledgement is on file.
+    #[serde(default)]
+    pub anti_spoof_mode: String,
+    #[serde(default)]
+    pub anti_spoof_enforced_by_program: bool,
+    #[serde(default)]
+    pub anti_spoof_acknowledged: bool,
     /// Sliding-window-log map: configured capacity vs entries currently installed.
     /// Each entry preallocates ~16.4 KiB of kernel memory.
     #[serde(default)]

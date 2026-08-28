@@ -51,6 +51,8 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
     pub experimental: ExperimentalConfig,
     #[serde(default, rename = "ip_ranges")]
     pub ip_ranges: Vec<IpRangeEntry>,
@@ -103,6 +105,38 @@ impl Default for CollectorConfig {
             interface_scan_interval_secs: default_scan_interval_secs(),
             map_max_entries: default_map_max_entries(),
             swl_map_max_entries: default_swl_map_max_entries(),
+        }
+    }
+}
+
+/// Trust contract for packet-source ownership. This program has no VM inventory and
+/// no trusted TAP→IP source, so it cannot verify that a packet's source address
+/// belongs to the TAP it arrived on. Anti-spoofing must therefore be enforced
+/// EXTERNALLY (bridge firewall / nftables / the virtualization platform); the config
+/// records the operator's explicit acknowledgement of that contract.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Only `external` is supported: source-address anti-spoofing is enforced outside
+    /// this program. Any other value is rejected (there is no internal mode yet).
+    #[serde(default = "default_ip_ownership")]
+    pub ip_ownership: String,
+    /// Must be `true` for the daemon to start: the operator confirms that external
+    /// anti-spoofing is actually deployed for the bridged TAPs. A reload that drops
+    /// the acknowledgement is rejected like any validation error.
+    #[serde(default)]
+    pub acknowledge_external_anti_spoofing: bool,
+}
+
+fn default_ip_ownership() -> String {
+    "external".to_string()
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            ip_ownership: default_ip_ownership(),
+            acknowledge_external_anti_spoofing: false,
         }
     }
 }
@@ -427,6 +461,8 @@ pub struct ValidatedConfig {
     pub interface_scan_interval_secs: u64,
     pub map_max_entries: u32,
     pub swl_map_max_entries: u32,
+    /// Anti-spoofing contract from `[security]` (validated above).
+    pub ip_ownership: String,
     pub show_interface: bool,
     pub show_packets: bool,
     pub default_sort: SortMode,
@@ -506,6 +542,21 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         }
     }
 
+    // Security contract: refuse to run without an explicit anti-spoofing
+    // acknowledgement (and refuse ownership modes this program does not have).
+    if config.security.ip_ownership != "external" {
+        return Err(format!(
+            "security.ip_ownership {:?} is not supported (only \"external\": anti-spoofing enforced outside this program)",
+            config.security.ip_ownership
+        ));
+    }
+    if !config.security.acknowledge_external_anti_spoofing {
+        return Err(
+            "security.acknowledge_external_anti_spoofing must be true: this program counts and limits by the packet's source address and CANNOT verify that the address belongs to the TAP it arrived on. Deploy source-address anti-spoofing on the bridge/platform (see README security prerequisites) and set [security] acknowledge_external_anti_spoofing = true"
+                .to_string(),
+        );
+    }
+
     let ranges = validate_ranges(&config.ip_ranges)?;
 
     // Attach parsed policies, validating units, override placement and completeness.
@@ -577,6 +628,7 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         interface_scan_interval_secs: config.collector.interface_scan_interval_secs,
         map_max_entries: config.collector.map_max_entries,
         swl_map_max_entries: config.collector.swl_map_max_entries,
+        ip_ownership: config.security.ip_ownership.clone(),
         show_interface: config.display.show_interface,
         show_packets: config.display.show_packets,
         default_sort,
@@ -594,6 +646,9 @@ mod tests {
     const EXAMPLE: &str = r#"
 [network]
 bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
 
 [collector]
 refresh_interval_ms = 1000
@@ -635,6 +690,9 @@ range = "10.30.9.1-10.30.9.16"
 [network]
 bridge = "br0"
 
+[security]
+acknowledge_external_anti_spoofing = true
+
 [[ip_ranges]]
 name = "A"
 range = "10.0.0.1-10.0.0.2"
@@ -645,6 +703,51 @@ range = "10.0.0.1-10.0.0.2"
         assert_eq!(cfg.map_max_entries, 8192);
         assert!(!cfg.show_interface);
         assert!(!cfg.show_packets);
+    }
+
+    #[test]
+    fn security_acknowledgement_is_required() {
+        // No [security] section at all: refused.
+        let text = r#"
+[network]
+bridge = "br0"
+
+[[ip_ranges]]
+name = "A"
+range = "10.0.0.1-10.0.0.2"
+"#;
+        let err = load_str(text).unwrap_err();
+        assert!(err.contains("acknowledge_external_anti_spoofing"), "{err}");
+
+        // Section present but acknowledgement false: refused.
+        let text = format!(
+            "{text}
+[security]
+acknowledge_external_anti_spoofing = false
+"
+        );
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("acknowledge_external_anti_spoofing"), "{err}");
+
+        // Acknowledged: accepted, ownership recorded.
+        let text = r#"
+[network]
+bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
+
+[[ip_ranges]]
+name = "A"
+range = "10.0.0.1-10.0.0.2"
+"#;
+        let cfg = load_str(text).unwrap();
+        assert_eq!(cfg.ip_ownership, "external");
+
+        // Unsupported ownership modes are rejected explicitly.
+        let text = format!("{text}\nip_ownership = \"automatic\"\n");
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("ip_ownership"), "{err}");
     }
 
     #[test]
@@ -741,7 +844,8 @@ url = \"{url}\"
 
     #[test]
     fn rejects_missing_ranges() {
-        let text = "[network]\nbridge = \"br0\"\n";
+        let text =
+            "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n";
         let err = load_str(text).unwrap_err();
         assert!(err.contains("[[ip_ranges]]"), "{err}");
     }
@@ -763,13 +867,16 @@ url = \"{url}\"
         // The whitelist is an LPM trie of CIDR prefixes: range size no longer costs
         // one map entry per address, so large ranges are valid.
         let text =
-            "[network]\nbridge = \"br0\"\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
+            "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
         assert!(load_str(text).is_ok());
     }
 
     const POLICY_EXAMPLE: &str = r#"
 [network]
 bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "Range-A"
@@ -823,6 +930,9 @@ range = "10.30.8.1-10.30.8.16"
 [network]
 bridge = "br0"
 
+[security]
+acknowledge_external_anti_spoofing = true
+
 [[ip_ranges]]
 name = "A"
 range = "10.0.0.1-10.0.0.2"
@@ -865,6 +975,9 @@ range = "10.0.0.1-10.0.0.2"
 [network]
 bridge = "br0"
 
+[security]
+acknowledge_external_anti_spoofing = true
+
 [[ip_ranges]]
 name = "Range-A"
 range = "10.30.8.1-10.30.8.16"
@@ -902,6 +1015,9 @@ enable_sliding_window_log = true
         let base = r#"
 [network]
 bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "Range-A"

@@ -650,6 +650,9 @@ impl Engine {
             config_watcher_last_error: self.config_watcher_last_error.clone(),
             dataplane_degraded: self.dataplane_degraded,
             rollback_failures_total: self.rollback_failures_total,
+            anti_spoof_mode: self.config.load().ip_ownership.clone(),
+            anti_spoof_enforced_by_program: false,
+            anti_spoof_acknowledged: true,
             swl_map_capacity: self.config.load().swl_map_max_entries,
             swl_map_used: self.swl_log.iter().filter_map(|i| i.ok()).count() as u32,
             ranges,
@@ -809,6 +812,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         "loaded {} IP range(s) for bridge {}",
         cfg.ranges.len(),
         cfg.bridge
+    );
+    // The anti-spoofing contract is a security-relevant startup fact: say it loudly.
+    log::warn!(
+        "SECURITY: ip_ownership = \"{}\" — source-address anti-spoofing is enforced          EXTERNALLY (bridge/platform), NOT by this program; operator acknowledgement          recorded in [security]",
+        cfg.ip_ownership
     );
 
     // 2. Single-instance lock. The file is created once and NEVER deleted: deleting
