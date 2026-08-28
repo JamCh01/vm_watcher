@@ -184,18 +184,36 @@ impl Engine {
             .poll(&self.traffic, &self.traffic6, &self.policer_stats, &ranges);
         // Idle eviction: drop counter-map entries frozen long enough; the data path
         // recreates them on the next packet (reset-safe deltas, see collector).
-        for key in &stale_traffic {
-            let _ = self.traffic.remove(key);
-        }
-        for key in &stale_traffic6 {
-            let _ = self.traffic6.remove(key);
-        }
-        if !(stale_traffic.is_empty() && stale_traffic6.is_empty()) {
-            log::debug!(
-                "evicted {} idle TRAFFIC / {} idle TRAFFIC6 key(s)",
-                stale_traffic.len(),
-                stale_traffic6.len()
-            );
+        let idle4 = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &stale_traffic,
+            |k| std::net::Ipv4Addr::from(k.ipv4).to_string(),
+            |k| self.traffic.remove(k),
+        );
+        let idle6 = remove_counter_keys(
+            "TRAFFIC6",
+            "idle eviction",
+            &stale_traffic6,
+            |k| format!("ifindex {k}"),
+            |k| self.traffic6.remove(k),
+        );
+        if idle4.attempted + idle6.attempted > 0 {
+            if idle4.failed + idle6.failed == 0 {
+                log::debug!(
+                    "evicted {} idle TRAFFIC / {} idle TRAFFIC6 key(s)",
+                    idle4.removed,
+                    idle6.removed
+                );
+            } else {
+                log::warn!(
+                    "idle eviction incomplete: TRAFFIC {}/{} + TRAFFIC6 {}/{} removed — see per-key failures",
+                    idle4.removed,
+                    idle4.attempted,
+                    idle6.removed,
+                    idle6.attempted
+                );
+            }
         }
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
@@ -323,11 +341,23 @@ impl Engine {
                             stale.push(key);
                         }
                     }
-                    for key in &stale {
-                        let _ = self.traffic.remove(key);
-                    }
-                    if !stale.is_empty() {
-                        log::debug!("pruned {} stale TRAFFIC key(s)", stale.len());
+                    let pruned = remove_counter_keys(
+                        "TRAFFIC",
+                        "stale-TAP prune",
+                        &stale,
+                        |k| std::net::Ipv4Addr::from(k.ipv4).to_string(),
+                        |k| self.traffic.remove(k),
+                    );
+                    if pruned.attempted > 0 {
+                        if pruned.failed == 0 {
+                            log::debug!("pruned {} stale TRAFFIC key(s)", pruned.removed);
+                        } else {
+                            log::warn!(
+                                "stale-TAP prune incomplete: removed {}/{} TRAFFIC key(s) — see per-key failures",
+                                pruned.removed,
+                                pruned.attempted
+                            );
+                        }
                     }
                     self.collector.prune_ifindexes(&new_ifindexes);
                 }
@@ -876,6 +906,68 @@ fn degraded_summary(failures: usize, attempted: usize) -> String {
          dataplane state may differ from the active configuration — \
          inspect the per-step rollback failures above"
     )
+}
+
+/// Outcome of a bulk counter-map removal.
+#[derive(Debug, PartialEq)]
+struct RemovalStats {
+    attempted: usize,
+    removed: usize,
+    failed: usize,
+}
+
+/// Remove keys from a counter map without stopping at individual failures.
+/// One key failing never blocks the rest; the summary counts only keys whose
+/// removal actually succeeded, never the input length.
+///
+/// Keys already absent count as removed — the goal (key not in map) is met.
+/// aya 0.14 maps the kernel's ENOENT from `bpf_map_delete_elem` to
+/// `MapError::SyscallError` with `io_error.kind() == NotFound` (see
+/// `aya::maps::hash_map::remove`); the typed variants below are matched,
+/// never the error string. Should a future aya return another variant for
+/// absent keys, this degrades to a logged failure retried next cycle — never
+/// to silent success. Real-kernel confirmation: docs/kernel-validation.md §6.
+fn remove_counter_keys<K, D, F>(
+    map_name: &str,
+    op: &'static str,
+    keys: &[K],
+    display: D,
+    mut remove: F,
+) -> RemovalStats
+where
+    D: Fn(&K) -> String,
+    F: FnMut(&K) -> Result<(), MapError>,
+{
+    let mut stats = RemovalStats {
+        attempted: keys.len(),
+        removed: 0,
+        failed: 0,
+    };
+    for key in keys {
+        match remove(key) {
+            Ok(()) => stats.removed += 1,
+            Err(e) if key_already_absent(&e) => stats.removed += 1,
+            Err(e) => {
+                stats.failed += 1;
+                log::warn!(
+                    "{map_name} remove failed during {op} for {}: {e}",
+                    display(key)
+                );
+            }
+        }
+    }
+    stats
+}
+
+/// Typed absent-key detection for `remove_counter_keys` — no string matching.
+fn key_already_absent(e: &MapError) -> bool {
+    use std::io::ErrorKind;
+    match e {
+        MapError::KeyNotFound | MapError::ElementNotFound => true,
+        MapError::SyscallError(se) => se.io_error.kind() == ErrorKind::NotFound,
+        MapError::IoError(io) => io.kind() == ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
@@ -1493,6 +1585,148 @@ mod degraded_message_tests {
         assert!(msg.contains("2 of 5"));
         assert!(msg.contains("per-step rollback failures"));
         assert!(msg.contains("DEGRADED"));
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::{remove_counter_keys, RemovalStats};
+    use aya::maps::MapError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn absent_syscall_error() -> MapError {
+        // The variant aya 0.14 produces for ENOENT from bpf_map_delete_elem.
+        MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: std::io::Error::from_raw_os_error(2), // ENOENT
+        })
+    }
+
+    #[test]
+    fn all_keys_removed() {
+        let calls = AtomicUsize::new(0);
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3],
+            |k| k.to_string(),
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 3,
+                removed: 3,
+                failed: 0
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn middle_failure_does_not_stop_the_rest() {
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3],
+            |k| k.to_string(),
+            |k| {
+                if *k == 2 {
+                    Err(MapError::InvalidName {
+                        name: "injected".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 3,
+                removed: 2,
+                failed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn all_failures_counted_individually() {
+        let stats = remove_counter_keys(
+            "TRAFFIC6",
+            "stale-TAP prune",
+            &[7u32, 8],
+            |k| k.to_string(),
+            |_| {
+                Err(MapError::InvalidName {
+                    name: "injected".to_string(),
+                })
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 2,
+                removed: 0,
+                failed: 2
+            }
+        );
+    }
+
+    #[test]
+    fn absent_key_counts_as_removed_via_typed_variants_only() {
+        // Ok, KeyNotFound and the ENOENT syscall variant all mean "the key is
+        // not in the map"; any other variant is a real failure.
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3, 4, 5],
+            |k| k.to_string(),
+            |k| match *k {
+                1 => Ok(()),
+                2 => Err(MapError::KeyNotFound),
+                3 => Err(MapError::ElementNotFound),
+                4 => Err(absent_syscall_error()),
+                _ => Err(MapError::InvalidName {
+                    name: "injected".to_string(),
+                }),
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 5,
+                removed: 4,
+                failed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn failed_removals_never_enter_the_removed_total() {
+        // The summary used for logs must be built from actual removal results,
+        // not from the input length.
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3, 4],
+            |k| k.to_string(),
+            |k| {
+                if *k % 2 == 0 {
+                    Err(MapError::InvalidName {
+                        name: "injected".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(stats.removed + stats.failed, stats.attempted);
+        assert_eq!(stats.removed, 2);
+        assert_ne!(stats.removed, stats.attempted);
     }
 }
 
