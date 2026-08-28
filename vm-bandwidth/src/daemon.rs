@@ -307,31 +307,15 @@ impl Engine {
         if lines.is_empty() {
             return;
         }
-        let Some(guard) = self.push_counters.try_start() else {
-            log::debug!("metrics push skipped: previous push still in flight");
-            return;
-        };
-        let counters = self.push_counters.clone();
-        let http = self.http.clone();
-        let url = cfg.metrics_url.clone();
-        tokio::spawn(async move {
-            // The in-flight flag lives in an RAII guard: normal completion, HTTP
-            // errors, cancellation and panic unwinding all drop it and release it.
-            let _guard = guard;
-            match crate::metrics::push(&http, &url, &lines).await {
-                Ok(()) => {
-                    counters.note_success();
-                    log::debug!("metrics push: {} line(s)", lines.lines().count());
-                }
-                Err(e) => {
-                    counters.note_failure();
-                    log::warn!(
-                        "metrics push to {} failed: {e:#}",
-                        vm_bandwidth_core::config::safe_endpoint_display(&url)
-                    );
-                }
-            }
-        });
+        // The single-flight guard, the push and the outcome counters all live in
+        // `run_metrics_push` so push-path tests exercise the SAME production
+        // orchestration instead of mirroring it.
+        tokio::spawn(run_metrics_push(
+            self.push_counters.clone(),
+            self.http.clone(),
+            cfg.metrics_url.clone(),
+            lines,
+        ));
     }
 
     fn range_name(&self, ip: u32) -> String {
@@ -1471,6 +1455,43 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     drop(lock_file);
     log::info!("daemon stopped cleanly");
     Ok(())
+}
+
+/// One metrics push end to end under the single-flight guard — the exact
+/// orchestration `Engine::push_metrics` spawns, extracted so tests drive the
+/// production wiring (guard acquisition, push, outcome counters) rather than a
+/// test-only copy.
+///
+/// The RAII guard releases the in-flight slot on every exit path: normal
+/// completion, HTTP error, future cancellation and panic unwinding. Counters
+/// are observational only (Ordering::Relaxed) — they never feed a safety or
+/// business decision. An empty payload is unreachable from production once the
+/// process-metric lines render (they always emit four series); if passed
+/// directly, `metrics::push` returns Ok without HTTP and the push counts as a
+/// success — see the push_io tests for that contract.
+pub(crate) async fn run_metrics_push(
+    counters: Arc<PushCounters>,
+    http: reqwest::Client,
+    url: String,
+    lines: String,
+) {
+    let Some(_guard) = counters.try_start() else {
+        log::debug!("metrics push skipped: previous push still in flight");
+        return;
+    };
+    match crate::metrics::push(&http, &url, &lines).await {
+        Ok(()) => {
+            counters.note_success();
+            log::debug!("metrics push: {} line(s)", lines.lines().count());
+        }
+        Err(e) => {
+            counters.note_failure();
+            log::warn!(
+                "metrics push to {} failed: {e:#}",
+                vm_bandwidth_core::config::safe_endpoint_display(&url)
+            );
+        }
+    }
 }
 
 /// Process-lifetime outcome counters for the metrics push path plus the
