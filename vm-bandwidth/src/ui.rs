@@ -40,7 +40,10 @@ impl Client {
         self.stream.write_all(&frame)?;
         let mut lenbuf = [0u8; 4];
         self.stream.read_exact(&mut lenbuf)?;
-        let len = u32::from_be_bytes(lenbuf) as usize;
+        // Validate the untrusted length BEFORE allocating; never trust a u32 from
+        // the wire with an unbounded vec!.
+        let len = ipc::validate_frame_len(u32::from_be_bytes(lenbuf), ipc::MAX_RESPONSE_FRAME)
+            .map_err(anyhow::Error::msg)?;
         let mut body = vec![0u8; len];
         self.stream.read_exact(&mut body)?;
         ipc::decode::<Response>(&body).map_err(anyhow::Error::msg)
@@ -77,26 +80,42 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
 
     // The UI reads the same config file as the daemon, purely for the [metrics]
     // section (trend queries go straight to VictoriaMetrics, never via the daemon).
+    // A missing/broken config DEGRADES the UI (trend screen off) instead of exiting:
+    // overview and detail come from the daemon, not from this file.
     let metrics_cfg = match config::load(&config_path) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => Some(cfg),
         Err(e) => {
-            eprintln!("warning: cannot load {config_path:?}: {e}; trend screen disabled");
-            return Ok(());
+            eprintln!(
+                "warning: cannot load {config_path:?}: {e};                  continuing without the trend screen"
+            );
+            None
         }
     };
-    if metrics_cfg.metrics_enabled {
-        println!(
-            "metrics: querying {} (refresh {}s)",
-            metrics_cfg.metrics_url, metrics_cfg.metrics_push_interval_secs
-        );
+    if let Some(cfg) = &metrics_cfg {
+        if cfg.metrics_enabled {
+            println!(
+                "metrics: querying {} (refresh {}s)",
+                cfg.metrics_url, cfg.metrics_push_interval_secs
+            );
+        }
     }
 
     let mut terminal = ratatui::init();
-    let mut app = UiState::new("br0".to_string(), REFRESH, metrics_cfg.default_sort);
-    app.metrics_enabled = metrics_cfg.metrics_enabled;
-    app.metrics_url = metrics_cfg.metrics_url.clone();
-    // rate() window: at least two push intervals, never below 2 minutes.
-    app.rate_window_secs = (metrics_cfg.metrics_push_interval_secs * 2).max(120);
+    let default_sort = metrics_cfg
+        .as_ref()
+        .map(|c| c.default_sort)
+        .unwrap_or(config::SortMode::Ip);
+    let mut app = UiState::new("br0".to_string(), REFRESH, default_sort);
+    if let Some(cfg) = &metrics_cfg {
+        app.metrics_enabled = cfg.metrics_enabled;
+        app.metrics_url = cfg.metrics_url.clone();
+        // rate() window: at least two push intervals, never below 2 minutes.
+        app.rate_window_secs = (cfg.metrics_push_interval_secs * 2).max(120);
+    } else {
+        app.metrics_enabled = false;
+        app.config_warning =
+            Some("config unreadable: trend screen disabled (daemon data still shown)".to_string());
+    }
 
     // crossterm input on a dedicated thread (blocking read degrades gracefully).
     let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
@@ -192,6 +211,15 @@ fn poll(client: &mut Option<Client>, app: &mut UiState) {
     match c.request(&Request::Overview) {
         Ok(Response::Status(s)) => {
             app.bridge = s.bridge.clone();
+            // Protocol drift: never hard-fail on a version mismatch, just say so.
+            app.protocol_note = match s.protocol_version {
+                0 => Some("daemon predates protocol versioning (legacy)".to_string()),
+                v if v > ipc::PROTOCOL_VERSION => Some(format!(
+                    "daemon protocol v{v} is newer than this UI (v{}) — upgrade the UI",
+                    ipc::PROTOCOL_VERSION
+                )),
+                _ => None,
+            };
             app.status = Some(*s);
             app.error = None;
         }

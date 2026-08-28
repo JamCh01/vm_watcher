@@ -8,6 +8,7 @@
 //! shared-mutable locking.
 
 use std::collections::HashSet;
+use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,8 +50,10 @@ pub const PIN_LIMIT_POLICIES: &str = "/sys/fs/bpf/LIMIT_POLICIES";
 pub const PIN_GCRA_STATE: &str = "/sys/fs/bpf/GCRA_STATE";
 const LOCK_PATH: &str = "/run/vm-bandwidth-monitor.lock";
 
-/// Refuse IPC frames larger than this (guards against a misbehaving client).
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// Bound on concurrent IPC clients: the socket is owner-only, but a slow or stuck
+/// connection must not accumulate unbounded engine-side queues; new connections wait
+/// in the listen backlog until a slot frees up.
+const MAX_IPC_CONNECTIONS: usize = 16;
 /// Debounce window for filesystem events (§29): one normal save ≈ one reload.
 const RELOAD_DEBOUNCE_MS: u64 = 300;
 
@@ -633,6 +636,7 @@ impl Engine {
             });
         }
         Status {
+            protocol_version: ipc::PROTOCOL_VERSION,
             generation: self.generation,
             config_loaded_at: self.config_loaded_at.clone(),
             last_reload_at: self.last_reload_at.clone(),
@@ -797,8 +801,6 @@ fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
 
 /// Entry point for daemon mode.
 pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<()> {
-    use std::fs::File;
-
     // 1. Load and validate the initial config. Refuse to start on any problem.
     let cfg = config::load(&config_path).map_err(anyhow::Error::msg)?;
     let initial_config_bytes = std::fs::read(&config_path)?;
@@ -808,16 +810,10 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         cfg.bridge
     );
 
-    // 2. Single-instance lock.
-    let lock_file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(LOCK_PATH)
-        .with_context(|| format!("cannot create lock file {LOCK_PATH}"))?;
-    lock_file
-        .try_lock()
-        .context("another vm-bandwidth-monitor instance is already running")?;
+    // 2. Single-instance lock. The file is created once and NEVER deleted: deleting
+    //    it on shutdown opens an inode race (another process locks the old inode
+    //    while a third creates and locks a fresh one). The flock dies with the fd.
+    let lock_file = acquire_instance_lock(LOCK_PATH)?;
 
     // 3. Remove any pins left by older versions (v0.2.0 and earlier pinned the maps);
     //    the current maps are unpinned and live only as long as the daemon does.
@@ -962,12 +958,21 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     std::fs::set_permissions(SOCK_PATH, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting permissions on {SOCK_PATH}"))?;
     let (ipc_tx, mut ipc_rx) = mpsc::channel::<IpcReq>(32);
+    let conn_permits = Arc::new(tokio::sync::Semaphore::new(MAX_IPC_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    // Backpressure: wait for a slot instead of spawning without bound;
+                    // excess clients queue in the listen backlog.
+                    let Ok(permit) = conn_permits.clone().acquire_owned().await else {
+                        break; // semaphore closed: shutting down
+                    };
                     let tx = ipc_tx.clone();
-                    tokio::spawn(handle_connection(stream, tx));
+                    tokio::spawn(async move {
+                        let _permit = permit; // held until the connection ends
+                        handle_connection(stream, tx).await;
+                    });
                 }
                 Err(e) => {
                     log::warn!("IPC accept error: {e}");
@@ -1059,19 +1064,36 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     //    the TC links this program created; the unpinned maps die with the process.
     drop(engine);
     let _ = std::fs::remove_file(SOCK_PATH);
+    // Release the lock by dropping the fd; the lock file itself stays on disk
+    // permanently (see the note at acquisition).
     drop(lock_file);
-    let _ = std::fs::remove_file(LOCK_PATH);
     log::info!("daemon stopped cleanly");
     Ok(())
 }
 
+/// Open (creating if needed) the lock file at a fixed path and take an exclusive,
+/// non-blocking flock. A second live holder fails with a clear error.
+fn acquire_instance_lock(path: &str) -> Result<File> {
+    let lock_file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("cannot create lock file {path}"))?;
+    lock_file
+        .try_lock()
+        .context("another vm-bandwidth-monitor instance is already running")?;
+    Ok(lock_file)
+}
+
 /// Serve one IPC client: length-delimited JSON request/response until it disconnects.
 async fn handle_connection(stream: UnixStream, tx: mpsc::Sender<IpcReq>) {
+    // Requests are tiny; refuse anything a legitimate client would never send.
     let mut framed = Framed::new(
         stream,
         LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
-            .max_frame_length(MAX_FRAME)
+            .max_frame_length(ipc::MAX_REQUEST_FRAME)
             .new_codec(),
     );
     while let Some(frame) = framed.next().await {
@@ -1200,4 +1222,34 @@ fn spawn_watcher(
         }
     });
     Ok(debouncer)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::acquire_instance_lock;
+
+    /// The lock lifecycle without the inode race: a second process/fd fails while the
+    /// first holds the lock, succeeds after it is released, and two holders never
+    /// coexist. Two separate open()s in one process contend exactly like two
+    /// processes (flock is per open file description).
+    #[test]
+    fn instance_lock_serializes_holders() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("vmbw-lock-test-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+
+        // A holds the lock.
+        let a = acquire_instance_lock(path).expect("A acquires");
+        // B must fail while A holds it.
+        assert!(acquire_instance_lock(path).is_err());
+        // A exits.
+        drop(a);
+        // B can now take it.
+        let b = acquire_instance_lock(path).expect("B acquires after A exits");
+        // And a third contender fails again — never two holders at once.
+        assert!(acquire_instance_lock(path).is_err());
+        drop(b);
+        // The file stays behind on purpose; remove it only inside this test.
+        let _ = std::fs::remove_file(path);
+    }
 }
