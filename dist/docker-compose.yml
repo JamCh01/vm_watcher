@@ -6,9 +6,9 @@
 # counters here (Prometheus import API); the --ui trend screen queries it.
 services:
   victoriametrics:
-    # TODO(supply-chain, issue #1): pin a verified release tag or digest instead
-    # of :latest (the -storageDataPath flag below needs v1.150+).
-    image: victoriametrics/victoria-metrics:latest
+    # Pinned (issue #1): official release tag v1.150.0 + digest resolved from
+    # registry-1.docker.io on 2026-08-28. -storageDataPath needs v1.150+.
+    image: victoriametrics/victoria-metrics:v1.150.0@sha256:54467c7764a3e6579199af1914bb779f01ce32265cd552eb5ae0d4f8a2b80a97
     container_name: victoriametrics
     restart: unless-stopped
     ports:

@@ -1,0 +1,11 @@
+# Re-pin the SHA-pinned GitHub Actions when upstream tags move (issue #1).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"

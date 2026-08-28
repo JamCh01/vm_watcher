@@ -24,11 +24,11 @@ on:
 # Bumping ANY of the three requires re-verifying the other two (bitcode
 # version mismatch fails the eBPF link with "Invalid record").
 #
-# SUPPLY-CHAIN TODO (issue #1): every `uses:` below is pinned by MUTABLE TAG,
-# not by commit SHA, and the LLVM install pipes apt.llvm.org/llvm.sh to bash.
-# SHAs must be copied from the official repositories (never guessed); until
-# then this workflow is not fully reproducible. The VictoriaMetrics compose
-# image is likewise unpinned (see dist/docker-compose.yml).
+# SUPPLY-CHAIN (issue #1, resolved): every `uses:` below is pinned to an
+# immutable commit SHA resolved from the official repository (tag kept in the
+# comment; re-pin via dependabot). The apt.llvm.org installer is downloaded and
+# sha256-verified against the pinned hash below BEFORE running. The
+# VictoriaMetrics compose image is pinned by tag AND digest.
 # ---------------------------------------------------------------------------
 
 concurrency:
@@ -55,14 +55,14 @@ jobs:
           apt-get install -y --no-install-recommends \
             git curl ca-certificates xz-utils build-essential pkg-config
 
-      - uses: actions/checkout@v7 # TODO(supply-chain): pin to immutable commit SHA
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable # TODO(supply-chain): pin to immutable commit SHA
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (thin rustup wrapper; the toolchain INPUT is what rolls)
         with:
           components: rustfmt, clippy
 
       # Must run after the toolchain is selected (keys include the rustc version).
-      - uses: Swatinem/rust-cache@v2 # TODO(supply-chain): pin to immutable commit SHA
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -88,27 +88,31 @@ jobs:
           # apt.llvm.org hosts LLVM 22 for trixie; the pinned nightly's LLVM
           # (22.1.x) must not be newer than bpf-linker's LLVM or the bitcode
           # fails to link ("Invalid record").
-          # TODO(supply-chain, issue #1): this pipes an external script to bash;
-          # replace with distro LLVM packages or a pinned+checksummed copy.
-          wget -qO- https://apt.llvm.org/llvm.sh | bash -s -- 22
+          # Pinned installer (issue #1): download, verify the sha256 recorded below
+          # (fetched from apt.llvm.org on 2026-08-28), then run. A hash mismatch
+          # fails the job instead of executing a changed script. Re-pin by updating
+          # the hash after inspecting the new script.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          echo "03878e08f47b66cc95bc4b544b0db3c6d9ce8d60e6cf2492ae357984330a9eae  /tmp/llvm.sh" | sha256sum -c -
+          bash /tmp/llvm.sh 22
           apt-get install -y --no-install-recommends \
             llvm-22-dev libclang-22-dev libpolly-22-dev
 
-      - uses: actions/checkout@v7 # TODO(supply-chain): pin to immutable commit SHA
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Pinned nightly: its LLVM version must stay compatible with bpf-linker.
       # @master + explicit toolchain input because the action only keeps
       # per-date branches for recent nightlies.
-      - uses: dtolnay/rust-toolchain@master # TODO(supply-chain): pin to immutable commit SHA
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (thin rustup wrapper; the toolchain INPUT is what rolls)
         with:
           toolchain: nightly-2026-06-15
           components: rust-src, clippy
 
-      - uses: Swatinem/rust-cache@v2 # TODO(supply-chain): pin to immutable commit SHA
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Cache bpf-linker
         id: cache-bpf-linker
-        uses: actions/cache@v4 # TODO(supply-chain): pin to immutable commit SHA
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: /root/.cargo/bin/bpf-linker
           key: bpf-linker-0.11.0-llvm22-${{ runner.arch }}
@@ -130,7 +134,7 @@ jobs:
         run: VM_BW_EBPF_TOOLCHAIN=nightly-2026-06-15 cargo build --release
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4 # TODO(supply-chain): pin to immutable commit SHA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vm-bandwidth-monitor-linux-x86_64
           path: target/release/vm-bandwidth-monitor
@@ -145,7 +149,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Download binary
-        uses: actions/download-artifact@v4 # TODO(supply-chain): pin to immutable commit SHA
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: vm-bandwidth-monitor-linux-x86_64
           path: dist
@@ -155,7 +159,7 @@ jobs:
         run: mv dist/vm-bandwidth-monitor "dist/vm-bandwidth-monitor-${GITHUB_REF_NAME}-linux-x86_64"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2 # TODO(supply-chain): pin to immutable commit SHA
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/vm-bandwidth-monitor-*
           generate_release_notes: true
