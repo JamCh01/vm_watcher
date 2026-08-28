@@ -1427,3 +1427,177 @@ mod lock_tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::{handle_connection, IpcReq};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::sync::mpsc;
+    use vm_bandwidth_core::ipc::{
+        validate_frame_len, IpDetail, RangeDetail, Request, Response, MAX_REQUEST_FRAME,
+        MAX_RESPONSE_FRAME,
+    };
+
+    /// Client-side framing exactly like the UI: 4-byte BE length + body.
+    async fn write_raw(stream: &mut UnixStream, body: &[u8]) {
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(body).await.unwrap();
+    }
+
+    /// Read one frame, validating the untrusted length BEFORE allocating.
+    async fn read_frame(stream: &mut UnixStream, max: usize) -> Vec<u8> {
+        let mut lenbuf = [0u8; 4];
+        stream.read_exact(&mut lenbuf).await.unwrap();
+        let len = validate_frame_len(u32::from_be_bytes(lenbuf), max).unwrap();
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.unwrap();
+        body
+    }
+
+    /// One half of a socket pair behind handle_connection; the test side owns the
+    /// engine-channel receiver and decides what (if anything) gets answered.
+    fn pair() -> (UnixStream, mpsc::Receiver<IpcReq>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::channel::<IpcReq>(8);
+        tokio::spawn(handle_connection(server, tx));
+        (client, rx)
+    }
+
+    fn big_range_detail(ips: u32) -> Response {
+        Response::RangeDetail(Box::new(RangeDetail {
+            name: "big".to_string(),
+            range: "10.0.0.0/8".to_string(),
+            ips: (0..ips)
+                .map(|i| IpDetail {
+                    ip: i,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    // 1. Small request / small response round-trip.
+    #[tokio::test]
+    async fn small_roundtrip() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+
+        let (req, reply) = rx.recv().await.expect("request reached the engine");
+        assert!(matches!(req, Request::Overview));
+        let status = vm_bandwidth_core::ipc::Status {
+            protocol_version: vm_bandwidth_core::ipc::PROTOCOL_VERSION,
+            ..Default::default()
+        };
+        reply.send(Response::Status(Box::new(status))).unwrap();
+
+        let body = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&body) {
+            Response::Status(s) => {
+                assert_eq!(s.protocol_version, vm_bandwidth_core::ipc::PROTOCOL_VERSION)
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    // 2. A legitimate large response (64 KiB < size < 8 MiB) travels intact: the old
+    //    single-codec design refused to encode it at all.
+    #[tokio::test]
+    async fn large_response_between_request_and_response_limits() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+
+        let (_, reply) = rx.recv().await.unwrap();
+        let resp = big_range_detail(400);
+        let size = serde_json::to_vec(&resp).unwrap().len();
+        assert!(
+            size > MAX_REQUEST_FRAME && size < MAX_RESPONSE_FRAME,
+            "test payload must sit between the two limits, got {size}"
+        );
+        reply.send(resp).unwrap();
+
+        let body = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&body) {
+            Response::RangeDetail(d) => assert_eq!(d.ips.len(), 400),
+            other => panic!("expected range detail, got {other:?}"),
+        }
+    }
+
+    // 3. An oversized request is refused by the request-side limit and NEVER reaches
+    //    the engine channel; the client gets a meaningful error.
+    #[tokio::test]
+    async fn oversized_request_refused_before_engine() {
+        let (mut client, mut rx) = pair();
+        // Any body above MAX_REQUEST_FRAME: the codec refuses before JSON parsing.
+        let body = vec![b'x'; MAX_REQUEST_FRAME + 1];
+        write_raw(&mut client, &body).await;
+
+        let err = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&err) {
+            Response::Error { message } => {
+                assert!(message.contains("request rejected"), "{message}")
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "oversized request must not reach the engine channel"
+        );
+    }
+
+    // 4. A response above MAX_RESPONSE_FRAME does NOT silently disconnect: the client
+    //    receives a size-controlled Response::Error naming the limit.
+    #[tokio::test]
+    async fn oversized_response_becomes_controlled_error() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+
+        let (_, reply) = rx.recv().await.unwrap();
+        let resp = big_range_detail(26_000);
+        assert!(serde_json::to_vec(&resp).unwrap().len() > MAX_RESPONSE_FRAME);
+        reply.send(resp).unwrap();
+
+        let body = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&body) {
+            Response::Error { message } => {
+                assert!(message.contains("protocol limit"), "{message}");
+                assert!(message.contains("map_max_entries"), "{message}");
+            }
+            other => panic!("expected controlled error, got {other:?}"),
+        }
+    }
+
+    // 5. Frame-limit boundaries, both directions, pure.
+    #[test]
+    fn frame_limits_boundaries() {
+        for max in [MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME] {
+            assert_eq!(validate_frame_len(max as u32 - 1, max), Ok(max - 1));
+            assert_eq!(validate_frame_len(max as u32, max), Ok(max));
+            assert!(validate_frame_len(max as u32 + 1, max).is_err());
+            assert!(validate_frame_len(u32::MAX, max).is_err());
+        }
+    }
+
+    fn ipc_decode(body: &[u8]) -> Response {
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+        serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+            panic!("undecodable response: {v}");
+        })
+    }
+}
