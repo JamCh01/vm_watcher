@@ -2111,9 +2111,11 @@ mod lock_tests {
 #[cfg(test)]
 mod ipc_tests {
     use super::{handle_connection, IpcReq};
+    use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio::sync::mpsc;
+    use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
     use vm_bandwidth_core::ipc::{
         validate_frame_len, IpDetail, RangeDetail, Request, Response, MAX_REQUEST_FRAME,
         MAX_RESPONSE_FRAME,
@@ -2271,6 +2273,78 @@ mod ipc_tests {
             assert_eq!(validate_frame_len(max as u32, max), Ok(max));
             assert!(validate_frame_len(max as u32 + 1, max).is_err());
             assert!(validate_frame_len(u32::MAX, max).is_err());
+        }
+    }
+
+    /// A RangeDetail with an ASCII-padded name: serialized length is base + pad,
+    /// so one measurement plus one delta adjustment lands exactly on a target.
+    fn padded_range_detail(pad: usize) -> Response {
+        Response::RangeDetail(Box::new(RangeDetail {
+            name: "a".repeat(pad),
+            range: "10.0.0.0/8".to_string(),
+            ips: (0..32)
+                .map(|i| IpDetail {
+                    ip: i,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    // 6. A response body of EXACTLY MAX_RESPONSE_FRAME round-trips over a real
+    //    socket through the daemon's real FramedWrite and a real client codec.
+    //    Pure validate_frame_len boundaries are covered above; this exercises the
+    //    ceiling on the wire. Payload size is adjusted dynamically against the
+    //    actual serde_json output length (no assumed JSON overhead).
+    #[tokio::test]
+    async fn response_at_exactly_max_frame_round_trips_over_real_socket() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+        let (_, reply) = rx.recv().await.unwrap();
+
+        let mut pad = MAX_RESPONSE_FRAME - 1_000_000;
+        let resp = loop {
+            let candidate = padded_range_detail(pad);
+            let len = serde_json::to_vec(&candidate).unwrap().len();
+            if len == MAX_RESPONSE_FRAME {
+                break candidate;
+            }
+            // ASCII padding is byte-linear in the JSON output: one delta lands it.
+            pad = (pad as i64 + MAX_RESPONSE_FRAME as i64 - len as i64) as usize;
+        };
+        reply.send(resp).unwrap();
+
+        // Client side: a real LengthDelimitedCodec configured with the response
+        // ceiling, reading the whole frame off the socket.
+        let mut framed = FramedRead::new(
+            client,
+            LengthDelimitedCodec::builder()
+                .length_field_type::<u32>()
+                .max_frame_length(MAX_RESPONSE_FRAME)
+                .new_codec(),
+        );
+        let frame = framed
+            .next()
+            .await
+            .expect("frame expected")
+            .expect("frame must decode at the ceiling");
+        assert_eq!(
+            frame.len(),
+            MAX_RESPONSE_FRAME,
+            "body must sit exactly on the response ceiling"
+        );
+        match serde_json::from_slice::<Response>(&frame).unwrap() {
+            Response::RangeDetail(rd) => {
+                assert_eq!(rd.ips.len(), 32, "payload content must be intact");
+                assert_eq!(rd.name.len(), pad);
+                assert!(rd.name.bytes().all(|b| b == b'a'));
+            }
+            other => panic!("expected range detail, got {other:?}"),
         }
     }
 
