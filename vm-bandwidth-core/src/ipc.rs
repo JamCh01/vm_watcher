@@ -90,9 +90,14 @@ pub struct Status {
     /// Operational counters, cumulative since daemon start (additive protocol
     /// fields: older daemons omit them, `#[serde(default)]` → 0).
     ///
-    /// `metrics_push_successes_total` can lag reality by one push interval: a
-    /// push cannot observe its own success while it is still running, so the
-    /// value is final only once the NEXT push completes.
+    /// Lag semantics — two DIFFERENT surfaces:
+    /// - IPC `Status` (this struct): reads the process atomics directly, so
+    ///   these values are CURRENT at query time and never lag.
+    /// - The VictoriaMetrics payload: a push cannot include its own outcome
+    ///   (it has not finished yet), so the `vmbw_metrics_push_successes_total`
+    ///   SERIES exported to VM lags the true count by at most one push
+    ///   interval. failures/skipped are rendered before the request, so they
+    ///   are current even in the payload.
     #[serde(default)]
     pub tap_attach_failures_total: u64,
     #[serde(default)]

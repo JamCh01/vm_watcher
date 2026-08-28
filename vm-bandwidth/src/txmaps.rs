@@ -100,8 +100,14 @@ pub struct RollbackReport {
     pub attempted: usize,
     pub succeeded: usize,
     pub failures: Vec<RollbackFailure>,
-    /// False when any step failed: at least one flow is unarmed that used to be
-    /// armed (fail-open) or a whitelist entry could not be restored.
+    /// False when any rollback step failed. A rollback failure means the
+    /// intended pre-transaction state was not fully restored; the surviving
+    /// dataplane state depends on the failed step and is reported per
+    /// `RollbackFailure` (e.g. a failed disarm-new leaves the NEW policy armed
+    /// with its state, a failed re-arm leaves the flow unarmed with a bounded
+    /// orphan state). It does NOT uniformly mean every affected flow is
+    /// unarmed. The hard invariant `armed policy => matching state exists`
+    /// holds either way.
     pub dataplane_consistent: bool,
 }
 
