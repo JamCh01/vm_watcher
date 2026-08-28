@@ -2876,7 +2876,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vm-bandwidth"
-version = "0.4.6"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2905,14 +2905,14 @@ dependencies = [
 
 [[package]]
 name = "vm-bandwidth-common"
-version = "0.4.6"
+version = "0.7.0"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "vm-bandwidth-core"
-version = "0.4.6"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2923,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "vm-bandwidth-ebpf"
-version = "0.4.6"
+version = "0.7.0"
 dependencies = [
  "aya-ebpf",
  "network-types",
