@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use aya::maps::{MapData, PerCpuHashMap};
-use vm_bandwidth_common::{LimitKey, PolicerStats, TrafficKey, TrafficKey6, TrafficValue};
+use vm_bandwidth_common::{LimitKey, PolicerStats, TrafficKey, TrafficValue};
 
 use vm_bandwidth_core::ip_range::IpRange;
 use vm_bandwidth_core::limiter::IpTotals;
@@ -110,7 +110,7 @@ pub struct Snapshot {
 #[derive(Debug, Default)]
 pub struct PollInputs {
     pub cur: HashMap<TrafficKey, TrafficValue>,
-    pub cur6: HashMap<TrafficKey6, TrafficValue>,
+    pub cur6: HashMap<u32, TrafficValue>,
     pub cur_policer: HashMap<LimitKey, PolicerStats>,
 }
 
@@ -127,7 +127,8 @@ pub struct PollResult {
     pub policer: HashMap<u32, PolicerIpTotals>,
     /// Counter-map keys idle long enough to be evicted (daemon removes them).
     pub stale_traffic: Vec<TrafficKey>,
-    pub stale_traffic6: Vec<TrafficKey6>,
+    /// TAP ifindexes whose aggregate IPv6 counters went idle.
+    pub stale_traffic6: Vec<u32>,
 }
 
 /// Cumulative policer verdicts for one IP (both directions), for metrics export.
@@ -169,13 +170,13 @@ impl Delta {
 pub struct Collector {
     prev: HashMap<TrafficKey, TrafficValue>,
     totals: HashMap<u32, IpStats>,
-    prev6: HashMap<TrafficKey6, TrafficValue>,
+    prev6: HashMap<u32, TrafficValue>,
     /// Running IPv6 aggregate (cumulative counters + last-interval rates).
     ipv6: IpStats,
     prev_policer: HashMap<LimitKey, PolicerStats>,
     /// Idle-eviction tracking per counter-map key (see [`IdleTracker`]).
     idle4: IdleTracker<TrafficKey>,
-    idle6: IdleTracker<TrafficKey6>,
+    idle6: IdleTracker<u32>,
     last_poll: Option<Instant>,
 }
 
@@ -203,17 +204,24 @@ impl Collector {
         self.prev_policer.retain(|key, _| kept(&key.ipv4));
     }
 
+    /// Running IPv6 aggregate (test/inspection accessor).
+    #[cfg(test)]
+    fn ipv6_total(&self) -> u64 {
+        self.ipv6.rx_bytes + self.ipv6.tx_bytes
+    }
+
     /// Drop previous-sample entries for TAPs that no longer exist (pairs that can never
     /// produce a delta again).
     pub fn prune_ifindexes(&mut self, live: &HashSet<u32>) {
         self.prev.retain(|key, _| live.contains(&key.ifindex));
-        self.prev6.retain(|key, _| live.contains(&key.ifindex));
+        // TRAFFIC6 keys ARE the ifindex (per-TAP aggregation).
+        self.prev6.retain(|key, _| live.contains(key));
     }
 
     pub fn poll(
         &mut self,
         traffic: &PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
-        traffic6: &PerCpuHashMap<MapData, TrafficKey6, TrafficValue>,
+        traffic6: &PerCpuHashMap<MapData, u32, TrafficValue>,
         policer: &PerCpuHashMap<MapData, LimitKey, PolicerStats>,
         ranges: &[IpRange],
     ) -> PollResult {
@@ -243,7 +251,7 @@ impl Collector {
             }
         }
 
-        let mut cur6: HashMap<TrafficKey6, TrafficValue> = HashMap::new();
+        let mut cur6: HashMap<u32, TrafficValue> = HashMap::new();
         for item in traffic6.iter() {
             match item {
                 Ok((key, values)) => {
@@ -353,8 +361,8 @@ impl Collector {
                 }
             }
         }
-        let present6: HashSet<TrafficKey6> = cur6.keys().copied().collect();
-        let changed6: HashSet<TrafficKey6> = cur6
+        let present6: HashSet<u32> = cur6.keys().copied().collect();
+        let changed6: HashSet<u32> = cur6
             .iter()
             .filter(|(k, v)| self.prev6.get(k).map(|p| p != *v).unwrap_or(true))
             .map(|(k, _)| *k)
@@ -529,6 +537,60 @@ mod tests {
                                                             // A key gone from the map stops being tracked: it must re-idle from zero.
         assert!(t.observe(&nothing, &nothing).is_empty());
         assert!(t.observe(&present, &nothing).is_empty());
+    }
+
+    // ---------- IPv6 per-TAP aggregation tests ----------
+
+    /// One poll round feeding only aggregate IPv6 counters (keyed by TAP ifindex).
+    fn round6(c: &mut Collector, cur6: &[(u32, TrafficValue)]) -> PollResult {
+        let inputs = PollInputs {
+            cur: HashMap::new(),
+            cur6: cur6.iter().copied().collect(),
+            cur_policer: HashMap::new(),
+        };
+        c.apply_poll(inputs, 1.0, &[])
+    }
+
+    // IPv6 counters are aggregated PER TAP: the key space grows with the number of
+    // TAPs, never with the number of addresses a VM rotates through. A thousand
+    // rotated source addresses on one TAP stay ONE map key by construction; the
+    // collector sees exactly that shape here.
+    #[test]
+    fn ipv6_cardinality_is_bounded_by_tap_count() {
+        let mut c = Collector::new();
+        // Baseline round.
+        round6(&mut c, &[(7, tval(1000, 0))]);
+        // One key in, one key out — however many addresses produced the bytes.
+        let r = round6(&mut c, &[(7, tval(1000 + 64_000, 0))]);
+        assert_eq!(r.ipv6.rx_bytes, 64_000);
+        assert!((r.ipv6.rx_bps - 64_000.0 * 8.0).abs() < 1e-9);
+        // A second TAP adds exactly one more key; its first round is the baseline,
+        // so only the first TAP's fresh delta lands this round.
+        let r = round6(&mut c, &[(7, tval(65_000 + 100, 0)), (8, tval(50, 0))]);
+        assert_eq!(r.ipv6.rx_bytes, 64_000 + 100);
+        let r = round6(&mut c, &[(7, tval(65_100, 0)), (8, tval(50 + 25, 0))]);
+        assert_eq!(r.ipv6.rx_bytes, 64_000 + 100 + 25);
+    }
+
+    // Idle eviction tracks the ifindex aggregate and is rebaselined on return.
+    #[test]
+    fn ipv6_idle_eviction_and_reappearance() {
+        let mut c = Collector::new();
+        round6(&mut c, &[(7, tval(1000, 0))]);
+        let mut stale = Vec::new();
+        for _ in 0..IDLE_EVICT_POLLS {
+            let r = round6(&mut c, &[(7, tval(1000, 0))]);
+            stale = r.stale_traffic6;
+        }
+        assert_eq!(stale, vec![7]);
+        // Key gone (daemon removed it): the running aggregate keeps its history.
+        let total_before = c.ipv6_total();
+        round6(&mut c, &[]);
+        assert_eq!(c.ipv6_total(), total_before);
+        // Traffic returns: rebaselined, no spike.
+        round6(&mut c, &[(7, tval(100, 0))]);
+        let r = round6(&mut c, &[(7, tval(160, 0))]);
+        assert!((r.ipv6.rx_bps - 60.0 * 8.0).abs() < 1e-9);
     }
 
     // ---------- consecutive-poll tests (drive the pure apply_poll directly) ----------

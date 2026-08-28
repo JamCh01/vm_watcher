@@ -26,8 +26,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, LimitState, PolicerStats, SwlRing, TrafficKey, TrafficKey6,
-    TrafficValue, ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
+    LimitKey, LimitPolicy, LimitState, PolicerStats, SwlRing, TrafficKey, TrafficValue,
+    ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
 };
 
 use vm_bandwidth_core::config::{self, ValidatedConfig};
@@ -139,7 +139,9 @@ struct Engine {
     /// the `sliding_window_log` algorithm.
     swl_log: AyaHashMap<MapData, LimitKey, SwlRing>,
     traffic: PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
-    traffic6: PerCpuHashMap<MapData, TrafficKey6, TrafficValue>,
+    /// Aggregate IPv6 counters per TAP ifindex (cardinality bounded by TAP count,
+    /// not by address churn — see the eBPF TRAFFIC6 comment).
+    traffic6: PerCpuHashMap<MapData, u32, TrafficValue>,
     policer_stats: PerCpuHashMap<MapData, LimitKey, PolicerStats>,
     /// Shared HTTP client for the VictoriaMetrics push.
     http: reqwest::Client,
@@ -875,7 +877,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         base.take_map("TRAFFIC").context("TRAFFIC missing")?,
     )
     .context("TRAFFIC has the wrong type")?;
-    let traffic6 = PerCpuHashMap::<MapData, TrafficKey6, TrafficValue>::try_from(
+    let traffic6 = PerCpuHashMap::<MapData, u32, TrafficValue>::try_from(
         base.take_map("TRAFFIC6").context("TRAFFIC6 missing")?,
     )
     .context("TRAFFIC6 has the wrong type")?;

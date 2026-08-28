@@ -47,7 +47,7 @@ use network_types::{
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use vm_bandwidth_common::{
-    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, PolicerStats, SwlEntry, TrafficKey, TrafficKey6,
+    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, PolicerStats, SwlEntry, TrafficKey,
     TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
     ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, ETHERTYPE_IPV4,
     ETHERTYPE_IPV6, SWL_LOG_CAP, VLAN_HDR_LEN,
@@ -78,11 +78,13 @@ static MONITORED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(MAP_CAPACITY 
 #[btf_map]
 static TRAFFIC: PerCpuHashMap<TrafficKey, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
 
-/// (ifindex, ipv6) -> per-CPU monotonic counters. IPv6 is counted but never
-/// policed and has no whitelist (config has no IPv6 ranges); the map cap is the
-/// only bound on distinct flows.
+/// ifindex -> aggregate per-CPU IPv6 counters. IPv6 is counted but never policed and
+/// has no whitelist (config has no IPv6 ranges). Counters are aggregated PER TAP on
+/// purpose: userspace only ever shows one IPv6 total, and keying by address would let
+/// a single VM exhaust the map by rotating source addresses (IPv6 privacy addresses).
+/// Cardinality is bounded by the number of TAPs instead of the number of addresses.
 #[btf_map]
-static TRAFFIC6: PerCpuHashMap<TrafficKey6, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
+static TRAFFIC6: PerCpuHashMap<u32, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
 
 /// (ipv4, direction) -> limiter policy installed by the daemon. Absent or
 /// `enabled == 0` means the flow is not policed.
@@ -268,21 +270,20 @@ fn handle_v6(ctx: &TcContext, is_tx: bool, l3_off: usize) -> i32 {
         Ok(i) => i,
         Err(_) => return TC_ACT_PIPE,
     };
-    // Extension headers, when present, come after the fixed 40-byte header, so the
-    // addresses are always at these offsets.
-    let addr = if is_tx { ip.src_addr } else { ip.dst_addr };
+    // The address itself is deliberately NOT part of the counter key: aggregate
+    // per-TAP counting bounds map cardinality at the number of TAPs (see TRAFFIC6).
+    // (The header is still validated by the load above.)
+    let _ = ip;
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    unsafe { count6(ctx, &addr, ifindex, is_tx) };
+    unsafe { count6(ctx, ifindex, is_tx) };
     TC_ACT_PIPE
 }
 
-/// Accumulate byte/packet counters for one IPv6 flow. Never fails the packet.
+/// Accumulate byte/packet counters for one TAP's aggregate IPv6 traffic. Never fails
+/// the packet.
 #[inline(always)]
-unsafe fn count6(ctx: &TcContext, ipv6: &[u8; 16], ifindex: u32, is_tx: bool) {
-    let key = TrafficKey6 {
-        ifindex,
-        ipv6: *ipv6,
-    };
+unsafe fn count6(ctx: &TcContext, ifindex: u32, is_tx: bool) {
+    let key = ifindex;
     let value = match TRAFFIC6.get_ptr_mut(key) {
         Some(ptr) => &mut *ptr,
         None => {
@@ -290,7 +291,7 @@ unsafe fn count6(ctx: &TcContext, ipv6: &[u8; 16], ifindex: u32, is_tx: bool) {
             #[allow(clippy::needless_borrows_for_generic_args)]
             if TRAFFIC6
                 .insert(
-                    &key,
+                    key,
                     &TrafficValue {
                         rx_bytes: 0,
                         tx_bytes: 0,
