@@ -122,6 +122,36 @@ ip addr add 10.0.0.99/24 dev eth0          # B 自己的临时地址
 
 同样的步骤对 IPv6 源地址重复一次（隐私地址轮换场景）。
 
+## 6. 缺席键删除的 errno 变体（`map_gone` / 计数器清理依赖项）
+
+前置条件：任意 Linux + root + `bpftool`（不需要加载本程序）。
+
+counter map 的空闲淘汰与 stale-TAP 清理（`daemon.rs::remove_counter_keys`）把“键本就不在”视为删除成功。这个判定按**类型化错误变体**匹配，不做错误字符串匹配：
+
+- `MapError::KeyNotFound` / `MapError::ElementNotFound`；
+- `MapError::SyscallError(se)` 且 `se.io_error.kind() == NotFound`；
+- `MapError::IoError(io)` 且 `io.kind() == NotFound`。
+
+aya 0.14 的 `hash_map::remove` 把 `bpf_map_delete_elem` 的失败包成 `SyscallError`（源码路径已核对），因此内核返回 ENOENT 时落入第二个变体——但**内核实际返回的 errno 未在真实环境裁决过**，在那之前保持保守：未匹配的变体一律计为失败、按键记日志、下一轮重试，绝不静默当成功。
+
+验证步骤：
+
+```bash
+bpftool map create name probe type hash key 4 value 4 entries 8
+# 删除一个从未写入的键：预期报错包含 ENOENT（“No such file or directory”）
+bpftool map delete name probe key 0x01 0x02 0x03 0x04
+echo "exit=$?"
+bpftool map delete name probe key 0x01 0x02 0x03 0x04 2>&1 | cat
+bpftool map show name probe    # 记录内核版本与 map 参数，写入本节结论
+```
+
+判定标准：
+
+- [ ] 缺席键删除返回 ENOENT（或 aya 映射后的上述变体之一）→ 现有类型化匹配成立，记录内核版本；
+- [ ] 返回其它 errno/变体 → 在 `remove_counter_keys` 的匹配分支中补上该变体（仍按类型，不按字符串），并回归本节。
+
+本项未闭环前，不得声称“缺席键即成功”已在生产内核验证；默认 CI 不要求 root，故本节只存在于文档。
+
 ---
 
 以上任何一项的结果变化（内核升级、offload 策略变化、平台过滤规则变化）都应重新
