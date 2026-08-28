@@ -176,19 +176,33 @@ struct HeaderLine {
 }
 
 const PRIO_PLAIN: u8 = 1;
-const PRIO_NOTE: u8 = 2;
-const PRIO_CONFIG_FAILURE: u8 = 3;
-const PRIO_WATCHER: u8 = 4;
-const PRIO_DEGRADED: u8 = 5;
-const PRIO_ERROR: u8 = 6;
+const PRIO_SPOOF: u8 = 2;
+const PRIO_NOTE: u8 = 3;
+const PRIO_CONFIG_FAILURE: u8 = 4;
+const PRIO_WATCHER: u8 = 5;
+const PRIO_DEGRADED: u8 = 6;
+const PRIO_ERROR: u8 = 7;
+
+// The keep-priority ladder, pinned at compile time: daemon error > dataplane
+// degraded > watcher unhealthy > config/reload failure > protocol warning >
+// anti-spoof warning > plain info.
+const _: () = {
+    assert!(PRIO_ERROR > PRIO_DEGRADED);
+    assert!(PRIO_DEGRADED > PRIO_CONFIG_FAILURE);
+    assert!(PRIO_CONFIG_FAILURE > PRIO_NOTE);
+    assert!(PRIO_NOTE > PRIO_SPOOF);
+    assert!(PRIO_SPOOF > PRIO_PLAIN);
+};
 
 /// Build every header line the current state asks for (no truncation here).
 fn header_lines(app: &UiState) -> Vec<HeaderLine> {
     let status = app.status.as_ref();
     let tap_count = status.map(|s| s.tap_count).unwrap_or(0);
     let generation = status.map(|s| s.generation).unwrap_or(0);
+    let mut reload_failed = false;
     let reload_line = match status {
         Some(s) if !s.last_reload_at.is_empty() => {
+            reload_failed = !s.last_reload_ok;
             let state = if s.last_reload_ok { "OK" } else { "FAILED" };
             let mut line = format!(
                 "Config generation: {}    Last reload: {}    Status: {}",
@@ -220,11 +234,27 @@ fn header_lines(app: &UiState) -> Vec<HeaderLine> {
             )),
         },
         HeaderLine {
-            prio: PRIO_CONFIG_FAILURE,
+            // A successful reload / generation line is plain info and must not
+            // out-priority a protocol or anti-spoof warning; only an actual
+            // reload failure earns the config-failure priority.
+            prio: if reload_failed {
+                PRIO_CONFIG_FAILURE
+            } else {
+                PRIO_PLAIN
+            },
             line: Line::from(reload_line),
         },
     ];
     if let Some(s) = status {
+        if !s.anti_spoof_acknowledged {
+            lines.push(HeaderLine {
+                prio: PRIO_SPOOF,
+                line: Line::from(Span::styled(
+                    "ANTI-SPOOF: external anti-spoofing not confirmed by this daemon",
+                    Style::default().fg(ratatui::style::Color::Yellow),
+                )),
+            });
+        }
         if !s.config_watcher_healthy {
             lines.push(HeaderLine {
                 prio: PRIO_WATCHER,
@@ -1057,6 +1087,23 @@ mod header_tests {
             config_watcher_last_error: "inotify failed".to_string(),
             dataplane_degraded: true,
             rollback_failures_total: 2,
+            anti_spoof_acknowledged: true,
+            ..Default::default()
+        }
+    }
+
+    fn ok_status() -> Status {
+        Status {
+            protocol_version: 1,
+            generation: 3,
+            config_loaded_at: "t0".to_string(),
+            last_reload_at: "t1".to_string(),
+            last_reload_ok: true,
+            last_reload_error: String::new(),
+            bridge: "br0".to_string(),
+            tap_count: 2,
+            config_watcher_healthy: true,
+            anti_spoof_acknowledged: true,
             ..Default::default()
         }
     }
@@ -1131,6 +1178,71 @@ mod header_tests {
             app.error = Some("daemon gone".to_string());
             render(&mut app, w, h); // must return without panicking
         }
+    }
+
+    /// 1 content row: header border 2 + content 1 + body min 1 + footer 1.
+    const ONE_LINE_TERMINAL: (u16, u16) = (120, 5);
+
+    #[test]
+    fn successful_reload_loses_to_protocol_warning() {
+        let mut app = base_app();
+        app.status = Some(ok_status()); // successful reload => plain priority
+        app.protocol_note = Some("daemon newer".to_string());
+        let text = render(&mut app, ONE_LINE_TERMINAL.0, ONE_LINE_TERMINAL.1);
+        assert!(text.contains("protocol: daemon newer"), "{text}");
+        assert!(
+            !text.contains("Config generation"),
+            "plain generation line must be droppable: {text}"
+        );
+    }
+
+    #[test]
+    fn reload_failure_beats_protocol_warning() {
+        let mut app = base_app();
+        let mut status = ok_status();
+        status.last_reload_ok = false;
+        status.last_reload_error = "bad field".to_string();
+        app.status = Some(status);
+        app.protocol_note = Some("daemon newer".to_string());
+        let text = render(&mut app, ONE_LINE_TERMINAL.0, ONE_LINE_TERMINAL.1);
+        assert!(text.contains("Status: FAILED"), "{text}");
+        assert!(!text.contains("protocol:"), "{text}");
+    }
+
+    #[test]
+    fn equal_priority_lines_keep_their_stable_order() {
+        let mut app = base_app();
+        let mut status = ok_status();
+        status.last_reload_ok = false;
+        status.last_reload_error = "bad field".to_string();
+        app.status = Some(status);
+        // config warning shares PRIO_CONFIG_FAILURE with the failed reload line.
+        app.config_warning = Some("swl experimental".to_string());
+        app.protocol_note = Some("daemon newer".to_string());
+        // 2 content rows: the two config-failure lines survive IN ORIGINAL
+        // ORDER; the lower-priority protocol note is dropped.
+        let text = render(&mut app, 120, 6);
+        let reload_row = text.find("Status: FAILED").expect("reload line kept");
+        let warning_row = text.find("config: swl experimental").expect("warning kept");
+        assert!(
+            reload_row < warning_row,
+            "equal priorities must keep visual order:\n{text}"
+        );
+        assert!(!text.contains("protocol:"), "{text}");
+    }
+
+    #[test]
+    fn anti_spoof_warning_beats_plain_but_loses_to_protocol() {
+        let mut app = base_app();
+        let mut status = ok_status();
+        status.anti_spoof_acknowledged = false; // legacy daemon: unconfirmed
+        app.status = Some(status);
+        app.protocol_note = Some("daemon newer".to_string());
+        // 2 content rows: protocol (3) and anti-spoof (2) survive; plain lines drop.
+        let text = render(&mut app, 120, 6);
+        assert!(text.contains("protocol: daemon newer"), "{text}");
+        assert!(text.contains("ANTI-SPOOF"), "{text}");
+        assert!(!text.contains("VM Bandwidth Monitor"), "{text}");
     }
 }
 
