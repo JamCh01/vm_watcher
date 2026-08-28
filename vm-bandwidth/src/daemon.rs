@@ -23,9 +23,10 @@ use futures::{SinkExt, StreamExt};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::RecursiveMode;
 use notify_debouncer_full::Debouncer;
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use vm_bandwidth_common::{
     LimitKey, LimitPolicy, LimitState, OversizedStats, PolicerStats, SwlRing, TrafficKey,
     TrafficValue, ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
@@ -1151,24 +1152,52 @@ fn acquire_instance_lock(path: &str) -> Result<File> {
 
 /// Serve one IPC client: length-delimited JSON request/response until it disconnects.
 async fn handle_connection(stream: UnixStream, tx: mpsc::Sender<IpcReq>) {
-    // Requests are tiny; refuse anything a legitimate client would never send.
-    let mut framed = Framed::new(
-        stream,
+    // The two directions carry asymmetric limits and get separate codecs: requests
+    // are tiny documents (MAX_REQUEST_FRAME protects the engine from abusive
+    // clients), while legitimate responses — a full RangeDetail — can reach several
+    // MiB (MAX_RESPONSE_FRAME). One shared codec would either admit huge requests or
+    // refuse our own large responses (LengthDelimitedCodec::encode enforces the same
+    // ceiling on writes).
+    let (read_half, write_half) = stream.into_split();
+    let mut requests = FramedRead::new(
+        read_half,
         LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
             .max_frame_length(ipc::MAX_REQUEST_FRAME)
             .new_codec(),
     );
-    while let Some(frame) = framed.next().await {
+    let mut responses = FramedWrite::new(
+        write_half,
+        LengthDelimitedCodec::builder()
+            .length_field_type::<u32>()
+            .max_frame_length(ipc::MAX_RESPONSE_FRAME)
+            .new_codec(),
+    );
+    while let Some(frame) = requests.next().await {
         let body = match frame {
             Ok(b) => b,
-            Err(_) => break,
+            Err(e) => {
+                // Codec-level refusal: frame above MAX_REQUEST_FRAME or malformed
+                // length framing. The payload never reached the engine channel. Tell
+                // the client why, then drop the connection.
+                log::warn!("IPC request rejected by frame limit: {e}");
+                let resp = Response::Error {
+                    message: format!("request rejected: {e}"),
+                };
+                if let Err(e) = send_response(&mut responses, &resp).await {
+                    log::warn!("could not report IPC request rejection: {e}");
+                }
+                break;
+            }
         };
         let req: Request = match ipc::decode(&body) {
             Ok(r) => r,
             Err(e) => {
                 let resp = Response::Error { message: e };
-                send_response(&mut framed, &resp).await;
+                if let Err(e) = send_response(&mut responses, &resp).await {
+                    log::warn!("IPC response failed: {e}");
+                    break;
+                }
                 continue;
             }
         };
@@ -1180,21 +1209,65 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::Sender<IpcReq>) {
             Ok(r) => r,
             Err(_) => break,
         };
-        if !send_response(&mut framed, &resp).await {
+        if let Err(e) = send_response(&mut responses, &resp).await {
+            log::warn!("IPC response failed: {e}");
             break;
         }
     }
 }
 
+/// One failure class per way a response can fail to leave the daemon; callers log
+/// the whole chain instead of a swallowed bool.
+#[derive(Debug)]
+enum SendFailure {
+    Encode(String),
+    TooLarge { body_len: usize, max: usize },
+    Write(String),
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode(e) => write!(f, "response serialization failed: {e}"),
+            Self::TooLarge { body_len, max } => write!(
+                f,
+                "response body of {body_len} bytes exceeds the {max}-byte protocol limit"
+            ),
+            Self::Write(e) => write!(f, "socket write failed: {e}"),
+        }
+    }
+}
+
+/// Send one response under the response-side frame ceiling. When the serialized body
+/// exceeds MAX_RESPONSE_FRAME the client gets a size-controlled Response::Error
+/// instead of a silent disconnect (and the caller still sees TooLarge for its logs).
 async fn send_response(
-    framed: &mut Framed<UnixStream, LengthDelimitedCodec>,
+    sink: &mut FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
     resp: &Response,
-) -> bool {
-    let body = match serde_json::to_vec(resp) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    framed.send(body.into()).await.is_ok()
+) -> Result<(), SendFailure> {
+    let body = serde_json::to_vec(resp).map_err(|e| SendFailure::Encode(e.to_string()))?;
+    if body.len() > ipc::MAX_RESPONSE_FRAME {
+        let message = format!(
+            "response body of {} bytes exceeds the {}-byte protocol limit; the range \
+             detail is bounded by collector.map_max_entries — reduce it or query a \
+             smaller range",
+            body.len(),
+            ipc::MAX_RESPONSE_FRAME
+        );
+        let err_resp = Response::Error { message };
+        let err_body =
+            serde_json::to_vec(&err_resp).map_err(|e| SendFailure::Encode(e.to_string()))?;
+        if let Err(e) = sink.send(err_body.into()).await {
+            return Err(SendFailure::Write(e.to_string()));
+        }
+        return Err(SendFailure::TooLarge {
+            body_len: body.len(),
+            max: ipc::MAX_RESPONSE_FRAME,
+        });
+    }
+    sink.send(body.into())
+        .await
+        .map_err(|e| SendFailure::Write(e.to_string()))
 }
 
 /// (Re)build the three engine timers from a config snapshot.
