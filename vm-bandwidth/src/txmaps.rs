@@ -50,13 +50,19 @@ pub trait WhitelistOps {
 }
 
 /// One journaled install: which policy was displaced and how far the new one got.
+/// Every progress flag is set ONLY after the corresponding map operation returned
+/// success — a record's existence alone never implies any step succeeded.
 #[derive(Debug, Clone)]
 pub struct InstallRecord {
     pub key: LimitKey,
     pub old: Option<LimitPolicy>,
-    /// Set once the NEW algorithm's state artifact has been written.
+    /// True only after the displaced policy was confirmed removed from
+    /// LIMIT_POLICIES. While false the old policy may still be armed and the
+    /// rollback must not rewrite or re-arm on top of it.
+    pub old_disarmed: bool,
+    /// Set only after the NEW algorithm's state artifact has been written.
     pub new_algorithm: Option<u32>,
-    /// Set once the new policy is armed.
+    /// Set only after the new policy is armed.
     pub armed: bool,
 }
 
@@ -65,6 +71,10 @@ pub struct InstallRecord {
 pub struct RemoveRecord {
     pub key: LimitKey,
     pub old: LimitPolicy,
+    /// True only after the policy was confirmed removed from LIMIT_POLICIES. While
+    /// false the old policy may still be armed with its state, and the rollback must
+    /// leave that pair untouched.
+    pub disarmed: bool,
 }
 
 /// Journal of executed operations, played back in reverse on failure.
@@ -108,14 +118,17 @@ pub fn install_limit<M: LimitMaps>(
     journal.installs.push(InstallRecord {
         key,
         old,
+        old_disarmed: false,
         new_algorithm: None,
         armed: false,
     });
     let rec = journal.installs.last_mut().expect("record just pushed");
 
     if let Some(old) = rec.old {
-        // Disarm first: no state may be rewritten while a policy is armed.
+        // Disarm first: no state may be rewritten while a policy is armed. The
+        // progress flag flips only once the removal is confirmed.
         m.disarm_policy(&key)?;
+        rec.old_disarmed = true;
         if old.algorithm != policy.algorithm {
             m.clear_state(&key, old.algorithm)?;
         }
@@ -132,8 +145,17 @@ pub fn remove_limit<M: LimitMaps>(m: &mut M, journal: &mut TxJournal, key: Limit
     let Some(old) = m.get_policy(&key)? else {
         return Ok(()); // nothing armed: removal is a no-op
     };
-    journal.removes.push(RemoveRecord { key, old });
+    journal.removes.push(RemoveRecord {
+        key,
+        old,
+        disarmed: false,
+    });
     m.disarm_policy(&key)?;
+    journal
+        .removes
+        .last_mut()
+        .expect("record just pushed")
+        .disarmed = true;
     m.clear_state(&key, old.algorithm)?;
     m.clear_policer(&key)?;
     Ok(())
@@ -179,36 +201,60 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
         report.attempted += 1;
         let mut ok = true;
         if rec.armed {
-            if let Err(e) = m.disarm_policy(&rec.key) {
-                fail(&mut report, rec.key, "disarm new policy", e);
-                ok = false;
+            match m.disarm_policy(&rec.key) {
+                Ok(()) => {}
+                Err(e) => {
+                    // The new policy may still be armed; its state artifact must not
+                    // be cleared, overwritten or replaced. Leaving the (new policy +
+                    // new state) pair in place still satisfies the hard invariant —
+                    // the dataplane keeps the NEW limit for this flow, and the report
+                    // says so. Stop this record's destructive rollback, but keep
+                    // rolling back the independent records so every failure surfaces.
+                    fail(
+                        &mut report,
+                        rec.key,
+                        "disarm new policy (kept new policy + state)",
+                        e,
+                    );
+                    continue;
+                }
             }
         }
         if let Some(algo) = rec.new_algorithm {
             if let Err(e) = m.clear_state(&rec.key, algo) {
                 fail(&mut report, rec.key, "clear new state", e);
                 ok = false;
+                // Continue: a leftover artifact is a bounded orphan; restoring the
+                // displaced policy matters more (a same-algorithm restore overwrites
+                // the leftover anyway).
             }
         }
         if let Some(old) = rec.old {
-            // Restore the displaced policy: fresh state FIRST, arming LAST. If the
-            // state cannot be restored the flow stays unarmed (fail-open) — an armed
-            // policy without state is the one thing that must never happen.
-            match m.write_fresh_state(&rec.key, old.algorithm) {
-                Ok(()) => {
-                    if let Err(e) = m.arm_policy(&rec.key, old) {
-                        fail(&mut report, rec.key, "re-arm old policy", e);
+            if !rec.old_disarmed {
+                // The forward disarm never succeeded: the old policy may still be
+                // armed with its own state. Rewriting or re-arming on top of a live
+                // pair would corrupt it — leave the pair untouched.
+            } else {
+                // Restore the displaced policy: fresh state FIRST, arming LAST. If
+                // the state cannot be restored the flow stays unarmed (fail-open) —
+                // an armed policy without state is the one thing that must never
+                // happen.
+                match m.write_fresh_state(&rec.key, old.algorithm) {
+                    Ok(()) => {
+                        if let Err(e) = m.arm_policy(&rec.key, old) {
+                            fail(&mut report, rec.key, "re-arm old policy", e);
+                            ok = false;
+                        }
+                    }
+                    Err(e) => {
+                        fail(
+                            &mut report,
+                            rec.key,
+                            "restore state (flow stays unarmed)",
+                            e,
+                        );
                         ok = false;
                     }
-                }
-                Err(e) => {
-                    fail(
-                        &mut report,
-                        rec.key,
-                        "restore state (flow stays unarmed)",
-                        e,
-                    );
-                    ok = false;
                 }
             }
         }
@@ -219,6 +265,13 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
 
     for rec in journal.removes.iter().rev() {
         report.attempted += 1;
+        if !rec.disarmed {
+            // The policy never left LIMIT_POLICIES: it may still be armed with its
+            // state. Nothing to roll back — and rewriting its state would corrupt a
+            // live flow.
+            report.succeeded += 1;
+            continue;
+        }
         let mut ok = true;
         match m.write_fresh_state(&rec.key, rec.old.algorithm) {
             Ok(()) => {
