@@ -91,6 +91,18 @@ pub struct Status {
     pub anti_spoof_enforced_by_program: bool,
     #[serde(default)]
     pub anti_spoof_acknowledged: bool,
+    /// Packets above the policer's MAX_POLICED_LEN that passed fail-open while a
+    /// limit policy was armed (cumulative since daemon start). Nonzero values mean
+    /// the environment can produce oversized frames at the TC hooks — see
+    /// docs/kernel-validation.md for how to judge them.
+    #[serde(default)]
+    pub oversized_rx_packets: u64,
+    #[serde(default)]
+    pub oversized_rx_bytes: u64,
+    #[serde(default)]
+    pub oversized_tx_packets: u64,
+    #[serde(default)]
+    pub oversized_tx_bytes: u64,
     /// Sliding-window-log map: configured capacity vs entries currently installed.
     /// Each entry preallocates ~16.4 KiB of kernel memory.
     #[serde(default)]

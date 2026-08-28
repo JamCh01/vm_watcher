@@ -198,6 +198,20 @@ impl Default for SwlRing {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SwlRing {}
 
+/// Cumulative counters of packets too large to police (above `MAX_POLICED_LEN`),
+/// per direction, while a limit policy WAS armed for the flow. Pure observability:
+/// such packets fail open, and the numbers tell operators whether that path is
+/// actually reachable on their kernel/offload configuration.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OversizedStats {
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for OversizedStats {}
+
 // ---------------------------------------------------------------------------
 // L2 parsing, shared between the eBPF data path and userspace tests.
 // ---------------------------------------------------------------------------

@@ -47,8 +47,8 @@ use network_types::{
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use vm_bandwidth_common::{
-    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, PolicerStats, SwlEntry, TrafficKey,
-    TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
+    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats, SwlEntry,
+    TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
     ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, ETHERTYPE_IPV4,
     ETHERTYPE_IPV6, SWL_LOG_CAP, VLAN_HDR_LEN,
 };
@@ -137,6 +137,12 @@ static SWL_LOG: HashMap<LimitKey, SwlRingVal, MAP_CAPACITY> = HashMap::new();
 /// policy are recorded; fail-open paths make no entry.
 #[btf_map]
 static POLICER_STATS: PerCpuHashMap<LimitKey, PolicerStats, MAP_CAPACITY> = PerCpuHashMap::new();
+
+/// Direction-keyed counters of oversized (unpoliceable) packets that arrived while a
+/// limit policy was armed. Two entries at most (RX/TX); userspace reads them for the
+/// IPC status and the metrics push.
+#[btf_map]
+static OVERSIZED: PerCpuHashMap<u8, OversizedStats, 4> = PerCpuHashMap::new();
 
 /// TAP ingress: the VM is sending. The VM's address is the IPv4 source.
 #[classifier]
@@ -328,16 +334,23 @@ unsafe fn count6(ctx: &TcContext, ifindex: u32, is_tx: bool) {
 /// passes).
 #[inline(always)]
 unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
-    if len_bytes == 0 || len_bytes > MAX_POLICED_LEN {
-        return false;
-    }
-
     let key = LimitKey::new(ipv4, direction);
     let policy = match LIMIT_POLICIES.get(key) {
         Some(p) => *p,
         None => return false,
     };
     if policy.enabled == 0 || policy.rate_bps == 0 {
+        return false;
+    }
+
+    // Armed policy, unpoliceable size: fail open (never drop on arithmetic grounds),
+    // but count it — these are exactly the packets that would bypass limiting if the
+    // environment can produce them (GSO/BIG TCP). Zero-length frames just pass.
+    if len_bytes == 0 {
+        return false;
+    }
+    if len_bytes > MAX_POLICED_LEN {
+        record_oversized(direction, len_bytes);
         return false;
     }
 
@@ -371,6 +384,30 @@ unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
     bpf_spin_unlock(lock_ptr);
     record_verdict(&key, len_bytes, conform);
     !conform
+}
+
+/// Count an oversized packet that skipped policing while armed. Failure to record
+/// never affects the (fail-open) verdict.
+#[inline(always)]
+unsafe fn record_oversized(direction: u8, len_bytes: u64) {
+    let stats = match OVERSIZED.get_ptr_mut(direction) {
+        Some(ptr) => &mut *ptr,
+        None => {
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            if OVERSIZED
+                .insert(&direction, &OversizedStats::default(), 0)
+                .is_err()
+            {
+                return;
+            }
+            match OVERSIZED.get_ptr_mut(direction) {
+                Some(ptr) => &mut *ptr,
+                None => return,
+            }
+        }
+    };
+    stats.packets += 1;
+    stats.bytes += len_bytes;
 }
 
 /// Record a policer verdict (pass or drop) for a flow with an active policy.

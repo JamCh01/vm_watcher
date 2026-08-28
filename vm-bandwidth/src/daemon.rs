@@ -27,8 +27,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, LimitState, PolicerStats, SwlRing, TrafficKey, TrafficValue,
-    ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
+    LimitKey, LimitPolicy, LimitState, OversizedStats, PolicerStats, SwlRing, TrafficKey,
+    TrafficValue, ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
 };
 
 use vm_bandwidth_core::config::{self, ValidatedConfig};
@@ -131,6 +131,10 @@ struct Engine {
     last_policer: std::collections::HashMap<u32, crate::collector::PolicerIpTotals>,
     /// Last poll's aggregate IPv6 counters, for the VictoriaMetrics push.
     last_ipv6: crate::collector::IpStats,
+    /// Cumulative oversized (unpoliced) packet counters, (RX, TX) — observability for
+    /// the fail-open path above MAX_POLICED_LEN while a policy is armed.
+    oversized: (OversizedStats, OversizedStats),
+    oversized_map: PerCpuHashMap<MapData, u8, OversizedStats>,
 
     /// Whitelist-trie capacity fixed at startup; hot reload must fit inside it.
     whitelist_capacity: u32,
@@ -210,6 +214,7 @@ impl Engine {
         self.last_ipv6 = ipv6;
         self.last_policer = policer;
         self.last_snapshot = Some(snapshot);
+        self.oversized = read_oversized(&self.oversized_map);
     }
 
     /// Push cumulative per-IP counters to VictoriaMetrics (no-op when disabled).
@@ -236,6 +241,10 @@ impl Engine {
         ));
         lines.push_str(&crate::metrics::render_prom_lines_ipv6(
             &self.last_ipv6,
+            now_ms,
+        ));
+        lines.push_str(&crate::metrics::render_prom_lines_oversized(
+            &self.oversized,
             now_ms,
         ));
         if lines.is_empty() {
@@ -653,6 +662,10 @@ impl Engine {
             anti_spoof_mode: self.config.load().ip_ownership.clone(),
             anti_spoof_enforced_by_program: false,
             anti_spoof_acknowledged: true,
+            oversized_rx_packets: self.oversized.0.packets,
+            oversized_rx_bytes: self.oversized.0.bytes,
+            oversized_tx_packets: self.oversized.1.packets,
+            oversized_tx_bytes: self.oversized.1.bytes,
             swl_map_capacity: self.config.load().swl_map_max_entries,
             swl_map_used: self.swl_log.iter().filter_map(|i| i.ok()).count() as u32,
             ranges,
@@ -721,6 +734,28 @@ impl Engine {
             },
         }
     }
+}
+
+/// Aggregate the two-entry per-CPU OVERSIZED map into cumulative (RX, TX) counters.
+/// Map read errors leave the previous numbers in place (observability must never
+/// disturb the engine).
+fn read_oversized(
+    map: &PerCpuHashMap<MapData, u8, OversizedStats>,
+) -> (OversizedStats, OversizedStats) {
+    let mut acc = (OversizedStats::default(), OversizedStats::default());
+    for item in map.iter() {
+        let Ok((dir, values)) = item else { continue };
+        let slot = match dir {
+            DIR_RX => &mut acc.0,
+            DIR_TX => &mut acc.1,
+            _ => continue,
+        };
+        for v in values.iter() {
+            slot.packets += v.packets;
+            slot.bytes += v.bytes;
+        }
+    }
+    acc
 }
 
 /// The engine's limit maps behind the [`crate::txmaps::LimitMaps`] trait. Absence-tolerant
@@ -853,6 +888,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         // capacity (config::swl_map_max_entries) instead of the general map size.
         .map_max_entries("SWL_LOG", cfg.swl_map_max_entries)
         .map_max_entries("POLICER_STATS", cfg.map_max_entries)
+        .map_max_entries("OVERSIZED", 4)
         .load(object)
         .context(
             "failed to load the eBPF object; this program needs root (CAP_BPF + CAP_NET_ADMIN), \
@@ -902,6 +938,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     )
     .context("POLICER_STATS has the wrong type")?;
 
+    let oversized_map = PerCpuHashMap::<MapData, u8, OversizedStats>::try_from(
+        base.take_map("OVERSIZED").context("OVERSIZED missing")?,
+    )
+    .context("OVERSIZED has the wrong type")?;
+
     // 4. Discover TAPs and attach (one loaded object, one link pair per TAP).
     let mut manager = AttachManager::new(base)?;
     let mut taps = Vec::new();
@@ -941,6 +982,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_totals: std::collections::HashMap::new(),
         last_policer: std::collections::HashMap::new(),
         last_ipv6: crate::collector::IpStats::default(),
+        oversized: (OversizedStats::default(), OversizedStats::default()),
+        oversized_map,
         whitelist_capacity,
         monitored,
         limit_policies,

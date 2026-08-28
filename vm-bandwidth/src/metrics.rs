@@ -40,6 +40,28 @@ pub fn render_prom_lines_ipv6(t: &crate::collector::IpStats, now_ms: i64) -> Str
     out
 }
 
+/// Render the oversized-packet observability series (cumulative, low cardinality).
+pub fn render_prom_lines_oversized(
+    oversized: &(
+        vm_bandwidth_common::OversizedStats,
+        vm_bandwidth_common::OversizedStats,
+    ),
+    now_ms: i64,
+) -> String {
+    let mut out = String::new();
+    for (dir, stats) in [("rx", &oversized.0), ("tx", &oversized.1)] {
+        if stats.packets | stats.bytes == 0 {
+            continue;
+        }
+        out.push_str(&format!(
+            "vmbw_oversized_{dir}_packets_total {packets} {now_ms}\nvmbw_oversized_{dir}_bytes_total {bytes} {now_ms}\n",
+            packets = stats.packets,
+            bytes = stats.bytes
+        ));
+    }
+    out
+}
+
 /// Escape a Prometheus label value (backslash, double quote, newline).
 pub fn escape_label(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
@@ -221,6 +243,27 @@ mod tests {
         );
         let lines = render_prom_lines(&totals, |_| "a\"b\\c".into(), 0);
         assert!(lines.contains("range=\"a\\\"b\\\\c\""), "{lines}");
+    }
+
+    #[test]
+    fn renders_oversized_only_when_nonzero() {
+        use vm_bandwidth_common::OversizedStats;
+        let none = (OversizedStats::default(), OversizedStats::default());
+        assert_eq!(render_prom_lines_oversized(&none, 7), "");
+        let some = (
+            OversizedStats {
+                packets: 3,
+                bytes: 200_000,
+            },
+            OversizedStats::default(),
+        );
+        let out = render_prom_lines_oversized(&some, 7);
+        assert!(out.contains("vmbw_oversized_rx_packets_total 3 7"), "{out}");
+        assert!(
+            out.contains("vmbw_oversized_rx_bytes_total 200000 7"),
+            "{out}"
+        );
+        assert!(!out.contains("_tx_"), "tx was zero: {out}");
     }
 
     #[test]
