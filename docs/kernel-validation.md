@@ -122,35 +122,75 @@ ip addr add 10.0.0.99/24 dev eth0          # B 自己的临时地址
 
 同样的步骤对 IPv6 源地址重复一次（隐私地址轮换场景）。
 
-## 6. 缺席键删除的 errno 变体（`map_gone` / 计数器清理依赖项）
+## 6. 缺席键删除的 errno 变体（计数器清理依赖项）
 
-前置条件：任意 Linux + root + `bpftool`（不需要加载本程序）。
+前置条件：
 
-counter map 的空闲淘汰与 stale-TAP 清理（`daemon.rs::remove_counter_keys`）把“键本就不在”视为删除成功。这个判定按**类型化错误变体**匹配，不做错误字符串匹配：
+- Linux 宿主机 + **root**（`bpftool map create` 与 BPF syscall 需要 `CAP_BPF`/root）；
+- bpffs 已挂载（默认 `/sys/fs/bpf`）。未挂载时先 `mount -t bpf bpf /sys/fs/bpf`（root）；
+- 安装 `bpftool`。**本节所有命令默认不在开发环境执行**——需要上述环境时按步骤跑。
+
+背景：counter map 的空闲淘汰与 stale-TAP 清理（`daemon.rs::remove_counter_keys` /
+`PendingRemovals`）把“键本就不在”视为删除成功。判定按**类型化错误变体**匹配，
+绝不做错误字符串匹配：
 
 - `MapError::KeyNotFound` / `MapError::ElementNotFound`；
 - `MapError::SyscallError(se)` 且 `se.io_error.kind() == NotFound`；
 - `MapError::IoError(io)` 且 `io.kind() == NotFound`。
 
-aya 0.14 的 `hash_map::remove` 把 `bpf_map_delete_elem` 的失败包成 `SyscallError`（源码路径已核对），因此内核返回 ENOENT 时落入第二个变体——但**内核实际返回的 errno 未在真实环境裁决过**，在那之前保持保守：未匹配的变体一律计为失败、按键记日志、下一轮重试，绝不静默当成功。
+aya 0.14 的 `hash_map::remove` 把 `bpf_map_delete_elem` 的失败包成
+`SyscallError`（源码路径已核对），因此内核返回 ENOENT 时落入第二个变体——但
+**内核实际返回的 errno 未在真实环境裁决过**。在那之前代码保持保守：未匹配的
+变体一律计为失败、按键记日志、下一个有界维护周期重试，绝不静默当成功。
 
-验证步骤：
+验证步骤（均需 root）：
 
 ```bash
-bpftool map create name probe type hash key 4 value 4 entries 8
-# 删除一个从未写入的键：预期报错包含 ENOENT（“No such file or directory”）
-bpftool map delete name probe key 0x01 0x02 0x03 0x04
+# 0. 环境检查
+uname -r                # 记录内核版本
+bpftool version         # 记录 bpftool 版本
+mountpoint -q /sys/fs/bpf || { echo "bpffs 未挂载"; exit 1; }
+
+# 1. 创建探针 map（官方语法：bpftool map create FILE type TYPE key KEY_SIZE
+#    value VALUE_SIZE entries MAX_ENTRIES name NAME）。pin 路径带 PID，
+#    不覆盖已有 pin。
+PROBE_PIN="/sys/fs/bpf/vmbw-delete-probe-$$"
+cleanup() { rm -f -- "$PROBE_PIN"; }
+trap cleanup EXIT
+
+bpftool map create "$PROBE_PIN" \
+    type hash \
+    key 4 \
+    value 4 \
+    entries 8 \
+    name vmbw_del_probe
+
+bpftool map show pinned "$PROBE_PIN"
+
+# 2. 删除一个从未写入的键，记录 exit status 与 stderr
+bpftool map delete pinned "$PROBE_PIN" key 0 1 2 3
 echo "exit=$?"
-bpftool map delete name probe key 0x01 0x02 0x03 0x04 2>&1 | cat
-bpftool map show name probe    # 记录内核版本与 map 参数，写入本节结论
+bpftool map delete pinned "$PROBE_PIN" key 0 1 2 3 2>&1 | cat
+
+# 3. trap 清理本任务创建的 pin；不得删除任何非本任务创建的 map
 ```
+
+记录要求：命令、exit status、stderr 原文、内核版本（`uname -r`）、bpftool 版本、
+Cargo.lock 中的 aya 版本，以及 Rust 侧最终匹配到的类型化变体。
 
 判定标准：
 
-- [ ] 缺席键删除返回 ENOENT（或 aya 映射后的上述变体之一）→ 现有类型化匹配成立，记录内核版本；
-- [ ] 返回其它 errno/变体 → 在 `remove_counter_keys` 的匹配分支中补上该变体（仍按类型，不按字符串），并回归本节。
+- [ ] **最终裁决必须落在 Rust 侧**：bpftool 的 stderr 字符串只是线索，不得把
+      它直接等同于 aya 的枚举变体。最小探针（对缺席键调用
+      `HashMap::remove` 并打印 `MapError` 变体）或本程序真实代码路径（观察到
+      缺席键清理记为 `removed` 且无 `remove failed` 日志）确认类型化变体后，
+      记录结论；
+- [ ] 缺席键删除返回 ENOENT 且落入上述匹配变体 → 现有类型化匹配成立；
+- [ ] 返回其它 errno/变体 → 在 `key_already_absent` 的匹配分支中补上该变体
+      （仍按类型，不按字符串），并回归本节。
 
-本项未闭环前，不得声称“缺席键即成功”已在生产内核验证；默认 CI 不要求 root，故本节只存在于文档。
+本项未闭环前，不得声称“缺席键即成功”已在生产内核验证；默认 CI 不要求 root，
+故本节只存在于文档。
 
 ---
 
