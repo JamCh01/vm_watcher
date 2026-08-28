@@ -4,7 +4,9 @@ bridge = "br0"
 [collector]
 refresh_interval_ms = 1000        # 采样周期（也是限速窗口的采样粒度）
 interface_scan_interval_secs = 5  # TAP 重扫周期
-map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / LIMIT_STATE / SWL_LOG map 容量
+map_max_entries = 8192            # TRAFFIC / TRAFFIC6 / LIMIT_POLICIES / LIMIT_STATE / POLICER_STATS 容量
+swl_map_max_entries = 256         # SWL_LOG 专用容量：每条 ≈16.4 KiB 内核内存（启动即预分配），
+                                  # 内存 ≈ 条数 × 16.4 KiB（256 条 ≈ 4 MiB；误用 8192 ≈ 134 MiB）
 
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
@@ -14,8 +16,23 @@ default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | t
 # dist/docker-compose.yml（docker compose up -d）。
 [metrics]
 enabled = false
-url = "http://127.0.0.1:8428"     # VictoriaMetrics 地址（仅支持 http://）
+url = "http://127.0.0.1:8428"     # VictoriaMetrics 地址：本机用 http://，远程必须用 https://
+                                  # （远程 http:// 需显式 allow_insecure_http = true 才会接受）
 push_interval_secs = 60           # 推送周期（5..=3600）
+
+# 实验性能力开关。sliding_window_log 每包在自旋锁内扫描 1024 条日志环，
+# 且包率高于约 1024/limit_window 条/秒时会因环覆盖而偏宽松——默认禁用，
+# 策略里写 algorithm = "sliding_window_log" 必须先打开此开关，否则拒绝加载。
+[experimental]
+enable_sliding_window_log = false
+
+# 安全契约（必填）：本程序按报文源地址计数和限速，但无法验证该源地址属于它到达的
+# TAP（没有 VM 清单，也没有可信的 TAP→IP 来源）。源地址反欺骗必须由外部强制：
+# Linux bridge 防火墙 / nftables / 虚拟化平台（如 Proxmox 防火墙），见 README
+# 「安全前提（反 IP 欺骗）」。未显式确认时 daemon 拒绝启动。
+[security]
+ip_ownership = "external"                 # 目前唯一支持的模式
+acknowledge_external_anti_spoofing = true # 操作员确认外部反欺骗已部署
 
 # ============================================================
 # 默认配置：仅监控带宽，不启用任何限速策略（各段都不写 [ip_ranges.policy]）。

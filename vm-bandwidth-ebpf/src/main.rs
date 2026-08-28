@@ -8,6 +8,11 @@
 //! The interface index is read straight from the skb context, so no per-interface
 //! reloading of the object is needed.
 //!
+//! L2 handling: untagged frames and frames with up to `MAX_VLAN_TAGS` (2) 802.1Q/802.1ad
+//! tags (single tag and QinQ) are walked to their inner IPv4/IPv6 header so tagged VM
+//! traffic is counted and policed like untagged traffic. Deeper stacks, truncated tags
+//! and non-IP payloads fail open like every other unhandled frame.
+//!
 //! Every path — parse failure, IP not whitelisted, map pressure, missing or invalid
 //! policy, arithmetic anomaly — ends in `TC_ACT_PIPE`: traffic is never dropped unless
 //! a policer explicitly classifies a packet as non-conforming while a valid limit is
@@ -38,13 +43,14 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use network_types::{
-    eth::{EthHdr, EtherType},
+    eth::EthHdr,
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, PolicerStats, SwlEntry, TrafficKey, TrafficKey6, TrafficValue,
-    ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
-    ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, SWL_LOG_CAP,
+    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats, SwlEntry,
+    TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
+    ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, ETHERTYPE_IPV4,
+    ETHERTYPE_IPV6, SWL_LOG_CAP, VLAN_HDR_LEN,
 };
 
 /// Compile-time default; userspace overrides `max_entries` at load time
@@ -72,11 +78,13 @@ static MONITORED_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(MAP_CAPACITY 
 #[btf_map]
 static TRAFFIC: PerCpuHashMap<TrafficKey, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
 
-/// (ifindex, ipv6) -> per-CPU monotonic counters. IPv6 is counted but never
-/// policed and has no whitelist (config has no IPv6 ranges); the map cap is the
-/// only bound on distinct flows.
+/// ifindex -> aggregate per-CPU IPv6 counters. IPv6 is counted but never policed and
+/// has no whitelist (config has no IPv6 ranges). Counters are aggregated PER TAP on
+/// purpose: userspace only ever shows one IPv6 total, and keying by address would let
+/// a single VM exhaust the map by rotating source addresses (IPv6 privacy addresses).
+/// Cardinality is bounded by the number of TAPs instead of the number of addresses.
 #[btf_map]
-static TRAFFIC6: PerCpuHashMap<TrafficKey6, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
+static TRAFFIC6: PerCpuHashMap<u32, TrafficValue, MAP_CAPACITY> = PerCpuHashMap::new();
 
 /// (ipv4, direction) -> limiter policy installed by the daemon. Absent or
 /// `enabled == 0` means the flow is not policed.
@@ -130,6 +138,12 @@ static SWL_LOG: HashMap<LimitKey, SwlRingVal, MAP_CAPACITY> = HashMap::new();
 #[btf_map]
 static POLICER_STATS: PerCpuHashMap<LimitKey, PolicerStats, MAP_CAPACITY> = PerCpuHashMap::new();
 
+/// Direction-keyed counters of oversized (unpoliceable) packets that arrived while a
+/// limit policy was armed. Two entries at most (RX/TX); userspace reads them for the
+/// IPC status and the metrics push.
+#[btf_map]
+static OVERSIZED: PerCpuHashMap<u8, OversizedStats, 4> = PerCpuHashMap::new();
+
 /// TAP ingress: the VM is sending. The VM's address is the IPv4 source.
 #[classifier]
 pub fn tc_ingress(ctx: TcContext) -> i32 {
@@ -148,13 +162,40 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
         Ok(e) => e,
         Err(_) => return TC_ACT_PIPE,
     };
-    match eth.ether_type() {
-        Ok(EtherType::Ipv4) => {}
-        Ok(EtherType::Ipv6) => return handle_v6(ctx, is_tx),
-        // ARP, LLDP, STP, VLAN, ... are not counted.
+
+    // Walk the VLAN stack (bounded by common::MAX_VLAN_TAGS: one load per level, no
+    // loop over data). A truncated tag header fails open like any other parse failure.
+    let et0 = u16::from_be(eth.ether_type);
+    let mut et1 = 0u16;
+    let mut et2 = 0u16;
+    if is_vlan_tag(et0) {
+        let v: VlanHdr = match ctx.load(EthHdr::LEN) {
+            Ok(v) => v,
+            Err(_) => return TC_ACT_PIPE,
+        };
+        et1 = u16::from_be(v.ether_type);
+        if is_vlan_tag(et1) {
+            let v: VlanHdr = match ctx.load(EthHdr::LEN + VLAN_HDR_LEN) {
+                Ok(v) => v,
+                Err(_) => return TC_ACT_PIPE,
+            };
+            et2 = u16::from_be(v.ether_type);
+        }
+    }
+    let (tags, ether_type) = match vlan_walk(et0, et1, et2) {
+        // Deeper stack than supported: give up (fail open).
+        None => return TC_ACT_PIPE,
+        Some(t) => t,
+    };
+    let l3_off = EthHdr::LEN + tags * VLAN_HDR_LEN;
+
+    match ether_type {
+        ETHERTYPE_IPV4 => {}
+        ETHERTYPE_IPV6 => return handle_v6(ctx, is_tx, l3_off),
+        // ARP, LLDP, STP and other non-IP payloads are not counted.
         _ => return TC_ACT_PIPE,
     }
-    let ip: Ipv4Hdr = match ctx.load(EthHdr::LEN) {
+    let ip: Ipv4Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
         Err(_) => return TC_ACT_PIPE,
     };
@@ -230,26 +271,25 @@ unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
 /// IPv6 accounting: counted like IPv4 but never policed and never whitelisted
 /// (config has no IPv6 ranges). Every error path fails open, same as IPv4.
 #[inline(always)]
-fn handle_v6(ctx: &TcContext, is_tx: bool) -> i32 {
-    let ip: Ipv6Hdr = match ctx.load(EthHdr::LEN) {
+fn handle_v6(ctx: &TcContext, is_tx: bool, l3_off: usize) -> i32 {
+    let ip: Ipv6Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
         Err(_) => return TC_ACT_PIPE,
     };
-    // Extension headers, when present, come after the fixed 40-byte header, so the
-    // addresses are always at these offsets.
-    let addr = if is_tx { ip.src_addr } else { ip.dst_addr };
+    // The address itself is deliberately NOT part of the counter key: aggregate
+    // per-TAP counting bounds map cardinality at the number of TAPs (see TRAFFIC6).
+    // (The header is still validated by the load above.)
+    let _ = ip;
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    unsafe { count6(ctx, &addr, ifindex, is_tx) };
+    unsafe { count6(ctx, ifindex, is_tx) };
     TC_ACT_PIPE
 }
 
-/// Accumulate byte/packet counters for one IPv6 flow. Never fails the packet.
+/// Accumulate byte/packet counters for one TAP's aggregate IPv6 traffic. Never fails
+/// the packet.
 #[inline(always)]
-unsafe fn count6(ctx: &TcContext, ipv6: &[u8; 16], ifindex: u32, is_tx: bool) {
-    let key = TrafficKey6 {
-        ifindex,
-        ipv6: *ipv6,
-    };
+unsafe fn count6(ctx: &TcContext, ifindex: u32, is_tx: bool) {
+    let key = ifindex;
     let value = match TRAFFIC6.get_ptr_mut(key) {
         Some(ptr) => &mut *ptr,
         None => {
@@ -257,7 +297,7 @@ unsafe fn count6(ctx: &TcContext, ipv6: &[u8; 16], ifindex: u32, is_tx: bool) {
             #[allow(clippy::needless_borrows_for_generic_args)]
             if TRAFFIC6
                 .insert(
-                    &key,
+                    key,
                     &TrafficValue {
                         rx_bytes: 0,
                         tx_bytes: 0,
@@ -294,16 +334,23 @@ unsafe fn count6(ctx: &TcContext, ipv6: &[u8; 16], ifindex: u32, is_tx: bool) {
 /// passes).
 #[inline(always)]
 unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
-    if len_bytes == 0 || len_bytes > MAX_POLICED_LEN {
-        return false;
-    }
-
     let key = LimitKey::new(ipv4, direction);
     let policy = match LIMIT_POLICIES.get(key) {
         Some(p) => *p,
         None => return false,
     };
     if policy.enabled == 0 || policy.rate_bps == 0 {
+        return false;
+    }
+
+    // Armed policy, unpoliceable size: fail open (never drop on arithmetic grounds),
+    // but count it — these are exactly the packets that would bypass limiting if the
+    // environment can produce them (GSO/BIG TCP). Zero-length frames just pass.
+    if len_bytes == 0 {
+        return false;
+    }
+    if len_bytes > MAX_POLICED_LEN {
+        record_oversized(direction, len_bytes);
         return false;
     }
 
@@ -337,6 +384,30 @@ unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
     bpf_spin_unlock(lock_ptr);
     record_verdict(&key, len_bytes, conform);
     !conform
+}
+
+/// Count an oversized packet that skipped policing while armed. Failure to record
+/// never affects the (fail-open) verdict.
+#[inline(always)]
+unsafe fn record_oversized(direction: u8, len_bytes: u64) {
+    let stats = match OVERSIZED.get_ptr_mut(direction) {
+        Some(ptr) => &mut *ptr,
+        None => {
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            if OVERSIZED
+                .insert(&direction, &OversizedStats::default(), 0)
+                .is_err()
+            {
+                return;
+            }
+            match OVERSIZED.get_ptr_mut(direction) {
+                Some(ptr) => &mut *ptr,
+                None => return,
+            }
+        }
+    };
+    stats.packets += 1;
+    stats.bytes += len_bytes;
 }
 
 /// Record a policer verdict (pass or drop) for a flow with an active policy.

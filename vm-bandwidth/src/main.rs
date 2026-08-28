@@ -11,6 +11,7 @@ mod interface;
 mod metrics;
 mod tc;
 mod tui;
+mod txmaps;
 mod ui;
 
 use std::path::PathBuf;
@@ -19,9 +20,10 @@ use anyhow::Result;
 use aya::include_bytes_aligned;
 use clap::Parser;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "vm-bandwidth-monitor",
+    version, // single source: workspace.package.version in Cargo.toml
     about = "Per-IP bandwidth monitoring and pluggable-algorithm rate limiting for VMs behind a Linux bridge (eBPF/TC)"
 )]
 struct Cli {
@@ -86,5 +88,21 @@ fn raise_fd_limit() -> u64 {
     } else {
         log::warn!("open-file limit is {cur} and could not be raised; large hosts may exhaust it");
         cur
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    /// The shipped binary must report the same version as the workspace manifest and
+    /// the release tag it came from.
+    #[test]
+    fn version_flag_prints_cargo_version() {
+        let err = Cli::try_parse_from(["vm-bandwidth-monitor", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let out = err.render().to_string();
+        assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
     }
 }

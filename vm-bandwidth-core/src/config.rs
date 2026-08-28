@@ -50,6 +50,10 @@ pub struct Config {
     pub display: DisplayConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
     #[serde(default, rename = "ip_ranges")]
     pub ip_ranges: Vec<IpRangeEntry>,
 }
@@ -72,6 +76,10 @@ fn default_map_max_entries() -> u32 {
     8192
 }
 
+fn default_swl_map_max_entries() -> u32 {
+    256
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorConfig {
@@ -81,6 +89,13 @@ pub struct CollectorConfig {
     pub interface_scan_interval_secs: u64,
     #[serde(default = "default_map_max_entries")]
     pub map_max_entries: u32,
+    /// Capacity of the sliding-window-log map ONLY. Each entry reserves one 1024-slot
+    /// ring (~16.4 KiB), preallocated by the kernel at load — keep this at the number
+    /// of flows you actually intend to limit with `sliding_window_log`, not at the
+    /// general map size. Default 256 ≈ 4 MiB; `map_max_entries` (8192) would reserve
+    /// ~134 MiB for a feature that is off by default.
+    #[serde(default = "default_swl_map_max_entries")]
+    pub swl_map_max_entries: u32,
 }
 
 impl Default for CollectorConfig {
@@ -89,8 +104,53 @@ impl Default for CollectorConfig {
             refresh_interval_ms: default_refresh_interval_ms(),
             interface_scan_interval_secs: default_scan_interval_secs(),
             map_max_entries: default_map_max_entries(),
+            swl_map_max_entries: default_swl_map_max_entries(),
         }
     }
+}
+
+/// Trust contract for packet-source ownership. This program has no VM inventory and
+/// no trusted TAP→IP source, so it cannot verify that a packet's source address
+/// belongs to the TAP it arrived on. Anti-spoofing must therefore be enforced
+/// EXTERNALLY (bridge firewall / nftables / the virtualization platform); the config
+/// records the operator's explicit acknowledgement of that contract.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Only `external` is supported: source-address anti-spoofing is enforced outside
+    /// this program. Any other value is rejected (there is no internal mode yet).
+    #[serde(default = "default_ip_ownership")]
+    pub ip_ownership: String,
+    /// Must be `true` for the daemon to start: the operator confirms that external
+    /// anti-spoofing is actually deployed for the bridged TAPs. A reload that drops
+    /// the acknowledgement is rejected like any validation error.
+    #[serde(default)]
+    pub acknowledge_external_anti_spoofing: bool,
+}
+
+fn default_ip_ownership() -> String {
+    "external".to_string()
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            ip_ownership: default_ip_ownership(),
+            acknowledge_external_anti_spoofing: false,
+        }
+    }
+}
+
+/// Capability switches for features that are expensive or experimental. Sliding
+/// Window Log is deliberately NOT a normal algorithm choice: every packet scans a
+/// 1024-entry ring under a spin lock, and the ring under-counts (gets lenient) above
+/// roughly `1024 / limit_window` packets per second.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentalConfig {
+    /// Allow `algorithm = "sliding_window_log"` in policies. Off by default.
+    #[serde(default)]
+    pub enable_sliding_window_log: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,11 +160,18 @@ pub struct MetricsConfig {
     /// screen explains that metrics are off.
     #[serde(default)]
     pub enabled: bool,
-    /// VictoriaMetrics base URL, e.g. `http://127.0.0.1:8428`. The daemon posts to
+    /// VictoriaMetrics base URL, e.g. `http://127.0.0.1:8428` (localhost) or
+    /// `https://vm.example.com:8428` (remote). The daemon posts to
     /// `{url}/api/v1/import/prometheus`; the `--ui` trend screen queries
-    /// `{url}/api/v1/query_range`. Plain HTTP only (the built-in client has no TLS).
+    /// `{url}/api/v1/query_range`. Remote URLs must use HTTPS; plain HTTP is only
+    /// accepted for loopback hosts unless `allow_insecure_http` is set.
     #[serde(default = "default_metrics_url")]
     pub url: String,
+    /// Explicit opt-in for remote plain-HTTP metrics URLs (per-customer bandwidth
+    /// figures would cross the network unencrypted and unauthenticated). Off by
+    /// default; localhost HTTP never needs it.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     /// How often cumulative per-IP counters are pushed, in seconds.
     #[serde(default = "default_push_interval_secs")]
     pub push_interval_secs: u64,
@@ -123,6 +190,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             url: default_metrics_url(),
+            allow_insecure_http: false,
             push_interval_secs: default_push_interval_secs(),
         }
     }
@@ -301,6 +369,9 @@ const MAX_RATE_BPS: u64 = 1_000_000_000_000; // 1 Tbps
 const MAX_BURST_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 const MIN_LIMIT_WINDOW_SECS: u64 = 1;
 const MAX_LIMIT_WINDOW_SECS: u64 = 60;
+/// Sanity cap on the SWL map: 65536 rings ≈ 1 GiB of kernel memory. The value exists
+/// to catch unit typos (e.g. 256000); any real deployment needs far fewer SWL flows.
+const MAX_SWL_MAP_ENTRIES: u32 = 65536;
 
 fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> {
     for (name, value) in [
@@ -328,6 +399,60 @@ fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// URL policy for the metrics endpoint, enforced with a real URL parser (no string
+/// prefix guessing): https anywhere; http only for loopback hosts unless the operator
+/// explicitly accepts insecure remote transport.
+fn validate_metrics_url(raw: &str, allow_insecure_http: bool) -> Result<(), String> {
+    use url::Host;
+    let url = url::Url::parse(raw).map_err(|e| format!("metrics.url is not a valid URL: {e}"))?;
+    if url.host().is_none() {
+        return Err("metrics.url must include a host".to_string());
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match url.host() {
+                Some(Host::Domain("localhost")) => true,
+                Some(Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            };
+            if loopback || allow_insecure_http {
+                Ok(())
+            } else {
+                Err(format!(
+                    "metrics.url {raw:?}: remote plain HTTP would send customer bandwidth                      figures unencrypted; use https:// or set allow_insecure_http = true                      to accept the risk"
+                ))
+            }
+        }
+        other => Err(format!(
+            "metrics.url scheme must be http:// or https://; got {other:?}"
+        )),
+    }
+}
+
+/// Sliding Window Log is gated behind `[experimental] enable_sliding_window_log`:
+/// refuse configs that select it without the explicit switch.
+fn check_swl_enabled(
+    eff: &policy::EffectivePolicy,
+    enabled: bool,
+    what: &str,
+) -> Result<(), String> {
+    let uses_swl = |d: &Option<policy::DirPolicy>| {
+        d.map(|p| p.algorithm == vm_bandwidth_common::ALGO_SLIDING_WINDOW_LOG)
+            .unwrap_or(false)
+    };
+    if (uses_swl(&eff.rx) || uses_swl(&eff.tx)) && !enabled {
+        return Err(format!(
+            "policy for {what}: algorithm = \"sliding_window_log\" requires \
+             [experimental] enable_sliding_window_log = true — every packet scans a \
+             1024-entry ring under a spin lock and the log gets lenient above roughly \
+             1024/limit_window packets per second; it is not a general-purpose choice"
+        ));
+    }
+    Ok(())
+}
+
 /// Config after full validation; everything downstream consumes this.
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {
@@ -335,6 +460,9 @@ pub struct ValidatedConfig {
     pub refresh_interval_ms: u64,
     pub interface_scan_interval_secs: u64,
     pub map_max_entries: u32,
+    pub swl_map_max_entries: u32,
+    /// Anti-spoofing contract from `[security]` (validated above).
+    pub ip_ownership: String,
     pub show_interface: bool,
     pub show_packets: bool,
     pub default_sort: SortMode,
@@ -382,6 +510,14 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     if config.collector.map_max_entries == 0 {
         return Err("collector.map_max_entries must be > 0".to_string());
     }
+    if config.collector.swl_map_max_entries == 0 {
+        return Err("collector.swl_map_max_entries must be > 0".to_string());
+    }
+    if config.collector.swl_map_max_entries > MAX_SWL_MAP_ENTRIES {
+        return Err(format!(
+            "collector.swl_map_max_entries must be at most {MAX_SWL_MAP_ENTRIES}              (each entry preallocates ~16.4 KiB of kernel memory)"
+        ));
+    }
     let default_sort = match config.display.default_sort.as_str() {
         "ip" => SortMode::Ip,
         "rx" => SortMode::Rx,
@@ -394,24 +530,31 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         }
     };
 
-    // Metrics section: validate only what the built-in HTTP client can actually do.
+    // Metrics section: validate the URL against what the client can actually do.
     let metrics = &config.metrics;
     if metrics.enabled {
-        if !metrics.url.starts_with("http://") {
-            return Err(format!(
-                "metrics.url must start with http:// (no TLS support); got {:?}",
-                metrics.url
-            ));
-        }
-        if metrics.url.trim_end_matches('/').len() <= "http://".len() {
-            return Err("metrics.url must include a host".to_string());
-        }
+        validate_metrics_url(&metrics.url, metrics.allow_insecure_http)?;
         if !(5..=3600).contains(&metrics.push_interval_secs) {
             return Err(format!(
                 "metrics.push_interval_secs must be within 5..=3600; got {}",
                 metrics.push_interval_secs
             ));
         }
+    }
+
+    // Security contract: refuse to run without an explicit anti-spoofing
+    // acknowledgement (and refuse ownership modes this program does not have).
+    if config.security.ip_ownership != "external" {
+        return Err(format!(
+            "security.ip_ownership {:?} is not supported (only \"external\": anti-spoofing enforced outside this program)",
+            config.security.ip_ownership
+        ));
+    }
+    if !config.security.acknowledge_external_anti_spoofing {
+        return Err(
+            "security.acknowledge_external_anti_spoofing must be true: this program counts and limits by the packet's source address and CANNOT verify that the address belongs to the TAP it arrived on. Deploy source-address anti-spoofing on the bridge/platform (see README security prerequisites) and set [security] acknowledge_external_anti_spoofing = true"
+                .to_string(),
+        );
     }
 
     let ranges = validate_ranges(&config.ip_ranges)?;
@@ -430,7 +573,8 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         };
 
         // The range default must itself be internally consistent.
-        policy::resolve(&policy, None, &scope)?;
+        let eff = policy::resolve(&policy, None, &scope)?;
+        check_swl_enabled(&eff, config.experimental.enable_sliding_window_log, &scope)?;
 
         let mut overrides = HashMap::new();
         for ov in &entry.overrides {
@@ -459,7 +603,13 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
                 .into_fields(&format!("{scope} override {}", ov.ip))?;
             check_policy_bounds(&fields, &format!("{scope} override {}", ov.ip))?;
             // The merged result must be complete (inheritance fills what is missing).
-            policy::resolve(&policy, Some(&fields), &format!("{} ip {}", scope, ov.ip))?;
+            let ov_scope = format!("{} ip {}", scope, ov.ip);
+            let eff = policy::resolve(&policy, Some(&fields), &ov_scope)?;
+            check_swl_enabled(
+                &eff,
+                config.experimental.enable_sliding_window_log,
+                &ov_scope,
+            )?;
             if overrides.insert(ip, fields).is_some() {
                 return Err(format!("{scope}: duplicate override for ip {}", ov.ip));
             }
@@ -477,6 +627,8 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         refresh_interval_ms: config.collector.refresh_interval_ms,
         interface_scan_interval_secs: config.collector.interface_scan_interval_secs,
         map_max_entries: config.collector.map_max_entries,
+        swl_map_max_entries: config.collector.swl_map_max_entries,
+        ip_ownership: config.security.ip_ownership.clone(),
         show_interface: config.display.show_interface,
         show_packets: config.display.show_packets,
         default_sort,
@@ -494,6 +646,9 @@ mod tests {
     const EXAMPLE: &str = r#"
 [network]
 bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
 
 [collector]
 refresh_interval_ms = 1000
@@ -535,6 +690,9 @@ range = "10.30.9.1-10.30.9.16"
 [network]
 bridge = "br0"
 
+[security]
+acknowledge_external_anti_spoofing = true
+
 [[ip_ranges]]
 name = "A"
 range = "10.0.0.1-10.0.0.2"
@@ -545,6 +703,51 @@ range = "10.0.0.1-10.0.0.2"
         assert_eq!(cfg.map_max_entries, 8192);
         assert!(!cfg.show_interface);
         assert!(!cfg.show_packets);
+    }
+
+    #[test]
+    fn security_acknowledgement_is_required() {
+        // No [security] section at all: refused.
+        let text = r#"
+[network]
+bridge = "br0"
+
+[[ip_ranges]]
+name = "A"
+range = "10.0.0.1-10.0.0.2"
+"#;
+        let err = load_str(text).unwrap_err();
+        assert!(err.contains("acknowledge_external_anti_spoofing"), "{err}");
+
+        // Section present but acknowledgement false: refused.
+        let text = format!(
+            "{text}
+[security]
+acknowledge_external_anti_spoofing = false
+"
+        );
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("acknowledge_external_anti_spoofing"), "{err}");
+
+        // Acknowledged: accepted, ownership recorded.
+        let text = r#"
+[network]
+bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
+
+[[ip_ranges]]
+name = "A"
+range = "10.0.0.1-10.0.0.2"
+"#;
+        let cfg = load_str(text).unwrap();
+        assert_eq!(cfg.ip_ownership, "external");
+
+        // Unsupported ownership modes are rejected explicitly.
+        let text = format!("{text}\nip_ownership = \"automatic\"\n");
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("ip_ownership"), "{err}");
     }
 
     #[test]
@@ -562,17 +765,74 @@ range = "10.0.0.1-10.0.0.2"
         assert_eq!(cfg.metrics_url, "http://127.0.0.1:8428");
         assert_eq!(cfg.metrics_push_interval_secs, 30);
 
-        let text = format!("{EXAMPLE}\n[metrics]\nenabled = true\nurl = \"https://vm:8428\"\n");
-        assert!(load_str(&text).unwrap_err().contains("http://"));
+        // https is fine; unknown schemes are not.
+        let text = format!(
+            "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"https://vm:8428\"
+"
+        );
+        assert!(load_str(&text).is_ok());
+        let text = format!(
+            "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"ftp://vm:8428\"
+"
+        );
+        assert!(load_str(&text).unwrap_err().contains("scheme"));
 
         let text = format!(
-            "{EXAMPLE}\n[metrics]\nenabled = true\nurl = \"http://x\"\npush_interval_secs = 1\n"
+            "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"http://127.0.0.1:8428\"
+push_interval_secs = 1
+"
         );
         assert!(load_str(&text).unwrap_err().contains("push_interval_secs"));
 
         // disabled section skips all validation
-        let text = format!("{EXAMPLE}\n[metrics]\nenabled = false\nurl = \"nonsense\"\n");
+        let text = format!(
+            "{EXAMPLE}
+[metrics]
+enabled = false
+url = \"nonsense\"
+"
+        );
         assert!(load_str(&text).is_ok());
+    }
+
+    #[test]
+    fn metrics_url_policy() {
+        fn url_cfg(url: &str, extra: &str) -> String {
+            format!(
+                "{EXAMPLE}
+[metrics]
+enabled = true
+url = \"{url}\"
+{extra}"
+            )
+        }
+        // Loopback HTTP: always fine.
+        assert!(load_str(&url_cfg("http://127.0.0.1:8428", "")).is_ok());
+        assert!(load_str(&url_cfg("http://localhost:8428", "")).is_ok());
+        assert!(load_str(&url_cfg("http://[::1]:8428", "")).is_ok());
+        // Remote HTTP: refused unless explicitly accepted.
+        let err = load_str(&url_cfg("http://10.1.2.3:8428", "")).unwrap_err();
+        assert!(err.contains("allow_insecure_http"), "{err}");
+        assert!(load_str(&url_cfg(
+            "http://10.1.2.3:8428",
+            "allow_insecure_http = true
+"
+        ))
+        .is_ok());
+        // Remote HTTPS: fine without any flag.
+        assert!(load_str(&url_cfg("https://vm.example.com:8428", "")).is_ok());
+        // Garbage: parser error, host required.
+        assert!(load_str(&url_cfg("not a url", "")).is_err());
+        assert!(load_str(&url_cfg("http://", "")).is_err());
     }
 
     #[test]
@@ -584,7 +844,8 @@ range = "10.0.0.1-10.0.0.2"
 
     #[test]
     fn rejects_missing_ranges() {
-        let text = "[network]\nbridge = \"br0\"\n";
+        let text =
+            "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n";
         let err = load_str(text).unwrap_err();
         assert!(err.contains("[[ip_ranges]]"), "{err}");
     }
@@ -606,13 +867,16 @@ range = "10.0.0.1-10.0.0.2"
         // The whitelist is an LPM trie of CIDR prefixes: range size no longer costs
         // one map entry per address, so large ranges are valid.
         let text =
-            "[network]\nbridge = \"br0\"\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
+            "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
         assert!(load_str(text).is_ok());
     }
 
     const POLICY_EXAMPLE: &str = r#"
 [network]
 bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "Range-A"
@@ -666,6 +930,9 @@ range = "10.30.8.1-10.30.8.16"
 [network]
 bridge = "br0"
 
+[security]
+acknowledge_external_anti_spoofing = true
+
 [[ip_ranges]]
 name = "A"
 range = "10.0.0.1-10.0.0.2"
@@ -702,6 +969,108 @@ range = "10.0.0.1-10.0.0.2"
         let text = POLICY_EXAMPLE.replace("burst = \"4MiB\"", "burst = \"2GiB\"");
         let err = load_str(&text).unwrap_err();
         assert!(err.contains("at most 1GiB"), "{err}");
+    }
+
+    const SWL_POLICY: &str = r#"
+[network]
+bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
+
+[[ip_ranges]]
+name = "Range-A"
+range = "10.30.8.1-10.30.8.16"
+
+  [ip_ranges.policy]
+  rx_threshold = "1Gbps"
+  tx_threshold = "500Mbps"
+  window = "5m"
+  trigger_ratio = "80%"
+  rx_limit = "500Mbps"
+  tx_limit = "200Mbps"
+  limit_duration = "30m"
+  algorithm = "sliding_window_log"
+  limit_window = "10s"
+"#;
+
+    #[test]
+    fn swl_requires_explicit_experimental_switch() {
+        let err = load_str(SWL_POLICY).unwrap_err();
+        assert!(err.contains("enable_sliding_window_log"), "{err}");
+
+        let text = format!(
+            "{SWL_POLICY}
+[experimental]
+enable_sliding_window_log = true
+"
+        );
+        assert!(load_str(&text).is_ok());
+    }
+
+    #[test]
+    fn swl_switch_required_for_overrides_too() {
+        // Range default is plain GCRA; a single override switches to SWL — the gate
+        // must fire for the merged override policy too.
+        let base = r#"
+[network]
+bridge = "br0"
+
+[security]
+acknowledge_external_anti_spoofing = true
+
+[[ip_ranges]]
+name = "Range-A"
+range = "10.30.8.1-10.30.8.16"
+
+  [ip_ranges.policy]
+  rx_threshold = "1Gbps"
+  tx_threshold = "500Mbps"
+  window = "5m"
+  trigger_ratio = "80%"
+  rx_limit = "500Mbps"
+  tx_limit = "200Mbps"
+  limit_duration = "30m"
+  burst = "4MiB"
+
+  [[ip_ranges.overrides]]
+  ip = "10.30.8.3"
+  algorithm = "sliding_window_log"
+  limit_window = "10s"
+"#;
+        let err = load_str(base).unwrap_err();
+        assert!(err.contains("enable_sliding_window_log"), "{err}");
+
+        let text = format!("{base}\n[experimental]\nenable_sliding_window_log = true\n");
+        assert!(load_str(&text).is_ok());
+    }
+
+    #[test]
+    fn swl_map_capacity_validated() {
+        let cfg = load_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.swl_map_max_entries, 256); // conservative default
+
+        let text = EXAMPLE.replace(
+            "map_max_entries = 8192",
+            "map_max_entries = 8192
+swl_map_max_entries = 64",
+        );
+        assert_eq!(load_str(&text).unwrap().swl_map_max_entries, 64);
+
+        let text = EXAMPLE.replace(
+            "map_max_entries = 8192",
+            "map_max_entries = 8192
+swl_map_max_entries = 0",
+        );
+        assert!(load_str(&text).is_err());
+
+        let text = EXAMPLE.replace(
+            "map_max_entries = 8192",
+            "map_max_entries = 8192
+swl_map_max_entries = 999999",
+        );
+        let err = load_str(&text).unwrap_err();
+        assert!(err.contains("16.4 KiB"), "{err}");
     }
 
     #[test]

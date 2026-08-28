@@ -75,6 +75,9 @@ pub struct UiState {
     pub detail_index: Option<usize>,
     /// Last IPC error (daemon unreachable, bad reply, ...).
     pub error: Option<String>,
+    /// Non-fatal notices: config degradation, protocol drift.
+    pub config_warning: Option<String>,
+    pub protocol_note: Option<String>,
 
     pub screen: Screen,
     pub overview: TableState,
@@ -105,6 +108,8 @@ impl UiState {
             detail: None,
             detail_index: None,
             error: None,
+            config_warning: None,
+            protocol_note: None,
             screen: Screen::Overview,
             overview: TableState::default(),
             detail_table: TableState::default(),
@@ -166,6 +171,12 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
                     s.config_watcher_errors_total, s.config_watcher_last_error
                 ));
             }
+            if s.dataplane_degraded {
+                line.push_str(&format!(
+                    "    DATAPLANE DEGRADED: {} rollback failure(s) — some flows unarmed (fail-open)",
+                    s.rollback_failures_total
+                ));
+            }
             line
         }
         _ => format!("Config generation: {generation}"),
@@ -184,6 +195,20 @@ fn draw_header(f: &mut Frame, app: &UiState, area: Rect) {
         )),
         Line::from(reload_line),
     ];
+    if let Some(w) = &app.config_warning {
+        lines.push(Line::from(Span::styled(
+            format!("config: {w}"),
+            Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(n) = &app.protocol_note {
+        lines.push(Line::from(Span::styled(
+            format!("protocol: {n}"),
+            Style::default().fg(ratatui::style::Color::Yellow),
+        )));
+    }
     if let Some(err) = &app.error {
         lines.push(Line::from(Span::styled(
             format!("daemon: {err}"),

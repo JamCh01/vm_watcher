@@ -10,6 +10,7 @@ pub mod ip_range;
 pub mod ipc;
 pub mod limiter;
 pub mod policy;
+pub mod swl;
 pub mod timefmt;
 pub mod units;
 pub mod window;

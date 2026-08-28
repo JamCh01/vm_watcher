@@ -12,6 +12,29 @@ use serde::{Deserialize, Serialize};
 /// and UI so the name never drifts between the three.
 pub const IPV6_RANGE_NAME: &str = "IPv6";
 
+/// Protocol version carried in [`Status`]. Bump only on incompatible changes;
+/// additive fields must keep working via `serde(default)`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Requests are tiny JSON documents; a larger frame is a misbehaving client.
+pub const MAX_REQUEST_FRAME: usize = 64 * 1024;
+
+/// Largest legitimate response: a RangeDetail listing ~map_max_entries IPs at
+/// roughly 350 B JSON each (8192 IPs ≈ 3 MiB). 8 MiB leaves headroom while refusing
+/// to allocate on an untrusted u32 length.
+pub const MAX_RESPONSE_FRAME: usize = 8 * 1024 * 1024;
+
+/// Validate an untrusted frame length BEFORE allocating. `max` is one of the limits
+/// above, chosen by the reading side.
+pub fn validate_frame_len(len: u32, max: usize) -> Result<usize, String> {
+    let len = len as usize;
+    if len > max {
+        Err(format!("frame length {len} exceeds limit {max}"))
+    } else {
+        Ok(len)
+    }
+}
+
 /// A request from the UI to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,6 +57,10 @@ pub enum Response {
 /// Everything the overview screen needs (§30, §31, §32).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
+    /// Protocol version of the daemon. `#[serde(default)]` → 0 when talking to a
+    /// daemon older than versioning, which clients treat as "legacy, best effort".
+    #[serde(default)]
+    pub protocol_version: u32,
     pub generation: u64,
     /// Wall-clock string for when the current config was loaded.
     pub config_loaded_at: String,
@@ -48,6 +75,40 @@ pub struct Status {
     pub config_watcher_healthy: bool,
     pub config_watcher_errors_total: u64,
     pub config_watcher_last_error: String,
+    /// True once a map rollback could not fully restore the dataplane. Affected
+    /// flows are unarmed (fail-open) until they re-trigger; the flag persists so the
+    /// degradation stays visible. `#[serde(default)]` keeps older daemons readable.
+    #[serde(default)]
+    pub dataplane_degraded: bool,
+    #[serde(default)]
+    pub rollback_failures_total: u64,
+    /// Anti-spoofing contract (see config `[security]`): which mode is in effect,
+    /// whether THIS program enforces it (currently always false — external), and that
+    /// the operator acknowledgement is on file.
+    #[serde(default)]
+    pub anti_spoof_mode: String,
+    #[serde(default)]
+    pub anti_spoof_enforced_by_program: bool,
+    #[serde(default)]
+    pub anti_spoof_acknowledged: bool,
+    /// Packets above the policer's MAX_POLICED_LEN that passed fail-open while a
+    /// limit policy was armed (cumulative since daemon start). Nonzero values mean
+    /// the environment can produce oversized frames at the TC hooks — see
+    /// docs/kernel-validation.md for how to judge them.
+    #[serde(default)]
+    pub oversized_rx_packets: u64,
+    #[serde(default)]
+    pub oversized_rx_bytes: u64,
+    #[serde(default)]
+    pub oversized_tx_packets: u64,
+    #[serde(default)]
+    pub oversized_tx_bytes: u64,
+    /// Sliding-window-log map: configured capacity vs entries currently installed.
+    /// Each entry preallocates ~16.4 KiB of kernel memory.
+    #[serde(default)]
+    pub swl_map_capacity: u32,
+    #[serde(default)]
+    pub swl_map_used: u32,
     pub ranges: Vec<RangeSummary>,
 }
 
@@ -184,5 +245,48 @@ mod tests {
     fn rejects_garbage() {
         let err = decode::<Request>(b"not json").unwrap_err();
         assert!(err.contains("deserialize"), "{err}");
+    }
+
+    #[test]
+    fn frame_length_validation_boundaries() {
+        let max = 1024;
+        assert_eq!(validate_frame_len(1023, max), Ok(1023));
+        assert_eq!(validate_frame_len(1024, max), Ok(1024));
+        assert!(validate_frame_len(1025, max).is_err());
+        assert!(validate_frame_len(u32::MAX, max).is_err());
+        assert!(validate_frame_len(u32::MAX, MAX_RESPONSE_FRAME).is_err());
+    }
+
+    #[test]
+    fn truncated_frame_body_fails_to_decode() {
+        let frame = encode(&Request::Overview).unwrap();
+        let err = decode::<Request>(&frame[4..frame.len() - 1]).unwrap_err();
+        assert!(err.contains("deserialize"), "{err}");
+    }
+
+    #[test]
+    fn status_without_protocol_version_reads_as_legacy() {
+        // A daemon predating versioning sends no field: default must be 0, not an
+        // error.
+        let json = r#"{"type":"status","generation":1,"config_loaded_at":"","last_reload_at":"","last_reload_ok":true,"last_reload_error":"","bridge":"br0","tap_count":0,"config_watcher_healthy":true,"config_watcher_errors_total":0,"config_watcher_last_error":"","dataplane_degraded":false,"rollback_failures_total":0,"swl_map_capacity":0,"swl_map_used":0,"ranges":[]}"#;
+        let resp: Response = serde_json::from_str(json).unwrap();
+        match resp {
+            Response::Status(s) => assert_eq!(s.protocol_version, 0),
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_carries_current_protocol_version() {
+        let status = Status {
+            protocol_version: PROTOCOL_VERSION,
+            ..Default::default()
+        };
+        let frame = encode(&Response::Status(Box::new(status))).unwrap();
+        let back: Response = decode(&frame[4..]).unwrap();
+        match back {
+            Response::Status(s) => assert_eq!(s.protocol_version, PROTOCOL_VERSION),
+            other => panic!("expected status, got {other:?}"),
+        }
     }
 }

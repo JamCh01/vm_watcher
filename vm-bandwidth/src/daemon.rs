@@ -8,6 +8,7 @@
 //! shared-mutable locking.
 
 use std::collections::HashSet;
+use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,11 +23,12 @@ use futures::{SinkExt, StreamExt};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::RecursiveMode;
 use notify_debouncer_full::Debouncer;
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use vm_bandwidth_common::{
-    LimitKey, LimitPolicy, LimitState, PolicerStats, SwlRing, TrafficKey, TrafficKey6,
+    LimitKey, LimitPolicy, LimitState, OversizedStats, PolicerStats, SwlRing, TrafficKey,
     TrafficValue, ALGO_SLIDING_WINDOW_LOG, DIR_RX, DIR_TX,
 };
 
@@ -49,8 +51,10 @@ pub const PIN_LIMIT_POLICIES: &str = "/sys/fs/bpf/LIMIT_POLICIES";
 pub const PIN_GCRA_STATE: &str = "/sys/fs/bpf/GCRA_STATE";
 const LOCK_PATH: &str = "/run/vm-bandwidth-monitor.lock";
 
-/// Refuse IPC frames larger than this (guards against a misbehaving client).
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// Bound on concurrent IPC clients: the socket is owner-only, but a slow or stuck
+/// connection must not accumulate unbounded engine-side queues; new connections wait
+/// in the listen backlog until a slot frees up.
+const MAX_IPC_CONNECTIONS: usize = 16;
 /// Debounce window for filesystem events (§29): one normal save ≈ one reload.
 const RELOAD_DEBOUNCE_MS: u64 = 300;
 
@@ -67,18 +71,6 @@ enum WatchMsg {
     /// Debouncer/inotify errors: without surfacing these the daemon keeps running but
     /// hot reload silently stops working.
     Error(String),
-}
-
-/// Rollback bookkeeping for one transactional map apply: filled as operations
-/// succeed, played back in reverse on the first failure.
-#[derive(Default)]
-struct MapRollback {
-    wl_added: Vec<Cidr>,
-    wl_removed: Vec<Cidr>,
-    /// Executed Remove actions with the policy they displaced (None = was absent).
-    removes: Vec<(LimitKey, Option<LimitPolicy>)>,
-    /// Executed Install actions with the policy they displaced (None = fresh flow).
-    installs: Vec<(LimitKey, Option<LimitPolicy>)>,
 }
 
 /// Whitelist-trie key for one prefix. The kernel LPM trie matches bits in MEMORY-byte
@@ -121,6 +113,12 @@ struct Engine {
     config_watcher_errors_total: u64,
     config_watcher_last_error: String,
 
+    /// Dataplane health: set when a rollback could not fully restore the maps.
+    /// Affected flows are unarmed (fail-open) until they re-trigger; the flag stays
+    /// on so operators can see the degradation instead of it being swallowed.
+    dataplane_degraded: bool,
+    rollback_failures_total: u64,
+
     bridge: String,
     manager: AttachManager,
     taps: Vec<Tap>,
@@ -134,19 +132,24 @@ struct Engine {
     last_policer: std::collections::HashMap<u32, crate::collector::PolicerIpTotals>,
     /// Last poll's aggregate IPv6 counters, for the VictoriaMetrics push.
     last_ipv6: crate::collector::IpStats,
+    /// Cumulative oversized (unpoliced) packet counters, (RX, TX) — observability for
+    /// the fail-open path above MAX_POLICED_LEN while a policy is armed.
+    oversized: (OversizedStats, OversizedStats),
+    oversized_map: PerCpuHashMap<MapData, u8, OversizedStats>,
 
     /// Whitelist-trie capacity fixed at startup; hot reload must fit inside it.
     whitelist_capacity: u32,
 
     monitored: LpmTrie<MapData, u32, u8>,
-    #[allow(dead_code)] // kept alive so its map fd stays open
     limit_policies: AyaHashMap<MapData, LimitKey, LimitPolicy>,
     limit_state: AyaHashMap<MapData, LimitKey, LimitState>,
     /// Bounded sliding-window-log rings; only populated for flows limited with
     /// the `sliding_window_log` algorithm.
     swl_log: AyaHashMap<MapData, LimitKey, SwlRing>,
     traffic: PerCpuHashMap<MapData, TrafficKey, TrafficValue>,
-    traffic6: PerCpuHashMap<MapData, TrafficKey6, TrafficValue>,
+    /// Aggregate IPv6 counters per TAP ifindex (cardinality bounded by TAP count,
+    /// not by address churn — see the eBPF TRAFFIC6 comment).
+    traffic6: PerCpuHashMap<MapData, u32, TrafficValue>,
     policer_stats: PerCpuHashMap<MapData, LimitKey, PolicerStats>,
     /// Shared HTTP client for the VictoriaMetrics push.
     http: reqwest::Client,
@@ -191,11 +194,11 @@ impl Engine {
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         if !actions.is_empty() {
-            let mut rb = MapRollback::default();
-            if let Err(e) = self.execute_limit_actions(&actions, &mut rb) {
+            let mut journal = crate::txmaps::TxJournal::default();
+            if let Err(e) = self.execute_limit_actions(&actions, &mut journal) {
                 // A half-applied batch is worse than none: roll the dataplane back and
                 // let the flows re-evaluate from NORMAL on their next threshold cross.
-                self.rollback_map_apply(&rb);
+                self.rollback_map_apply(&journal);
                 for action in &actions {
                     let (ipv4, direction) = match action {
                         LimitAction::Install {
@@ -212,6 +215,7 @@ impl Engine {
         self.last_ipv6 = ipv6;
         self.last_policer = policer;
         self.last_snapshot = Some(snapshot);
+        self.oversized = read_oversized(&self.oversized_map);
     }
 
     /// Push cumulative per-IP counters to VictoriaMetrics (no-op when disabled).
@@ -240,6 +244,10 @@ impl Engine {
             &self.last_ipv6,
             now_ms,
         ));
+        lines.push_str(&crate::metrics::render_prom_lines_oversized(
+            &self.oversized,
+            now_ms,
+        ));
         if lines.is_empty() {
             return;
         }
@@ -254,9 +262,10 @@ impl Engine {
         let http = self.http.clone();
         let url = cfg.metrics_url.clone();
         tokio::spawn(async move {
-            let result = crate::metrics::push(&http, &url, &lines).await;
-            flag.store(false, std::sync::atomic::Ordering::Release);
-            match result {
+            // The flag lives in an RAII guard: normal completion, HTTP errors,
+            // cancellation and panic unwinding all drop it and release the flag.
+            let _guard = PushGuard(flag);
+            match crate::metrics::push(&http, &url, &lines).await {
                 Ok(()) => log::debug!("metrics push: {} line(s)", lines.lines().count()),
                 Err(e) => log::warn!("metrics push to {url} failed: {e:#}"),
             }
@@ -308,41 +317,35 @@ impl Engine {
         }
     }
 
-    /// Execute limit actions against the eBPF maps transactionally. Removes run first
-    /// (they free capacity); per flow the write order is:
-    ///   Install: STATE FIRST, POLICY LAST — the policy is the arming marker, so a
-    ///            failed state write can never leave an armed policy without state;
-    ///   Remove:  POLICY FIRST, state after — a failed cleanup can never leave an armed
-    ///            policy behind a "removed" verdict.
-    /// Every map operation propagates its error; on the first failure the caller plays
-    /// back `rb` in reverse.
+    /// Execute limit actions against the eBPF maps transactionally via the
+    /// [`txmaps`] layer: removes first (they free capacity), installs after. For each
+    /// flow the order is disarm -> clear foreign artifacts -> fresh state -> arm LAST;
+    /// the journal exists before the first destructive write of every action.
     fn execute_limit_actions(
         &mut self,
         actions: &[LimitAction],
-        rb: &mut MapRollback,
+        journal: &mut crate::txmaps::TxJournal,
     ) -> Result<()> {
-        // Pass 1: removals (disarm, then clean up).
+        let mut maps = EngineMaps {
+            policies: &mut self.limit_policies,
+            state: &mut self.limit_state,
+            swl: &mut self.swl_log,
+            policer: &mut self.policer_stats,
+        };
+
+        // Pass 1: removals.
         for action in actions {
             let LimitAction::Remove { ipv4, direction } = action else {
                 continue;
             };
             let key = LimitKey::new(*ipv4, *direction);
             let addr = std::net::Ipv4Addr::from(*ipv4);
-            let old = self.get_policy(&key)?;
-            self.limit_policies
-                .remove(&key)
+            crate::txmaps::remove_limit(&mut maps, journal, key)
                 .with_context(|| format!("removing limit policy for {addr} dir={direction}"))?;
-            rb.removes.push((key, old));
-            map_gone(self.limit_state.remove(&key))
-                .with_context(|| format!("removing limit state for {addr}"))?;
-            map_gone(self.swl_log.remove(&key))
-                .with_context(|| format!("removing sliding-window log for {addr}"))?;
-            map_gone(self.policer_stats.remove(&key))
-                .with_context(|| format!("removing policer stats for {addr}"))?;
             log::info!("back to NORMAL {addr} dir={direction}");
         }
 
-        // Pass 2: installs (state first, policy as the arming marker last).
+        // Pass 2: installs.
         for action in actions {
             let LimitAction::Install {
                 ipv4,
@@ -357,14 +360,6 @@ impl Engine {
             };
             let key = LimitKey::new(*ipv4, *direction);
             let addr = std::net::Ipv4Addr::from(*ipv4);
-            let old = self.get_policy(&key)?;
-            let old_was_swl = old
-                .map(|p| p.algorithm == ALGO_SLIDING_WINDOW_LOG)
-                .unwrap_or(false);
-
-            self.write_fresh_state(&key, *algorithm)
-                .with_context(|| format!("initialising limit state for {addr}"))?;
-
             let policy = LimitPolicy {
                 enabled: 1,
                 _pad0: [0; 3],
@@ -373,21 +368,8 @@ impl Engine {
                 burst_bytes: *burst_bytes,
                 window_ns: *window_ns,
             };
-            self.limit_policies
-                .insert(key, policy, 0)
+            crate::txmaps::install_limit(&mut maps, journal, key, policy)
                 .with_context(|| format!("installing limit policy for {addr} dir={direction}"))?;
-            rb.installs.push((key, old));
-
-            // Drop the displaced algorithm's artifact only after the new policy is
-            // armed, so no window exists where an armed policy points at dead state.
-            if old_was_swl && *algorithm != ALGO_SLIDING_WINDOW_LOG {
-                map_gone(self.swl_log.remove(&key))
-                    .with_context(|| format!("removing stale sliding-window log for {addr}"))?;
-            } else if old.is_some() && *algorithm == ALGO_SLIDING_WINDOW_LOG {
-                map_gone(self.limit_state.remove(&key))
-                    .with_context(|| format!("removing stale limit state for {addr}"))?;
-            }
-
             log::info!(
                 "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
                 addr,
@@ -401,72 +383,39 @@ impl Engine {
         Ok(())
     }
 
-    /// Read the currently armed policy for a flow (None = not policed). Propagates
-    /// errors other than absence.
-    fn get_policy(&self, key: &LimitKey) -> Result<Option<LimitPolicy>> {
-        match self.limit_policies.get(key, 0) {
-            Ok(p) => Ok(Some(p)),
-            Err(MapError::KeyNotFound) => Ok(None),
-            Err(e) => Err(e.into()),
+    /// Play the journal back in reverse and surface the outcome. Never silent: a
+    /// failed step logs at error severity and flags the dataplane degraded (affected
+    /// flows are unarmed / fail-open until they re-trigger).
+    fn rollback_map_apply(
+        &mut self,
+        journal: &crate::txmaps::TxJournal,
+    ) -> crate::txmaps::RollbackReport {
+        let mut maps = EngineMaps {
+            policies: &mut self.limit_policies,
+            state: &mut self.limit_state,
+            swl: &mut self.swl_log,
+            policer: &mut self.policer_stats,
+        };
+        let mut wl = EngineWhitelist(&mut self.monitored);
+        let report = crate::txmaps::rollback_journal(&mut maps, &mut wl, journal);
+        for f in &report.failures {
+            log::error!(
+                "rollback failed at '{}' for {}: {}",
+                f.op,
+                std::net::Ipv4Addr::from(f.key.ipv4),
+                f.error
+            );
         }
-    }
-
-    /// Zero-initialise the runtime-state map matching `algorithm` (the data path never
-    /// creates lock-bearing values).
-    fn write_fresh_state(&mut self, key: &LimitKey, algorithm: u32) -> Result<()> {
-        if algorithm == ALGO_SLIDING_WINDOW_LOG {
-            self.swl_log
-                .insert(*key, SwlRing::default(), 0)
-                .map_err(Into::into)
-        } else {
-            self.limit_state
-                .insert(*key, LimitState::default(), 0)
-                .map_err(Into::into)
+        if !report.dataplane_consistent {
+            self.dataplane_degraded = true;
+            self.rollback_failures_total += report.failures.len() as u64;
+            log::error!(
+                "dataplane DEGRADED after rollback: {} of {} step(s) failed;                  affected flows are unarmed (fail-open) until they re-trigger",
+                report.failures.len(),
+                report.attempted
+            );
         }
-    }
-
-    /// Best-effort reverse of everything recorded in `rb`, played back in reverse order.
-    /// Restored algorithm state is FRESH — kernel-side state is unrecoverable once
-    /// overwritten, so a rolled-back flow restarts its budget from zero.
-    fn rollback_map_apply(&mut self, rb: &MapRollback) {
-        for (key, old) in rb.installs.iter().rev() {
-            let _ = self.limit_policies.remove(key);
-            match old {
-                Some(old) => {
-                    // Re-arm the displaced policy with fresh state.
-                    if self.limit_policies.insert(*key, *old, 0).is_ok() {
-                        let _ = self.write_fresh_state(key, old.algorithm);
-                    } else {
-                        log::warn!(
-                            "rollback: failed to re-arm policy for {}",
-                            std::net::Ipv4Addr::from(key.ipv4)
-                        );
-                    }
-                }
-                None => {
-                    let _ = self.limit_state.remove(key);
-                    let _ = self.swl_log.remove(key);
-                }
-            }
-        }
-        for (key, old) in rb.removes.iter().rev() {
-            if let Some(old) = old {
-                if self.limit_policies.insert(*key, *old, 0).is_ok() {
-                    let _ = self.write_fresh_state(key, old.algorithm);
-                } else {
-                    log::warn!(
-                        "rollback: failed to restore policy for {}",
-                        std::net::Ipv4Addr::from(key.ipv4)
-                    );
-                }
-            }
-        }
-        for c in rb.wl_removed.iter().rev() {
-            let _ = self.monitored.insert(&trie_key(c), 1u8, 0);
-        }
-        for c in rb.wl_added.iter().rev() {
-            let _ = self.monitored.remove(&trie_key(c));
-        }
+        report
     }
 
     /// Human-readable algorithm name for log lines.
@@ -586,6 +535,12 @@ impl Engine {
                  (the eBPF maps are sized once at startup); restart the daemon instead"
             );
         }
+        if new_cfg.swl_map_max_entries != cur.swl_map_max_entries {
+            anyhow::bail!(
+                "changing collector.swl_map_max_entries is not supported by hot reload \
+                 (the eBPF maps are sized once at startup); restart the daemon instead"
+            );
+        }
 
         let old_prefixes = prefix_set(&cur);
         let new_prefixes = prefix_set(&new_cfg);
@@ -607,9 +562,9 @@ impl Engine {
             .plan_reload(&new_cfg, now)
             .map_err(anyhow::Error::msg)?;
 
-        let mut rb = MapRollback::default();
-        if let Err(e) = self.apply_maps(&plan.actions, &old_prefixes, &new_prefixes, &mut rb) {
-            self.rollback_map_apply(&rb);
+        let mut journal = crate::txmaps::TxJournal::default();
+        if let Err(e) = self.apply_maps(&plan.actions, &old_prefixes, &new_prefixes, &mut journal) {
+            self.rollback_map_apply(&journal);
             return Err(e);
         }
 
@@ -620,26 +575,28 @@ impl Engine {
         Ok(())
     }
 
-    /// §27 ordering with rollback bookkeeping: whitelist additions first, limit-map
-    /// actions second, whitelist removals last.
+    /// §27 ordering with journal bookkeeping: whitelist additions first, limit-map
+    /// actions second, whitelist removals last. Each successful operation is
+    /// journaled immediately, so any mid-way failure rolls back exactly what ran.
     fn apply_maps(
         &mut self,
         actions: &[LimitAction],
         old_prefixes: &HashSet<Cidr>,
         new_prefixes: &HashSet<Cidr>,
-        rb: &mut MapRollback,
+        journal: &mut crate::txmaps::TxJournal,
     ) -> Result<()> {
-        for c in new_prefixes.difference(old_prefixes) {
-            self.monitored
-                .insert(&trie_key(c), 1u8, 0)
-                .with_context(|| format!("whitelisting {}", c.display()))?;
-            rb.wl_added.push(*c);
+        let additions: Vec<Cidr> = new_prefixes.difference(old_prefixes).copied().collect();
+        {
+            let mut wl = EngineWhitelist(&mut self.monitored);
+            crate::txmaps::apply_whitelist_additions(&mut wl, journal, &additions)
+                .context("whitelisting new prefixes")?;
         }
-        self.execute_limit_actions(actions, rb)?;
-        for c in old_prefixes.difference(new_prefixes) {
-            map_gone(self.monitored.remove(&trie_key(c)))
-                .with_context(|| format!("dropping whitelist prefix {}", c.display()))?;
-            rb.wl_removed.push(*c);
+        self.execute_limit_actions(actions, journal)?;
+        let removals: Vec<Cidr> = old_prefixes.difference(new_prefixes).copied().collect();
+        {
+            let mut wl = EngineWhitelist(&mut self.monitored);
+            crate::txmaps::apply_whitelist_removals(&mut wl, journal, &removals)
+                .context("dropping removed whitelist prefixes")?;
         }
         Ok(())
     }
@@ -690,6 +647,7 @@ impl Engine {
             });
         }
         Status {
+            protocol_version: ipc::PROTOCOL_VERSION,
             generation: self.generation,
             config_loaded_at: self.config_loaded_at.clone(),
             last_reload_at: self.last_reload_at.clone(),
@@ -700,6 +658,17 @@ impl Engine {
             config_watcher_healthy: self.config_watcher_healthy,
             config_watcher_errors_total: self.config_watcher_errors_total,
             config_watcher_last_error: self.config_watcher_last_error.clone(),
+            dataplane_degraded: self.dataplane_degraded,
+            rollback_failures_total: self.rollback_failures_total,
+            anti_spoof_mode: self.config.load().ip_ownership.clone(),
+            anti_spoof_enforced_by_program: false,
+            anti_spoof_acknowledged: true,
+            oversized_rx_packets: self.oversized.0.packets,
+            oversized_rx_bytes: self.oversized.0.bytes,
+            oversized_tx_packets: self.oversized.1.packets,
+            oversized_tx_bytes: self.oversized.1.bytes,
+            swl_map_capacity: self.config.load().swl_map_max_entries,
+            swl_map_used: self.swl_log.iter().filter_map(|i| i.ok()).count() as u32,
             ranges,
         }
     }
@@ -768,6 +737,94 @@ impl Engine {
     }
 }
 
+/// Aggregate the two-entry per-CPU OVERSIZED map into cumulative (RX, TX) counters.
+/// Map read errors leave the previous numbers in place (observability must never
+/// disturb the engine).
+fn read_oversized(
+    map: &PerCpuHashMap<MapData, u8, OversizedStats>,
+) -> (OversizedStats, OversizedStats) {
+    let mut acc = (OversizedStats::default(), OversizedStats::default());
+    for item in map.iter() {
+        let Ok((dir, values)) = item else { continue };
+        let slot = match dir {
+            DIR_RX => &mut acc.0,
+            DIR_TX => &mut acc.1,
+            _ => continue,
+        };
+        for v in values.iter() {
+            slot.packets += v.packets;
+            slot.bytes += v.bytes;
+        }
+    }
+    acc
+}
+
+/// The engine's limit maps behind the [`crate::txmaps::LimitMaps`] trait. Absence-tolerant
+/// cleanup ops go through [`map_gone`]; the policy read maps `KeyNotFound` to `None`.
+struct EngineMaps<'a> {
+    policies: &'a mut AyaHashMap<MapData, LimitKey, LimitPolicy>,
+    state: &'a mut AyaHashMap<MapData, LimitKey, LimitState>,
+    swl: &'a mut AyaHashMap<MapData, LimitKey, SwlRing>,
+    policer: &'a mut PerCpuHashMap<MapData, LimitKey, PolicerStats>,
+}
+
+impl crate::txmaps::LimitMaps for EngineMaps<'_> {
+    fn get_policy(&mut self, key: &LimitKey) -> Result<Option<LimitPolicy>> {
+        match self.policies.get(key, 0) {
+            Ok(p) => Ok(Some(p)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn arm_policy(&mut self, key: &LimitKey, policy: LimitPolicy) -> Result<()> {
+        self.policies.insert(*key, policy, 0).map_err(Into::into)
+    }
+
+    fn disarm_policy(&mut self, key: &LimitKey) -> Result<()> {
+        map_gone(self.policies.remove(key))
+    }
+
+    fn write_fresh_state(&mut self, key: &LimitKey, algorithm: u32) -> Result<()> {
+        // The data path never constructs lock-bearing values; userspace installs a
+        // zeroed artifact of the shape the algorithm expects.
+        if algorithm == ALGO_SLIDING_WINDOW_LOG {
+            self.swl
+                .insert(*key, SwlRing::default(), 0)
+                .map_err(Into::into)
+        } else {
+            self.state
+                .insert(*key, LimitState::default(), 0)
+                .map_err(Into::into)
+        }
+    }
+
+    fn clear_state(&mut self, key: &LimitKey, algorithm: u32) -> Result<()> {
+        if algorithm == ALGO_SLIDING_WINDOW_LOG {
+            map_gone(self.swl.remove(key))
+        } else {
+            map_gone(self.state.remove(key))
+        }
+    }
+
+    fn clear_policer(&mut self, key: &LimitKey) -> Result<()> {
+        map_gone(self.policer.remove(key))
+    }
+}
+
+/// The whitelist trie behind [`crate::txmaps::WhitelistOps`].
+struct EngineWhitelist<'a>(&'a mut LpmTrie<MapData, u32, u8>);
+
+impl crate::txmaps::WhitelistOps for EngineWhitelist<'_> {
+    fn wl_insert(&mut self, cidr: &Cidr) -> Result<()> {
+        self.0.insert(&trie_key(cidr), 1u8, 0).map_err(Into::into)
+    }
+
+    fn wl_remove(&mut self, cidr: &Cidr) -> Result<()> {
+        map_gone(self.0.remove(&trie_key(cidr)))
+    }
+}
+
 fn state_label(limited: bool) -> String {
     if limited {
         "LIMITED".to_string()
@@ -784,8 +841,6 @@ fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
 
 /// Entry point for daemon mode.
 pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<()> {
-    use std::fs::File;
-
     // 1. Load and validate the initial config. Refuse to start on any problem.
     let cfg = config::load(&config_path).map_err(anyhow::Error::msg)?;
     let initial_config_bytes = std::fs::read(&config_path)?;
@@ -794,17 +849,16 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         cfg.ranges.len(),
         cfg.bridge
     );
+    // The anti-spoofing contract is a security-relevant startup fact: say it loudly.
+    log::warn!(
+        "SECURITY: ip_ownership = \"{}\" — source-address anti-spoofing is enforced          EXTERNALLY (bridge/platform), NOT by this program; operator acknowledgement          recorded in [security]",
+        cfg.ip_ownership
+    );
 
-    // 2. Single-instance lock.
-    let lock_file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(LOCK_PATH)
-        .with_context(|| format!("cannot create lock file {LOCK_PATH}"))?;
-    lock_file
-        .try_lock()
-        .context("another vm-bandwidth-monitor instance is already running")?;
+    // 2. Single-instance lock. The file is created once and NEVER deleted: deleting
+    //    it on shutdown opens an inode race (another process locks the old inode
+    //    while a third creates and locks a fresh one). The flock dies with the fd.
+    let lock_file = acquire_instance_lock(LOCK_PATH)?;
 
     // 3. Remove any pins left by older versions (v0.2.0 and earlier pinned the maps);
     //    the current maps are unpinned and live only as long as the daemon does.
@@ -831,8 +885,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         .map_max_entries("MONITORED_IPS", whitelist_capacity)
         .map_max_entries("LIMIT_POLICIES", cfg.map_max_entries)
         .map_max_entries("LIMIT_STATE", cfg.map_max_entries)
-        .map_max_entries("SWL_LOG", cfg.map_max_entries)
+        // SWL rings are ~16.4 KiB each and preallocated; they get their own small
+        // capacity (config::swl_map_max_entries) instead of the general map size.
+        .map_max_entries("SWL_LOG", cfg.swl_map_max_entries)
         .map_max_entries("POLICER_STATS", cfg.map_max_entries)
+        .map_max_entries("OVERSIZED", 4)
         .load(object)
         .context(
             "failed to load the eBPF object; this program needs root (CAP_BPF + CAP_NET_ADMIN), \
@@ -872,7 +929,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         base.take_map("TRAFFIC").context("TRAFFIC missing")?,
     )
     .context("TRAFFIC has the wrong type")?;
-    let traffic6 = PerCpuHashMap::<MapData, TrafficKey6, TrafficValue>::try_from(
+    let traffic6 = PerCpuHashMap::<MapData, u32, TrafficValue>::try_from(
         base.take_map("TRAFFIC6").context("TRAFFIC6 missing")?,
     )
     .context("TRAFFIC6 has the wrong type")?;
@@ -881,6 +938,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
             .context("POLICER_STATS missing")?,
     )
     .context("POLICER_STATS has the wrong type")?;
+
+    let oversized_map = PerCpuHashMap::<MapData, u8, OversizedStats>::try_from(
+        base.take_map("OVERSIZED").context("OVERSIZED missing")?,
+    )
+    .context("OVERSIZED has the wrong type")?;
 
     // 4. Discover TAPs and attach (one loaded object, one link pair per TAP).
     let mut manager = AttachManager::new(base)?;
@@ -910,6 +972,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         config_watcher_healthy: true,
         config_watcher_errors_total: 0,
         config_watcher_last_error: String::new(),
+        dataplane_degraded: false,
+        rollback_failures_total: 0,
         bridge: config.load().bridge.clone(),
         manager,
         taps,
@@ -919,6 +983,8 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         last_totals: std::collections::HashMap::new(),
         last_policer: std::collections::HashMap::new(),
         last_ipv6: crate::collector::IpStats::default(),
+        oversized: (OversizedStats::default(), OversizedStats::default()),
+        oversized_map,
         whitelist_capacity,
         monitored,
         limit_policies,
@@ -945,12 +1011,21 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     std::fs::set_permissions(SOCK_PATH, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting permissions on {SOCK_PATH}"))?;
     let (ipc_tx, mut ipc_rx) = mpsc::channel::<IpcReq>(32);
+    let conn_permits = Arc::new(tokio::sync::Semaphore::new(MAX_IPC_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    // Backpressure: wait for a slot instead of spawning without bound;
+                    // excess clients queue in the listen backlog.
+                    let Ok(permit) = conn_permits.clone().acquire_owned().await else {
+                        break; // semaphore closed: shutting down
+                    };
                     let tx = ipc_tx.clone();
-                    tokio::spawn(handle_connection(stream, tx));
+                    tokio::spawn(async move {
+                        let _permit = permit; // held until the connection ends
+                        handle_connection(stream, tx).await;
+                    });
                 }
                 Err(e) => {
                     log::warn!("IPC accept error: {e}");
@@ -1042,31 +1117,87 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     //    the TC links this program created; the unpinned maps die with the process.
     drop(engine);
     let _ = std::fs::remove_file(SOCK_PATH);
+    // Release the lock by dropping the fd; the lock file itself stays on disk
+    // permanently (see the note at acquisition).
     drop(lock_file);
-    let _ = std::fs::remove_file(LOCK_PATH);
     log::info!("daemon stopped cleanly");
     Ok(())
 }
 
+/// RAII holder for the in-flight metrics-push flag. Dropping the guard covers every
+/// exit path of the spawned task — normal completion, HTTP error, future cancellation
+/// and panic unwinding — so the flag can never stay set and silently stop pushes.
+struct PushGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for PushGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Open (creating if needed) the lock file at a fixed path and take an exclusive,
+/// non-blocking flock. A second live holder fails with a clear error.
+fn acquire_instance_lock(path: &str) -> Result<File> {
+    let lock_file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("cannot create lock file {path}"))?;
+    lock_file
+        .try_lock()
+        .context("another vm-bandwidth-monitor instance is already running")?;
+    Ok(lock_file)
+}
+
 /// Serve one IPC client: length-delimited JSON request/response until it disconnects.
 async fn handle_connection(stream: UnixStream, tx: mpsc::Sender<IpcReq>) {
-    let mut framed = Framed::new(
-        stream,
+    // The two directions carry asymmetric limits and get separate codecs: requests
+    // are tiny documents (MAX_REQUEST_FRAME protects the engine from abusive
+    // clients), while legitimate responses — a full RangeDetail — can reach several
+    // MiB (MAX_RESPONSE_FRAME). One shared codec would either admit huge requests or
+    // refuse our own large responses (LengthDelimitedCodec::encode enforces the same
+    // ceiling on writes).
+    let (read_half, write_half) = stream.into_split();
+    let mut requests = FramedRead::new(
+        read_half,
         LengthDelimitedCodec::builder()
             .length_field_type::<u32>()
-            .max_frame_length(MAX_FRAME)
+            .max_frame_length(ipc::MAX_REQUEST_FRAME)
             .new_codec(),
     );
-    while let Some(frame) = framed.next().await {
+    let mut responses = FramedWrite::new(
+        write_half,
+        LengthDelimitedCodec::builder()
+            .length_field_type::<u32>()
+            .max_frame_length(ipc::MAX_RESPONSE_FRAME)
+            .new_codec(),
+    );
+    while let Some(frame) = requests.next().await {
         let body = match frame {
             Ok(b) => b,
-            Err(_) => break,
+            Err(e) => {
+                // Codec-level refusal: frame above MAX_REQUEST_FRAME or malformed
+                // length framing. The payload never reached the engine channel. Tell
+                // the client why, then drop the connection.
+                log::warn!("IPC request rejected by frame limit: {e}");
+                let resp = Response::Error {
+                    message: format!("request rejected: {e}"),
+                };
+                if let Err(e) = send_response(&mut responses, &resp).await {
+                    log::warn!("could not report IPC request rejection: {e}");
+                }
+                break;
+            }
         };
         let req: Request = match ipc::decode(&body) {
             Ok(r) => r,
             Err(e) => {
                 let resp = Response::Error { message: e };
-                send_response(&mut framed, &resp).await;
+                if let Err(e) = send_response(&mut responses, &resp).await {
+                    log::warn!("IPC response failed: {e}");
+                    break;
+                }
                 continue;
             }
         };
@@ -1078,21 +1209,65 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::Sender<IpcReq>) {
             Ok(r) => r,
             Err(_) => break,
         };
-        if !send_response(&mut framed, &resp).await {
+        if let Err(e) = send_response(&mut responses, &resp).await {
+            log::warn!("IPC response failed: {e}");
             break;
         }
     }
 }
 
+/// One failure class per way a response can fail to leave the daemon; callers log
+/// the whole chain instead of a swallowed bool.
+#[derive(Debug)]
+enum SendFailure {
+    Encode(String),
+    TooLarge { body_len: usize, max: usize },
+    Write(String),
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode(e) => write!(f, "response serialization failed: {e}"),
+            Self::TooLarge { body_len, max } => write!(
+                f,
+                "response body of {body_len} bytes exceeds the {max}-byte protocol limit"
+            ),
+            Self::Write(e) => write!(f, "socket write failed: {e}"),
+        }
+    }
+}
+
+/// Send one response under the response-side frame ceiling. When the serialized body
+/// exceeds MAX_RESPONSE_FRAME the client gets a size-controlled Response::Error
+/// instead of a silent disconnect (and the caller still sees TooLarge for its logs).
 async fn send_response(
-    framed: &mut Framed<UnixStream, LengthDelimitedCodec>,
+    sink: &mut FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
     resp: &Response,
-) -> bool {
-    let body = match serde_json::to_vec(resp) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    framed.send(body.into()).await.is_ok()
+) -> Result<(), SendFailure> {
+    let body = serde_json::to_vec(resp).map_err(|e| SendFailure::Encode(e.to_string()))?;
+    if body.len() > ipc::MAX_RESPONSE_FRAME {
+        let message = format!(
+            "response body of {} bytes exceeds the {}-byte protocol limit; the range \
+             detail is bounded by collector.map_max_entries — reduce it or query a \
+             smaller range",
+            body.len(),
+            ipc::MAX_RESPONSE_FRAME
+        );
+        let err_resp = Response::Error { message };
+        let err_body =
+            serde_json::to_vec(&err_resp).map_err(|e| SendFailure::Encode(e.to_string()))?;
+        if let Err(e) = sink.send(err_body.into()).await {
+            return Err(SendFailure::Write(e.to_string()));
+        }
+        return Err(SendFailure::TooLarge {
+            body_len: body.len(),
+            max: ipc::MAX_RESPONSE_FRAME,
+        });
+    }
+    sink.send(body.into())
+        .await
+        .map_err(|e| SendFailure::Write(e.to_string()))
 }
 
 /// (Re)build the three engine timers from a config snapshot.
@@ -1183,4 +1358,246 @@ fn spawn_watcher(
         }
     });
     Ok(debouncer)
+}
+
+#[cfg(test)]
+mod push_guard_tests {
+    use crate::daemon::PushGuard;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn guard_releases_on_normal_drop() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = PushGuard(flag.clone());
+        }
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn guard_releases_on_panic_unwind() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let f = flag.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = PushGuard(f);
+            panic!("simulated push-task panic");
+        });
+        assert!(result.is_err());
+        assert!(!flag.load(Ordering::Acquire), "flag stuck after panic");
+    }
+
+    #[test]
+    fn guard_releases_on_simulated_cancellation() {
+        // A cancelled future drops its locals; model that by dropping the guard
+        // mid-flight without ever reaching completion.
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = PushGuard(flag.clone());
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire), "flag stuck after cancel");
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::acquire_instance_lock;
+
+    /// The lock lifecycle without the inode race: a second process/fd fails while the
+    /// first holds the lock, succeeds after it is released, and two holders never
+    /// coexist. Two separate open()s in one process contend exactly like two
+    /// processes (flock is per open file description).
+    #[test]
+    fn instance_lock_serializes_holders() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("vmbw-lock-test-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+
+        // A holds the lock.
+        let a = acquire_instance_lock(path).expect("A acquires");
+        // B must fail while A holds it.
+        assert!(acquire_instance_lock(path).is_err());
+        // A exits.
+        drop(a);
+        // B can now take it.
+        let b = acquire_instance_lock(path).expect("B acquires after A exits");
+        // And a third contender fails again — never two holders at once.
+        assert!(acquire_instance_lock(path).is_err());
+        drop(b);
+        // The file stays behind on purpose; remove it only inside this test.
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::{handle_connection, IpcReq};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::sync::mpsc;
+    use vm_bandwidth_core::ipc::{
+        validate_frame_len, IpDetail, RangeDetail, Request, Response, MAX_REQUEST_FRAME,
+        MAX_RESPONSE_FRAME,
+    };
+
+    /// Client-side framing exactly like the UI: 4-byte BE length + body.
+    async fn write_raw(stream: &mut UnixStream, body: &[u8]) {
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(body).await.unwrap();
+    }
+
+    /// Read one frame, validating the untrusted length BEFORE allocating.
+    async fn read_frame(stream: &mut UnixStream, max: usize) -> Vec<u8> {
+        let mut lenbuf = [0u8; 4];
+        stream.read_exact(&mut lenbuf).await.unwrap();
+        let len = validate_frame_len(u32::from_be_bytes(lenbuf), max).unwrap();
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.unwrap();
+        body
+    }
+
+    /// One half of a socket pair behind handle_connection; the test side owns the
+    /// engine-channel receiver and decides what (if anything) gets answered.
+    fn pair() -> (UnixStream, mpsc::Receiver<IpcReq>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::channel::<IpcReq>(8);
+        tokio::spawn(handle_connection(server, tx));
+        (client, rx)
+    }
+
+    fn big_range_detail(ips: u32) -> Response {
+        Response::RangeDetail(Box::new(RangeDetail {
+            name: "big".to_string(),
+            range: "10.0.0.0/8".to_string(),
+            ips: (0..ips)
+                .map(|i| IpDetail {
+                    ip: i,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    // 1. Small request / small response round-trip.
+    #[tokio::test]
+    async fn small_roundtrip() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+
+        let (req, reply) = rx.recv().await.expect("request reached the engine");
+        assert!(matches!(req, Request::Overview));
+        let status = vm_bandwidth_core::ipc::Status {
+            protocol_version: vm_bandwidth_core::ipc::PROTOCOL_VERSION,
+            ..Default::default()
+        };
+        reply.send(Response::Status(Box::new(status))).unwrap();
+
+        let body = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&body) {
+            Response::Status(s) => {
+                assert_eq!(s.protocol_version, vm_bandwidth_core::ipc::PROTOCOL_VERSION)
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    // 2. A legitimate large response (64 KiB < size < 8 MiB) travels intact: the old
+    //    single-codec design refused to encode it at all.
+    #[tokio::test]
+    async fn large_response_between_request_and_response_limits() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+
+        let (_, reply) = rx.recv().await.unwrap();
+        let resp = big_range_detail(400);
+        let size = serde_json::to_vec(&resp).unwrap().len();
+        assert!(
+            size > MAX_REQUEST_FRAME && size < MAX_RESPONSE_FRAME,
+            "test payload must sit between the two limits, got {size}"
+        );
+        reply.send(resp).unwrap();
+
+        let body = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&body) {
+            Response::RangeDetail(d) => assert_eq!(d.ips.len(), 400),
+            other => panic!("expected range detail, got {other:?}"),
+        }
+    }
+
+    // 3. An oversized request is refused by the request-side limit and NEVER reaches
+    //    the engine channel; the client gets a meaningful error.
+    #[tokio::test]
+    async fn oversized_request_refused_before_engine() {
+        let (mut client, mut rx) = pair();
+        // Any body above MAX_REQUEST_FRAME: the codec refuses before JSON parsing.
+        let body = vec![b'x'; MAX_REQUEST_FRAME + 1];
+        write_raw(&mut client, &body).await;
+
+        let err = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&err) {
+            Response::Error { message } => {
+                assert!(message.contains("request rejected"), "{message}")
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "oversized request must not reach the engine channel"
+        );
+    }
+
+    // 4. A response above MAX_RESPONSE_FRAME does NOT silently disconnect: the client
+    //    receives a size-controlled Response::Error naming the limit.
+    #[tokio::test]
+    async fn oversized_response_becomes_controlled_error() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+
+        let (_, reply) = rx.recv().await.unwrap();
+        let resp = big_range_detail(26_000);
+        assert!(serde_json::to_vec(&resp).unwrap().len() > MAX_RESPONSE_FRAME);
+        reply.send(resp).unwrap();
+
+        let body = read_frame(&mut client, MAX_RESPONSE_FRAME).await;
+        match ipc_decode(&body) {
+            Response::Error { message } => {
+                assert!(message.contains("protocol limit"), "{message}");
+                assert!(message.contains("map_max_entries"), "{message}");
+            }
+            other => panic!("expected controlled error, got {other:?}"),
+        }
+    }
+
+    // 5. Frame-limit boundaries, both directions, pure.
+    #[test]
+    fn frame_limits_boundaries() {
+        for max in [MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME] {
+            assert_eq!(validate_frame_len(max as u32 - 1, max), Ok(max - 1));
+            assert_eq!(validate_frame_len(max as u32, max), Ok(max));
+            assert!(validate_frame_len(max as u32 + 1, max).is_err());
+            assert!(validate_frame_len(u32::MAX, max).is_err());
+        }
+    }
+
+    fn ipc_decode(body: &[u8]) -> Response {
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+        serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+            panic!("undecodable response: {v}");
+        })
+    }
 }

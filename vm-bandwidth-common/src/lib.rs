@@ -1,5 +1,5 @@
 //! Data structures shared between the eBPF programs and userspace.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 /// Key of the TRAFFIC map: one counter set per (interface, IPv4) pair.
 ///
@@ -9,15 +9,6 @@
 pub struct TrafficKey {
     pub ifindex: u32,
     pub ipv4: u32,
-}
-
-/// Key of the TRAFFIC6 map: one counter set per (interface, IPv6) pair.
-/// IPv6 is counted but never policed (there is no IPv6 limit policy).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TrafficKey6 {
-    pub ifindex: u32,
-    pub ipv6: [u8; 16],
 }
 
 /// Monotonic byte/packet counters. Userspace computes rates from deltas.
@@ -34,7 +25,7 @@ pub struct TrafficValue {
 /// `TRAFFIC` records demand (what arrived); this records what the policer actually
 /// let through versus dropped. Only flows with an active policy get entries.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PolicerStats {
     pub passed_bytes: u64,
     pub passed_packets: u64,
@@ -71,7 +62,7 @@ pub const ALGO_GCRA: u32 = 5;
 /// Deliberately *not* keyed by ifindex: the same IP+direction must share a single
 /// rate budget across all CPUs and whichever TAP the packet currently traverses.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LimitKey {
     pub ipv4: u32,
     pub direction: u8,
@@ -102,7 +93,7 @@ impl LimitKey {
 ///   Unused by the window algorithms.
 /// * `window_ns` — window length for the window algorithms; 0 otherwise.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LimitPolicy {
     pub enabled: u8,
     pub _pad0: [u8; 3],
@@ -133,7 +124,7 @@ pub struct LimitPolicy {
 /// object so BTF describes it to the verifier); the userspace view only ever writes it
 /// (install/reset) or deletes it, so the lock field is simply carried as zeroed bytes.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LimitState {
     pub a: u64,
     pub b: u64,
@@ -144,9 +135,6 @@ pub struct LimitState {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficKey {}
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for TrafficKey6 {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficValue {}
@@ -171,7 +159,7 @@ pub const SWL_LOG_CAP: usize = 1024;
 
 /// One logged packet: arrival time and wire length.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SwlEntry {
     pub ts_ns: u64,
     pub len: u32,
@@ -182,7 +170,7 @@ pub struct SwlEntry {
 /// value also carries a `struct bpf_spin_lock` (declared in the eBPF object); userspace
 /// only inserts a zeroed ring or deletes it.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwlRing {
     pub head: u32,
     pub _pad: u32,
@@ -209,3 +197,163 @@ impl Default for SwlRing {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SwlRing {}
+
+/// Cumulative counters of packets too large to police (above `MAX_POLICED_LEN`),
+/// per direction, while a limit policy WAS armed for the flow. Pure observability:
+/// such packets fail open, and the numbers tell operators whether that path is
+/// actually reachable on their kernel/offload configuration.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OversizedStats {
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for OversizedStats {}
+
+// ---------------------------------------------------------------------------
+// L2 parsing, shared between the eBPF data path and userspace tests.
+// ---------------------------------------------------------------------------
+
+/// 802.1Q VLAN tag (host-order value; convert from network order before comparing).
+pub const ETHERTYPE_VLAN: u16 = 0x8100;
+/// 802.1ad provider bridging (QinQ outer tag).
+pub const ETHERTYPE_QINQ: u16 = 0x88a8;
+pub const ETHERTYPE_IPV4: u16 = 0x0800;
+pub const ETHERTYPE_IPV6: u16 = 0x86dd;
+
+/// One 802.1Q/802.1ad tag: 2 bytes TCI followed by the inner EtherType, both in
+/// network byte order on the wire.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VlanHdr {
+    pub tci: u16,
+    pub ether_type: u16,
+}
+
+/// Bytes one VLAN tag adds between EtherTypes.
+pub const VLAN_HDR_LEN: usize = 4;
+
+/// Maximum VLAN tags the data path walks (single tag + QinQ). Compile-time bound:
+/// the eBPF walk performs at most this many header loads, never a loop over data.
+pub const MAX_VLAN_TAGS: usize = 2;
+
+/// True for the two tag EtherTypes (host-order argument).
+pub fn is_vlan_tag(ether_type: u16) -> bool {
+    ether_type == ETHERTYPE_VLAN || ether_type == ETHERTYPE_QINQ
+}
+
+/// Pure VLAN-stack walk over the EtherType sequence encountered (host order).
+/// `et0` is the frame's EtherType; `et1`/`et2` are the inner EtherTypes and are only
+/// consulted when the previous one was a tag (pass 0 when they were never read).
+///
+/// Returns `Some((tags, final_ether_type))` — the L3 header starts
+/// `tags * VLAN_HDR_LEN` octets after the Ethernet header — or `None` when the stack
+/// is deeper than [`MAX_VLAN_TAGS`], in which case callers give up (fail open).
+pub fn vlan_walk(et0: u16, et1: u16, et2: u16) -> Option<(usize, u16)> {
+    let mut tags = 0;
+    let mut et = et0;
+    if is_vlan_tag(et) {
+        tags = 1;
+        et = et1;
+        if is_vlan_tag(et) {
+            tags = 2;
+            et = et2;
+            if is_vlan_tag(et) {
+                return None;
+            }
+        }
+    }
+    Some((tags, et))
+}
+
+#[cfg(test)]
+mod l2_tests {
+    use super::*;
+
+    // Wire shape sanity: the eBPF ctx.load offsets rely on this.
+    #[test]
+    fn vlan_header_is_four_bytes_aligned_two() {
+        assert_eq!(core::mem::size_of::<VlanHdr>(), 4);
+        assert_eq!(core::mem::align_of::<VlanHdr>(), 2);
+    }
+
+    fn walk(ets: &[u16]) -> Option<(usize, u16)> {
+        // Mirror how the data path feeds the walk: one EtherType per tag level.
+        vlan_walk(
+            ets.first().copied().unwrap_or(0),
+            ets.get(1).copied().unwrap_or(0),
+            ets.get(2).copied().unwrap_or(0),
+        )
+    }
+
+    // Frame vectors: (untagged / tagged, inner payload) -> expected walk outcome.
+    #[test]
+    fn untagged_frames_pass_straight_through() {
+        assert_eq!(walk(&[ETHERTYPE_IPV4]), Some((0, ETHERTYPE_IPV4)));
+        assert_eq!(walk(&[ETHERTYPE_IPV6]), Some((0, ETHERTYPE_IPV6)));
+        // ARP and anything else: no tags, final type handed to the caller's match.
+        assert_eq!(walk(&[0x0806]), Some((0, 0x0806)));
+    }
+
+    #[test]
+    fn single_8021q_tag() {
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_IPV4]),
+            Some((1, ETHERTYPE_IPV4))
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_IPV6]),
+            Some((1, ETHERTYPE_IPV6))
+        );
+        // VLAN + ARP: walked, but the inner type is not IP.
+        assert_eq!(walk(&[ETHERTYPE_VLAN, 0x0806]), Some((1, 0x0806)));
+    }
+
+    #[test]
+    fn single_8021ad_tag() {
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_IPV4]),
+            Some((1, ETHERTYPE_IPV4))
+        );
+    }
+
+    #[test]
+    fn qinq_double_tag() {
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_VLAN, ETHERTYPE_IPV4]),
+            Some((2, ETHERTYPE_IPV4))
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_VLAN, ETHERTYPE_IPV6]),
+            Some((2, ETHERTYPE_IPV6))
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_VLAN, 0x0806]),
+            Some((2, 0x0806))
+        );
+    }
+
+    #[test]
+    fn deeper_stacks_are_given_up() {
+        // Three tags: beyond MAX_VLAN_TAGS -> None (fail open).
+        assert_eq!(
+            walk(&[ETHERTYPE_QINQ, ETHERTYPE_VLAN, ETHERTYPE_VLAN,]),
+            None
+        );
+        assert_eq!(
+            walk(&[ETHERTYPE_VLAN, ETHERTYPE_VLAN, ETHERTYPE_VLAN]),
+            None
+        );
+    }
+
+    #[test]
+    fn truncated_walk_inputs_are_safe() {
+        // The data path passes 0 for EtherTypes it never managed to read; a tag whose
+        // inner field is unreadable never matches IP, it degrades to give-up-or-no-IP.
+        assert_eq!(walk(&[ETHERTYPE_VLAN]), Some((1, 0)));
+        assert_eq!(walk(&[ETHERTYPE_VLAN, ETHERTYPE_VLAN]), Some((2, 0)));
+        assert_eq!(walk(&[]), Some((0, 0)));
+    }
+}
