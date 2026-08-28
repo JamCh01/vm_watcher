@@ -340,11 +340,11 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use vm_bandwidth_common::{ALGO_GCRA, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, DIR_RX};
 
-    fn key(ip: u8) -> LimitKey {
+    pub(crate) fn key(ip: u8) -> LimitKey {
         LimitKey::new(u32::from(ip), DIR_RX)
     }
 
-    fn policy(algorithm: u32) -> LimitPolicy {
+    pub(crate) fn policy(algorithm: u32) -> LimitPolicy {
         LimitPolicy {
             enabled: 1,
             _pad0: [0; 3],
@@ -357,19 +357,19 @@ mod tests {
 
     /// Scripted maps with per-(op, key) failure injection and a full call log.
     #[derive(Default)]
-    struct FakeMaps {
-        policies: HashMap<LimitKey, LimitPolicy>,
+    pub(crate) struct FakeMaps {
+        pub(crate) policies: HashMap<LimitKey, LimitPolicy>,
         /// Value = the algorithm the artifact was fresh-written for.
-        state: HashMap<LimitKey, u32>,
-        rings: HashMap<LimitKey, u32>,
-        policer: HashMap<LimitKey, ()>,
+        pub(crate) state: HashMap<LimitKey, u32>,
+        pub(crate) rings: HashMap<LimitKey, u32>,
+        pub(crate) policer: HashMap<LimitKey, ()>,
         /// Pending injections: consumed when the matching op+key is attempted.
         inject: VecDeque<(String, LimitKey)>,
-        log: Vec<String>,
+        pub(crate) log: Vec<String>,
     }
 
     impl FakeMaps {
-        fn fail_next(&mut self, op: &str, k: LimitKey) {
+        pub(crate) fn fail_next(&mut self, op: &str, k: LimitKey) {
             self.inject.push_back((op.to_string(), k));
         }
 
@@ -394,7 +394,7 @@ mod tests {
             Ok(())
         }
 
-        fn artifact(&self, k: &LimitKey, algorithm: u32) -> bool {
+        pub(crate) fn artifact(&self, k: &LimitKey, algorithm: u32) -> bool {
             if algorithm == ALGO_SLIDING_WINDOW_LOG {
                 self.rings.contains_key(k)
             } else {
@@ -404,7 +404,7 @@ mod tests {
 
         /// The HARD invariant: every armed policy has its algorithm's artifact.
         /// Must hold even after a degraded rollback.
-        fn assert_invariants(&self) {
+        pub(crate) fn assert_invariants(&self) {
             for (k, p) in &self.policies {
                 assert!(
                     self.artifact(k, p.algorithm),
@@ -416,7 +416,7 @@ mod tests {
         /// The SOFT invariant: no unreachable artifact. Holds after clean
         /// transactions; a rollback that itself failed may leave one bounded
         /// orphan per failed flow (reported via RollbackReport).
-        fn assert_no_orphans(&self) {
+        pub(crate) fn assert_no_orphans(&self) {
             for k in self.state.keys().chain(self.rings.keys()) {
                 assert!(
                     self.policies.contains_key(k),
@@ -471,8 +471,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeWhitelist {
-        present: Vec<Cidr>,
+    pub(crate) struct FakeWhitelist {
+        pub(crate) present: Vec<Cidr>,
         inject: VecDeque<String>,
         log: Vec<String>,
     }
@@ -504,7 +504,7 @@ mod tests {
         }
     }
 
-    fn cidr(network: u32) -> Cidr {
+    pub(crate) fn cidr(network: u32) -> Cidr {
         Cidr {
             prefix_len: 24,
             network,
@@ -1180,4 +1180,11 @@ mod tests {
         assert_eq!(report.failures[0].key, k);
         assert_eq!(report.failures[0].op, "re-arm old policy");
     }
+}
+
+/// Test-only re-exports so engine-level tests can drive the same scripted
+/// fault-injection fakes against the production transaction code.
+#[cfg(test)]
+pub(crate) mod testmaps {
+    pub(crate) use super::tests::{policy, FakeMaps, FakeWhitelist};
 }
