@@ -114,10 +114,13 @@ struct Engine {
     config_watcher_last_error: String,
 
     /// Dataplane health: set when a rollback could not fully restore the maps.
-    /// Affected flows are unarmed (fail-open) until they re-trigger; the flag stays
-    /// on so operators can see the degradation instead of it being swallowed.
-    dataplane_degraded: bool,
-    rollback_failures_total: u64,
+    /// The dataplane may then differ from the active configuration; each affected
+    /// flow's exact state is carried by the per-step `RollbackFailure` logs. The
+    /// flag stays on so operators can see the degradation instead of it being
+    /// swallowed.
+    /// Dataplane rollback health (degraded flag + cumulative failure counter);
+    /// surfaced verbatim into IPC `Status`.
+    rollback_health: RollbackHealth,
 
     bridge: String,
     manager: AttachManager,
@@ -153,8 +156,24 @@ struct Engine {
     policer_stats: PerCpuHashMap<MapData, LimitKey, PolicerStats>,
     /// Shared HTTP client for the VictoriaMetrics push.
     http: reqwest::Client,
-    /// At most one metrics push in flight (see push_metrics).
-    push_inflight: Arc<std::sync::atomic::AtomicBool>,
+    /// Single-flight flag plus process-lifetime push outcome counters
+    /// (see push_metrics / PushCounters).
+    push_counters: Arc<PushCounters>,
+    /// TAP attach failures since daemon start. Counts only attach ATTEMPTS that
+    /// failed; TAPs skipped because their backoff window has not expired are
+    /// neither attempts nor failures (they are retried by a later scan).
+    /// Engine-owned, updated only by the engine task.
+    tap_attach_failures_total: u64,
+    /// TAP RECREATIONS observed since daemon start (same name, new ifindex).
+    /// Each recreation kills any external per-ifindex enforcement (anti-spoofing
+    /// rules) until the platform re-applies it, so every event is warned with a
+    /// SECURITY log and counted here for IPC/metrics observability. This program
+    /// does not (and by design cannot) re-apply external enforcement itself.
+    /// Engine-owned, updated only by the engine task.
+    antispoof_reapply_alerts_total: u64,
+    /// Counter-map keys whose removal failed transiently; retried on every TAP
+    /// rescan (bounded maintenance cycle) until removed or confirmed absent.
+    pending_removes: PendingRemovals,
 
     epoch: std::time::Instant,
 }
@@ -178,27 +197,64 @@ impl Engine {
             .poll(&self.traffic, &self.traffic6, &self.policer_stats, &ranges);
         // Idle eviction: drop counter-map entries frozen long enough; the data path
         // recreates them on the next packet (reset-safe deltas, see collector).
-        for key in &stale_traffic {
-            let _ = self.traffic.remove(key);
-        }
-        for key in &stale_traffic6 {
-            let _ = self.traffic6.remove(key);
-        }
-        if !(stale_traffic.is_empty() && stale_traffic6.is_empty()) {
-            log::debug!(
-                "evicted {} idle TRAFFIC / {} idle TRAFFIC6 key(s)",
-                stale_traffic.len(),
-                stale_traffic6.len()
-            );
+        let idle4 = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &stale_traffic,
+            traffic_key_display,
+            |k| self.traffic.remove(k),
+        );
+        let idle6 = remove_counter_keys(
+            "TRAFFIC6",
+            "idle eviction",
+            &stale_traffic6,
+            traffic6_key_display,
+            |k| self.traffic6.remove(k),
+        );
+        if idle4.attempted + idle6.attempted > 0 {
+            if idle4.failed + idle6.failed == 0 {
+                log::debug!(
+                    "evicted {} idle TRAFFIC / {} idle TRAFFIC6 key(s)",
+                    idle4.removed,
+                    idle6.removed
+                );
+            } else {
+                log::warn!(
+                    "idle eviction incomplete: TRAFFIC {}/{} + TRAFFIC6 {}/{} removed — see per-key failures",
+                    idle4.removed,
+                    idle4.attempted,
+                    idle6.removed,
+                    idle6.attempted
+                );
+            }
         }
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         if !actions.is_empty() {
             let mut journal = crate::txmaps::TxJournal::default();
-            if let Err(e) = self.execute_limit_actions(&actions, &mut journal) {
+            let applied = {
+                let mut maps = EngineMaps {
+                    policies: &mut self.limit_policies,
+                    state: &mut self.limit_state,
+                    swl: &mut self.swl_log,
+                    policer: &mut self.policer_stats,
+                };
+                run_limit_actions(&mut maps, &actions, &mut journal)
+            };
+            if let Err(e) = applied {
                 // A half-applied batch is worse than none: roll the dataplane back and
                 // let the flows re-evaluate from NORMAL on their next threshold cross.
-                self.rollback_map_apply(&journal);
+                let report = {
+                    let mut maps = EngineMaps {
+                        policies: &mut self.limit_policies,
+                        state: &mut self.limit_state,
+                        swl: &mut self.swl_log,
+                        policer: &mut self.policer_stats,
+                    };
+                    let mut wl = EngineWhitelist(&mut self.monitored);
+                    crate::txmaps::rollback_journal(&mut maps, &mut wl, &journal)
+                };
+                self.surface_rollback_report(&report);
                 for action in &actions {
                     let (ipv4, direction) = match action {
                         LimitAction::Install {
@@ -248,28 +304,26 @@ impl Engine {
             &self.oversized,
             now_ms,
         ));
+        lines.push_str(&crate::metrics::render_prom_lines_process(
+            self.tap_attach_failures_total,
+            self.antispoof_reapply_alerts_total,
+            self.push_counters.successes(),
+            self.push_counters.failures(),
+            self.push_counters.skipped(),
+            now_ms,
+        ));
         if lines.is_empty() {
             return;
         }
-        if self
-            .push_inflight
-            .swap(true, std::sync::atomic::Ordering::Acquire)
-        {
-            log::debug!("metrics push skipped: previous push still in flight");
-            return;
-        }
-        let flag = self.push_inflight.clone();
-        let http = self.http.clone();
-        let url = cfg.metrics_url.clone();
-        tokio::spawn(async move {
-            // The flag lives in an RAII guard: normal completion, HTTP errors,
-            // cancellation and panic unwinding all drop it and release the flag.
-            let _guard = PushGuard(flag);
-            match crate::metrics::push(&http, &url, &lines).await {
-                Ok(()) => log::debug!("metrics push: {} line(s)", lines.lines().count()),
-                Err(e) => log::warn!("metrics push to {url} failed: {e:#}"),
-            }
-        });
+        // The single-flight guard, the push and the outcome counters all live in
+        // `run_metrics_push` so push-path tests exercise the SAME production
+        // orchestration instead of mirroring it.
+        tokio::spawn(run_metrics_push(
+            self.push_counters.clone(),
+            self.http.clone(),
+            cfg.metrics_url.clone(),
+            lines,
+        ));
     }
 
     fn range_name(&self, ip: u32) -> String {
@@ -285,7 +339,18 @@ impl Engine {
     fn rescan_taps(&mut self) {
         match interface::discover_taps(&self.bridge) {
             Ok(found) => {
-                let (added, failed) = self.manager.reconcile(&found);
+                let (added, failed, recreated) = self.manager.reconcile(&found);
+                self.tap_attach_failures_total += failed as u64;
+                if !recreated.is_empty() {
+                    self.antispoof_reapply_alerts_total += recreated.len() as u64;
+                    log::warn!(
+                        "SECURITY: TAP(s) {} recreated with a NEW ifindex — external \
+                         anti-spoofing rules bound to the OLD ifindex are INACTIVE on \
+                         them until the platform re-applies them \
+                         (see docs/antispoof-boundary.md)",
+                        recreated.join(", ")
+                    );
+                }
                 if added > 0 || failed > 0 {
                     log::info!("scan: {added} attached, {failed} failed");
                 }
@@ -294,22 +359,70 @@ impl Engine {
                     new_taps.iter().map(|t| t.ifindex).collect();
                 let old_ifindexes: std::collections::HashSet<u32> =
                     self.taps.iter().map(|t| t.ifindex).collect();
+
+                // Retry transient removal failures from earlier cycles on EVERY
+                // rescan (the bounded maintenance cycle), independent of whether
+                // the TAP set changed — a failed prune from a previous scan must
+                // not wait for the next set change or the idle threshold.
+                let retry = self
+                    .pending_removes
+                    .retry_traffic(&new_ifindexes, |k| self.traffic.remove(k));
+                if retry.cancelled_reused + retry.removed + retry.still_pending > 0 {
+                    if retry.still_pending == 0 {
+                        log::debug!(
+                            "pending TRAFFIC removals: {} removed, {} cancelled (ifindex live again)",
+                            retry.removed,
+                            retry.cancelled_reused
+                        );
+                    } else {
+                        log::warn!(
+                            "pending TRAFFIC removals: {} removed, {} cancelled, {} still failing (retried next scan)",
+                            retry.removed,
+                            retry.cancelled_reused,
+                            retry.still_pending
+                        );
+                    }
+                }
+
                 if new_ifindexes != old_ifindexes {
                     // Drop counters of vanished TAPs so the TRAFFIC map does not fill up
-                    // with dead (ifindex, IP) keys as VMs churn (§33).
+                    // with dead (ifindex, IP) keys as VMs churn (§33). Keys already
+                    // pending were retried above; skip them this pass.
                     let mut stale = Vec::new();
                     for (key, _) in self.traffic.iter().flatten() {
-                        if !new_ifindexes.contains(&key.ifindex) {
+                        if !new_ifindexes.contains(&key.ifindex)
+                            && !self.pending_removes.traffic.contains(&key)
+                        {
                             stale.push(key);
                         }
                     }
-                    for key in &stale {
-                        let _ = self.traffic.remove(key);
-                    }
-                    if !stale.is_empty() {
-                        log::debug!("pruned {} stale TRAFFIC key(s)", stale.len());
-                    }
+                    let pruned = remove_counter_keys(
+                        "TRAFFIC",
+                        "stale-TAP prune",
+                        &stale,
+                        traffic_key_display,
+                        |k| self.traffic.remove(k),
+                    );
+                    // Keys whose removal failed stay pending and are retried next
+                    // scan; userspace tracking follows ifindex liveness regardless
+                    // (a re-baseline is safe: deltas are saturating and an absent
+                    // prev starts the next poll at zero delta).
                     self.collector.prune_ifindexes(&new_ifindexes);
+                    if !pruned.failed_keys.is_empty() {
+                        self.pending_removes.traffic.extend(pruned.failed_keys);
+                    }
+                    if pruned.attempted > 0 {
+                        if pruned.failed == 0 {
+                            log::debug!("pruned {} stale TRAFFIC key(s)", pruned.removed);
+                        } else {
+                            log::warn!(
+                                "stale-TAP prune incomplete: removed {}/{} TRAFFIC key(s), {} pending for retry",
+                                pruned.removed,
+                                pruned.attempted,
+                                pruned.failed
+                            );
+                        }
+                    }
                 }
                 self.taps = new_taps;
             }
@@ -317,119 +430,13 @@ impl Engine {
         }
     }
 
-    /// Execute limit actions against the eBPF maps transactionally via the
-    /// [`txmaps`] layer: removes first (they free capacity), installs after. For each
-    /// flow the order is disarm -> clear foreign artifacts -> fresh state -> arm LAST;
-    /// the journal exists before the first destructive write of every action.
-    fn execute_limit_actions(
-        &mut self,
-        actions: &[LimitAction],
-        journal: &mut crate::txmaps::TxJournal,
-    ) -> Result<()> {
-        let mut maps = EngineMaps {
-            policies: &mut self.limit_policies,
-            state: &mut self.limit_state,
-            swl: &mut self.swl_log,
-            policer: &mut self.policer_stats,
-        };
-
-        // Pass 1: removals.
-        for action in actions {
-            let LimitAction::Remove { ipv4, direction } = action else {
-                continue;
-            };
-            let key = LimitKey::new(*ipv4, *direction);
-            let addr = std::net::Ipv4Addr::from(*ipv4);
-            crate::txmaps::remove_limit(&mut maps, journal, key)
-                .with_context(|| format!("removing limit policy for {addr} dir={direction}"))?;
-            log::info!("back to NORMAL {addr} dir={direction}");
-        }
-
-        // Pass 2: installs.
-        for action in actions {
-            let LimitAction::Install {
-                ipv4,
-                direction,
-                rate_bps,
-                burst_bytes,
-                algorithm,
-                window_ns,
-            } = action
-            else {
-                continue;
-            };
-            let key = LimitKey::new(*ipv4, *direction);
-            let addr = std::net::Ipv4Addr::from(*ipv4);
-            let policy = LimitPolicy {
-                enabled: 1,
-                _pad0: [0; 3],
-                algorithm: *algorithm,
-                rate_bps: *rate_bps,
-                burst_bytes: *burst_bytes,
-                window_ns: *window_ns,
-            };
-            crate::txmaps::install_limit(&mut maps, journal, key, policy)
-                .with_context(|| format!("installing limit policy for {addr} dir={direction}"))?;
-            log::info!(
-                "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
-                addr,
-                direction,
-                Self::algorithm_name(*algorithm),
-                rate_bps,
-                burst_bytes,
-                window_ns
-            );
-        }
-        Ok(())
-    }
-
-    /// Play the journal back in reverse and surface the outcome. Never silent: a
-    /// failed step logs at error severity and flags the dataplane degraded (affected
-    /// flows are unarmed / fail-open until they re-trigger).
-    fn rollback_map_apply(
-        &mut self,
-        journal: &crate::txmaps::TxJournal,
-    ) -> crate::txmaps::RollbackReport {
-        let mut maps = EngineMaps {
-            policies: &mut self.limit_policies,
-            state: &mut self.limit_state,
-            swl: &mut self.swl_log,
-            policer: &mut self.policer_stats,
-        };
-        let mut wl = EngineWhitelist(&mut self.monitored);
-        let report = crate::txmaps::rollback_journal(&mut maps, &mut wl, journal);
-        for f in &report.failures {
-            log::error!(
-                "rollback failed at '{}' for {}: {}",
-                f.op,
-                std::net::Ipv4Addr::from(f.key.ipv4),
-                f.error
-            );
-        }
-        if !report.dataplane_consistent {
-            self.dataplane_degraded = true;
-            self.rollback_failures_total += report.failures.len() as u64;
-            log::error!(
-                "dataplane DEGRADED after rollback: {} of {} step(s) failed;                  affected flows are unarmed (fail-open) until they re-trigger",
-                report.failures.len(),
-                report.attempted
-            );
-        }
-        report
-    }
-
-    /// Human-readable algorithm name for log lines.
-    fn algorithm_name(algorithm: u32) -> &'static str {
-        use vm_bandwidth_common::*;
-        match algorithm {
-            ALGO_TOKEN_BUCKET => "token_bucket",
-            ALGO_LEAKY_BUCKET => "leaky_bucket",
-            ALGO_FIXED_WINDOW => "fixed_window",
-            ALGO_SLIDING_WINDOW_COUNTER => "sliding_window_counter",
-            ALGO_SLIDING_WINDOW_LOG => "sliding_window_log",
-            ALGO_GCRA => "gcra",
-            _ => "unknown",
-        }
+    /// Surface a rollback report: per-step failures at error severity, degraded
+    /// flag plus counter when the dataplane could not be fully restored. Never
+    /// silent. The exact post-rollback state varies per journal record (old policy
+    /// re-armed, new limit kept armed, or unarmed with a bounded orphan); only the
+    /// hard invariant `armed policy => matching state exists` is guaranteed.
+    fn surface_rollback_report(&mut self, report: &crate::txmaps::RollbackReport) {
+        self.rollback_health.record(report);
     }
 
     fn record_watcher_error(&mut self, e: String) {
@@ -489,7 +496,7 @@ impl Engine {
             return;
         }
 
-        self.generation += 1;
+        // apply_and_commit already incremented the generation on commit.
         let _ = self.config_watch.send_replace(self.generation);
         self.last_reload_ok = true;
         self.last_reload_error.clear();
@@ -562,43 +569,33 @@ impl Engine {
             .plan_reload(&new_cfg, now)
             .map_err(anyhow::Error::msg)?;
 
-        let mut journal = crate::txmaps::TxJournal::default();
-        if let Err(e) = self.apply_maps(&plan.actions, &old_prefixes, &new_prefixes, &mut journal) {
-            self.rollback_map_apply(&journal);
-            return Err(e);
-        }
-
-        // Commit phase: limiter internals, then collector, then the visible switch.
-        self.limiter.commit_reload(plan);
-        self.collector.prune_ips(&new_cfg.ip_ranges());
-        self.config.store(Arc::new(new_cfg));
-        Ok(())
-    }
-
-    /// §27 ordering with journal bookkeeping: whitelist additions first, limit-map
-    /// actions second, whitelist removals last. Each successful operation is
-    /// journaled immediately, so any mid-way failure rolls back exactly what ran.
-    fn apply_maps(
-        &mut self,
-        actions: &[LimitAction],
-        old_prefixes: &HashSet<Cidr>,
-        new_prefixes: &HashSet<Cidr>,
-        journal: &mut crate::txmaps::TxJournal,
-    ) -> Result<()> {
-        let additions: Vec<Cidr> = new_prefixes.difference(old_prefixes).copied().collect();
-        {
+        let result = {
+            let mut maps = EngineMaps {
+                policies: &mut self.limit_policies,
+                state: &mut self.limit_state,
+                swl: &mut self.swl_log,
+                policer: &mut self.policer_stats,
+            };
             let mut wl = EngineWhitelist(&mut self.monitored);
-            crate::txmaps::apply_whitelist_additions(&mut wl, journal, &additions)
-                .context("whitelisting new prefixes")?;
+            apply_and_commit(
+                &mut maps,
+                &mut wl,
+                &mut self.limiter,
+                &mut self.collector,
+                &self.config,
+                &mut self.generation,
+                &old_prefixes,
+                plan,
+                new_cfg,
+            )
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(rb) => {
+                self.surface_rollback_report(&rb.report);
+                Err(rb.message)
+            }
         }
-        self.execute_limit_actions(actions, journal)?;
-        let removals: Vec<Cidr> = old_prefixes.difference(new_prefixes).copied().collect();
-        {
-            let mut wl = EngineWhitelist(&mut self.monitored);
-            crate::txmaps::apply_whitelist_removals(&mut wl, journal, &removals)
-                .context("dropping removed whitelist prefixes")?;
-        }
-        Ok(())
     }
 
     // ----- IPC response builders -----
@@ -658,8 +655,13 @@ impl Engine {
             config_watcher_healthy: self.config_watcher_healthy,
             config_watcher_errors_total: self.config_watcher_errors_total,
             config_watcher_last_error: self.config_watcher_last_error.clone(),
-            dataplane_degraded: self.dataplane_degraded,
-            rollback_failures_total: self.rollback_failures_total,
+            dataplane_degraded: self.rollback_health.degraded,
+            rollback_failures_total: self.rollback_health.failures_total,
+            tap_attach_failures_total: self.tap_attach_failures_total,
+            antispoof_reapply_alerts_total: self.antispoof_reapply_alerts_total,
+            metrics_push_successes_total: self.push_counters.successes(),
+            metrics_push_failures_total: self.push_counters.failures(),
+            metrics_push_skipped_total: self.push_counters.skipped(),
             anti_spoof_mode: self.config.load().ip_ownership.clone(),
             anti_spoof_enforced_by_program: false,
             anti_spoof_acknowledged: true,
@@ -835,6 +837,353 @@ fn state_label(limited: bool) -> String {
 
 /// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
 /// Ranges are validated disjoint, so their prefix sets never overlap.
+/// Process-health view of dataplane rollbacks: the degraded flag and the
+/// cumulative rollback-failure counter that IPC `Status` exposes.
+#[derive(Default)]
+struct RollbackHealth {
+    degraded: bool,
+    failures_total: u64,
+}
+
+impl RollbackHealth {
+    /// Surface one rollback report — the single production wiring point that
+    /// `Engine::surface_rollback_report` delegates to. Per-step failures log
+    /// at error severity; a report that could not fully restore the dataplane
+    /// flags the degradation and adds the EXACT failure count (not one per
+    /// report). Callers pass each report exactly once; reading the fields
+    /// never mutates them.
+    fn record(&mut self, report: &crate::txmaps::RollbackReport) {
+        for f in &report.failures {
+            log::error!(
+                "rollback failed at '{}' for {}: {}",
+                f.op,
+                std::net::Ipv4Addr::from(f.key.ipv4),
+                f.error
+            );
+        }
+        if !report.dataplane_consistent {
+            self.degraded = true;
+            self.failures_total += report.failures.len() as u64;
+            log::error!(
+                "{}",
+                degraded_summary(report.failures.len(), report.attempted)
+            );
+        }
+    }
+}
+
+/// Summary line for the error log emitted when a rollback leaves the dataplane
+/// inconsistent. Deliberately neutral about the outcome: after a failed rollback
+/// a flow may be re-armed with its old policy, left armed on a new limit, or
+/// unarmed with a bounded orphan artifact — per-record state differs, and only
+/// the hard invariant `armed policy => matching state exists` holds. Any wording
+/// that claims one outcome ("all flows unarmed", "all flows limited") for every
+/// affected flow is wrong by construction; point at the per-step failures instead.
+fn degraded_summary(failures: usize, attempted: usize) -> String {
+    format!(
+        "dataplane DEGRADED after rollback: {failures} of {attempted} step(s) failed; \
+         dataplane state may differ from the active configuration — \
+         inspect the per-step rollback failures above"
+    )
+}
+
+/// Outcome of a bulk counter-map removal. `failed_keys` carries the exact keys
+/// that need a retry so callers can keep them pending (never lost in a count).
+#[derive(Debug, PartialEq)]
+struct RemovalStats<K> {
+    attempted: usize,
+    removed: usize,
+    failed: usize,
+    failed_keys: Vec<K>,
+}
+
+/// Transiently-failed TRAFFIC removals, retried on every bounded maintenance
+/// cycle (TAP rescan) until removed or confirmed absent.
+///
+/// Bounded by construction: every pending key was present in the TRAFFIC map
+/// when its removal failed, and entries leave the set the moment a retry
+/// removes the key, confirms it absent, or finds its ifindex live again — so
+/// the set can never exceed the TRAFFIC map's own cardinality
+/// (`map_max_entries`). No tasks, no timers: the rescan loop is the only
+/// driver, so there is no busy-loop path.
+#[derive(Default)]
+struct PendingRemovals {
+    traffic: HashSet<TrafficKey>,
+}
+
+/// Outcome of one pending-removal retry pass.
+struct PendingRetryStats {
+    /// Keys whose ifindex is a live TAP again: cancelled WITHOUT any deletion
+    /// attempt (the counters may now belong to the new TAP — see ifindex reuse).
+    cancelled_reused: usize,
+    removed: usize,
+    still_pending: usize,
+}
+
+impl PendingRemovals {
+    /// Retry every pending TRAFFIC removal once. Keys whose ifindex is live
+    /// again are cancelled, not deleted: a reused ifindex means the counters
+    /// may now be LIVE counters of the new TAP, and the collector rebaselines
+    /// them on its next poll (absent prev => zero delta for that poll).
+    fn retry_traffic<F>(
+        &mut self,
+        live_ifindexes: &HashSet<u32>,
+        mut remove: F,
+    ) -> PendingRetryStats
+    where
+        F: FnMut(&TrafficKey) -> Result<(), MapError>,
+    {
+        let mut stats = PendingRetryStats {
+            cancelled_reused: 0,
+            removed: 0,
+            still_pending: 0,
+        };
+        // Drain first: every key is either resolved or re-inserted below, so
+        // the set never accumulates duplicates across passes.
+        let keys: Vec<TrafficKey> = self.traffic.drain().collect();
+        for key in keys {
+            if live_ifindexes.contains(&key.ifindex) {
+                stats.cancelled_reused += 1;
+                log::debug!(
+                    "pending TRAFFIC removal cancelled: {}",
+                    traffic_key_display(&key)
+                );
+                continue;
+            }
+            match remove(&key) {
+                Ok(()) => stats.removed += 1,
+                Err(e) if key_already_absent(&e) => stats.removed += 1,
+                Err(e) => {
+                    // First occurrence logged warn at prune time; retries stay
+                    // per-key debug plus one aggregate warn per pass (no storm).
+                    log::debug!(
+                        "TRAFFIC remove retry failed for {}: {e}",
+                        traffic_key_display(&key)
+                    );
+                    stats.still_pending += 1;
+                    self.traffic.insert(key);
+                }
+            }
+        }
+        stats
+    }
+}
+
+/// Remove keys from a counter map without stopping at individual failures.
+/// One key failing never blocks the rest; the summary counts only keys whose
+/// removal actually succeeded, never the input length.
+///
+/// Keys already absent count as removed — the goal (key not in map) is met.
+/// aya 0.14 maps the kernel's ENOENT from `bpf_map_delete_elem` to
+/// `MapError::SyscallError` with `io_error.kind() == NotFound` (see
+/// `aya::maps::hash_map::remove`); the typed variants below are matched,
+/// never the error string. Should a future aya return another variant for
+/// absent keys, this degrades to a logged failure retried next cycle — never
+/// to silent success. Real-kernel confirmation: docs/kernel-validation.md §6.
+fn remove_counter_keys<K, D, F>(
+    map_name: &str,
+    op: &'static str,
+    keys: &[K],
+    display: D,
+    mut remove: F,
+) -> RemovalStats<K>
+where
+    K: Copy,
+    D: Fn(&K) -> String,
+    F: FnMut(&K) -> Result<(), MapError>,
+{
+    let mut stats = RemovalStats {
+        attempted: keys.len(),
+        removed: 0,
+        failed: 0,
+        failed_keys: Vec::new(),
+    };
+    for key in keys {
+        match remove(key) {
+            Ok(()) => stats.removed += 1,
+            Err(e) if key_already_absent(&e) => stats.removed += 1,
+            Err(e) => {
+                stats.failed += 1;
+                stats.failed_keys.push(*key);
+                log::warn!(
+                    "{map_name} remove failed during {op} for {}: {e}",
+                    display(key)
+                );
+            }
+        }
+    }
+    stats
+}
+
+/// Unambiguous counter-key rendering for logs: family + address + ifindex, so
+/// two keys with the same IP on different TAPs are never conflated.
+fn traffic_key_display(k: &TrafficKey) -> String {
+    format!(
+        "ipv4 {} ifindex {}",
+        std::net::Ipv4Addr::from(k.ipv4),
+        k.ifindex
+    )
+}
+
+fn traffic6_key_display(k: &u32) -> String {
+    format!("ipv6-aggregate ifindex {k}")
+}
+
+/// Typed absent-key detection for `remove_counter_keys` — no string matching.
+fn key_already_absent(e: &MapError) -> bool {
+    use std::io::ErrorKind;
+    match e {
+        MapError::KeyNotFound | MapError::ElementNotFound => true,
+        MapError::SyscallError(se) => se.io_error.kind() == ErrorKind::NotFound,
+        MapError::IoError(io) => io.kind() == ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+/// Human-readable algorithm name for log lines.
+fn algorithm_name(algorithm: u32) -> &'static str {
+    use vm_bandwidth_common::*;
+    match algorithm {
+        ALGO_TOKEN_BUCKET => "token_bucket",
+        ALGO_LEAKY_BUCKET => "leaky_bucket",
+        ALGO_FIXED_WINDOW => "fixed_window",
+        ALGO_SLIDING_WINDOW_COUNTER => "sliding_window_counter",
+        ALGO_SLIDING_WINDOW_LOG => "sliding_window_log",
+        ALGO_GCRA => "gcra",
+        _ => "unknown",
+    }
+}
+
+/// §27 ordering with journal bookkeeping: whitelist additions first, limit-map
+/// actions second, whitelist removals last. Each successful operation is
+/// journaled immediately, so any mid-way failure rolls back exactly what ran.
+fn apply_reload_steps<M: crate::txmaps::LimitMaps, W: crate::txmaps::WhitelistOps>(
+    maps: &mut M,
+    wl: &mut W,
+    actions: &[LimitAction],
+    old_prefixes: &HashSet<Cidr>,
+    new_prefixes: &HashSet<Cidr>,
+    journal: &mut crate::txmaps::TxJournal,
+) -> Result<()> {
+    let additions: Vec<Cidr> = new_prefixes.difference(old_prefixes).copied().collect();
+    crate::txmaps::apply_whitelist_additions(wl, journal, &additions)
+        .context("whitelisting new prefixes")?;
+    run_limit_actions(maps, actions, journal)?;
+    let removals: Vec<Cidr> = old_prefixes.difference(new_prefixes).copied().collect();
+    crate::txmaps::apply_whitelist_removals(wl, journal, &removals)
+        .context("dropping removed whitelist prefixes")?;
+    Ok(())
+}
+
+/// Two-pass limit-action execution against a [`crate::txmaps::LimitMaps`]:
+/// removes first (they free capacity), installs after. For each flow the order
+/// is disarm -> clear foreign artifacts -> fresh state -> arm LAST; the journal
+/// exists before the first destructive write of every action.
+fn run_limit_actions<M: crate::txmaps::LimitMaps>(
+    maps: &mut M,
+    actions: &[LimitAction],
+    journal: &mut crate::txmaps::TxJournal,
+) -> Result<()> {
+    // Pass 1: removals.
+    for action in actions {
+        let LimitAction::Remove { ipv4, direction } = action else {
+            continue;
+        };
+        let key = LimitKey::new(*ipv4, *direction);
+        let addr = std::net::Ipv4Addr::from(*ipv4);
+        crate::txmaps::remove_limit(maps, journal, key)
+            .with_context(|| format!("removing limit policy for {addr} dir={direction}"))?;
+        log::info!("back to NORMAL {addr} dir={direction}");
+    }
+
+    // Pass 2: installs.
+    for action in actions {
+        let LimitAction::Install {
+            ipv4,
+            direction,
+            rate_bps,
+            burst_bytes,
+            algorithm,
+            window_ns,
+        } = action
+        else {
+            continue;
+        };
+        let key = LimitKey::new(*ipv4, *direction);
+        let addr = std::net::Ipv4Addr::from(*ipv4);
+        let policy = LimitPolicy {
+            enabled: 1,
+            _pad0: [0; 3],
+            algorithm: *algorithm,
+            rate_bps: *rate_bps,
+            burst_bytes: *burst_bytes,
+            window_ns: *window_ns,
+        };
+        crate::txmaps::install_limit(maps, journal, key, policy)
+            .with_context(|| format!("installing limit policy for {addr} dir={direction}"))?;
+        log::info!(
+            "LIMITED {} dir={} algo={} at {} bps (burst {} B, window {} ns)",
+            addr,
+            direction,
+            algorithm_name(*algorithm),
+            rate_bps,
+            burst_bytes,
+            window_ns
+        );
+    }
+    Ok(())
+}
+
+/// Error payload of a reload whose dataplane apply failed: the original error
+/// plus the rollback report for surfacing.
+#[derive(Debug)]
+struct ReloadApplyError {
+    message: anyhow::Error,
+    report: crate::txmaps::RollbackReport,
+}
+
+/// Execute a validated reload plan against the dataplane and commit control-plane
+/// state ONLY if every map operation succeeded. On any failure the journal is
+/// played back in reverse and nothing commits: the limiter keeps its flows, the
+/// collector keeps its pruning baseline, the visible config and generation stay
+/// put. This free function is the single commit decision point for hot reloads;
+/// the engine wires real aya maps into it, and tests drive it directly with
+/// scripted maps.
+// All nine parameters are live control-plane handles the single commit
+// decision point needs; grouping them into a struct would only add a type.
+#[allow(clippy::too_many_arguments)]
+fn apply_and_commit<M: crate::txmaps::LimitMaps, W: crate::txmaps::WhitelistOps>(
+    maps: &mut M,
+    wl: &mut W,
+    limiter: &mut Limiter,
+    collector: &mut Collector,
+    config: &ConfigArc,
+    generation: &mut u64,
+    old_prefixes: &HashSet<Cidr>,
+    plan: vm_bandwidth_core::limiter::ReloadPlan,
+    new_cfg: ValidatedConfig,
+) -> Result<(), ReloadApplyError> {
+    let mut journal = crate::txmaps::TxJournal::default();
+    if let Err(e) = apply_reload_steps(
+        maps,
+        wl,
+        &plan.actions,
+        old_prefixes,
+        &prefix_set(&new_cfg),
+        &mut journal,
+    ) {
+        let report = crate::txmaps::rollback_journal(maps, wl, &journal);
+        return Err(ReloadApplyError { message: e, report });
+    }
+
+    // Commit phase: limiter internals, then collector, then the visible switch.
+    limiter.commit_reload(plan);
+    collector.prune_ips(&new_cfg.ip_ranges());
+    config.store(Arc::new(new_cfg));
+    *generation += 1;
+    Ok(())
+}
+
 fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
     cfg.ranges.iter().flat_map(|r| r.inner.cidrs()).collect()
 }
@@ -947,9 +1296,11 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     // 4. Discover TAPs and attach (one loaded object, one link pair per TAP).
     let mut manager = AttachManager::new(base)?;
     let mut taps = Vec::new();
+    let mut startup_attach_failures = 0usize;
     match interface::discover_taps(&cfg.bridge) {
         Ok(found) => {
-            let (added, failed) = manager.reconcile(&found);
+            let (added, failed, _recreated) = manager.reconcile(&found);
+            startup_attach_failures = failed;
             log::info!("initial scan: {added} TAP(s) attached, {failed} failed");
             taps = manager.taps();
         }
@@ -972,8 +1323,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         config_watcher_healthy: true,
         config_watcher_errors_total: 0,
         config_watcher_last_error: String::new(),
-        dataplane_degraded: false,
-        rollback_failures_total: 0,
+        rollback_health: RollbackHealth::default(),
         bridge: config.load().bridge.clone(),
         manager,
         taps,
@@ -994,7 +1344,10 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         traffic6,
         policer_stats,
         http: crate::metrics::client(),
-        push_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        push_counters: Arc::new(PushCounters::new()),
+        tap_attach_failures_total: startup_attach_failures as u64,
+        antispoof_reapply_alerts_total: 0,
+        pending_removes: PendingRemovals::default(),
         epoch: std::time::Instant::now(),
     };
     // Apply the initial limiter policy index (no LIMITs yet; just builds lookups).
@@ -1124,14 +1477,114 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     Ok(())
 }
 
-/// RAII holder for the in-flight metrics-push flag. Dropping the guard covers every
-/// exit path of the spawned task — normal completion, HTTP error, future cancellation
-/// and panic unwinding — so the flag can never stay set and silently stop pushes.
-struct PushGuard(Arc<std::sync::atomic::AtomicBool>);
+/// One metrics push end to end under the single-flight guard — the exact
+/// orchestration `Engine::push_metrics` spawns, extracted so tests drive the
+/// production wiring (guard acquisition, push, outcome counters) rather than a
+/// test-only copy.
+///
+/// The RAII guard releases the in-flight slot on every exit path: normal
+/// completion, HTTP error, future cancellation and panic unwinding. Counters
+/// are observational only (Ordering::Relaxed) — they never feed a safety or
+/// business decision. An empty payload is unreachable from production once the
+/// process-metric lines render (they always emit four series); if passed
+/// directly, `metrics::push` returns Ok without HTTP and the push counts as a
+/// success — see the push_io tests for that contract.
+pub(crate) async fn run_metrics_push(
+    counters: Arc<PushCounters>,
+    http: reqwest::Client,
+    url: String,
+    lines: String,
+) {
+    let Some(_guard) = counters.try_start() else {
+        log::debug!("metrics push skipped: previous push still in flight");
+        return;
+    };
+    match crate::metrics::push(&http, &url, &lines).await {
+        Ok(()) => {
+            counters.note_success();
+            log::debug!("metrics push: {} line(s)", lines.lines().count());
+        }
+        Err(e) => {
+            counters.note_failure();
+            log::warn!(
+                "metrics push to {} failed: {e:#}",
+                vm_bandwidth_core::config::safe_endpoint_display(&url)
+            );
+        }
+    }
+}
+
+/// Process-lifetime outcome counters for the metrics push path plus the
+/// single-flight flag.
+///
+/// All counters are monotonic and purely observational: no decision reads them
+/// with a happens-before dependency on other data, so `Ordering::Relaxed` is
+/// correct for the increments and loads (each thread sees a coherent value
+/// eventually; cross-thread freshness is irrelevant for diagnostics). The
+/// inflight flag itself still uses an atomic swap/store pair for exclusion.
+pub(crate) struct PushCounters {
+    inflight: std::sync::atomic::AtomicBool,
+    successes: std::sync::atomic::AtomicU64,
+    failures: std::sync::atomic::AtomicU64,
+    skipped: std::sync::atomic::AtomicU64,
+}
+
+impl PushCounters {
+    pub(crate) fn new() -> Self {
+        Self {
+            inflight: std::sync::atomic::AtomicBool::new(false),
+            successes: std::sync::atomic::AtomicU64::new(0),
+            failures: std::sync::atomic::AtomicU64::new(0),
+            skipped: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Take the single-flight slot, or count a skip when a push is already
+    /// running. The returned guard releases the slot on every exit path
+    /// (normal completion, HTTP error, cancellation, panic unwinding).
+    pub(crate) fn try_start(self: &Arc<Self>) -> Option<PushGuard> {
+        if self
+            .inflight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        Some(PushGuard(self.clone()))
+    }
+
+    pub(crate) fn note_success(&self) {
+        self.successes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_failure(&self) {
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn successes(&self) -> u64 {
+        self.successes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn skipped(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// RAII holder for the in-flight push slot; see `PushCounters::try_start`.
+pub(crate) struct PushGuard(Arc<PushCounters>);
 
 impl Drop for PushGuard {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.0
+            .inflight
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1361,40 +1814,817 @@ fn spawn_watcher(
 }
 
 #[cfg(test)]
+mod degraded_message_tests {
+    use super::degraded_summary;
+
+    /// The rollback state machine can leave different records in different states
+    /// (old policy re-armed, new limit still armed, unarmed with a bounded orphan).
+    /// The user-visible summary must not claim one outcome for all affected flows.
+    #[test]
+    fn summary_names_no_specific_outcome() {
+        let msg = degraded_summary(2, 5);
+        for banned in ["unarmed", "fail-open", "fail open", "limited"] {
+            assert!(
+                !msg.to_lowercase().contains(banned),
+                "summary over-generalizes: contains {banned:?} in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_keeps_counts_and_points_at_details() {
+        let msg = degraded_summary(2, 5);
+        assert!(msg.contains("2 of 5"));
+        assert!(msg.contains("per-step rollback failures"));
+        assert!(msg.contains("DEGRADED"));
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::{remove_counter_keys, RemovalStats};
+    use aya::maps::MapError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn absent_syscall_error() -> MapError {
+        // The variant aya 0.14 produces for ENOENT from bpf_map_delete_elem.
+        MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: std::io::Error::from_raw_os_error(2), // ENOENT
+        })
+    }
+
+    #[test]
+    fn all_keys_removed() {
+        let calls = AtomicUsize::new(0);
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3],
+            |k| k.to_string(),
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 3,
+                removed: 3,
+                failed: 0,
+                failed_keys: vec![]
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn middle_failure_does_not_stop_the_rest() {
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3],
+            |k| k.to_string(),
+            |k| {
+                if *k == 2 {
+                    Err(MapError::InvalidName {
+                        name: "injected".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 3,
+                removed: 2,
+                failed: 1,
+                failed_keys: vec![2]
+            }
+        );
+    }
+
+    #[test]
+    fn all_failures_counted_individually() {
+        let stats = remove_counter_keys(
+            "TRAFFIC6",
+            "stale-TAP prune",
+            &[7u32, 8],
+            |k| k.to_string(),
+            |_| {
+                Err(MapError::InvalidName {
+                    name: "injected".to_string(),
+                })
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 2,
+                removed: 0,
+                failed: 2,
+                failed_keys: vec![7, 8]
+            }
+        );
+    }
+
+    #[test]
+    fn absent_key_counts_as_removed_via_typed_variants_only() {
+        // Ok, KeyNotFound and the ENOENT syscall variant all mean "the key is
+        // not in the map"; any other variant is a real failure.
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3, 4, 5],
+            |k| k.to_string(),
+            |k| match *k {
+                1 => Ok(()),
+                2 => Err(MapError::KeyNotFound),
+                3 => Err(MapError::ElementNotFound),
+                4 => Err(absent_syscall_error()),
+                _ => Err(MapError::InvalidName {
+                    name: "injected".to_string(),
+                }),
+            },
+        );
+        assert_eq!(
+            stats,
+            RemovalStats {
+                attempted: 5,
+                removed: 4,
+                failed: 1,
+                failed_keys: vec![5]
+            }
+        );
+    }
+
+    #[test]
+    fn failed_removals_never_enter_the_removed_total() {
+        // The summary used for logs must be built from actual removal results,
+        // not from the input length.
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "idle eviction",
+            &[1u32, 2, 3, 4],
+            |k| k.to_string(),
+            |k| {
+                if *k % 2 == 0 {
+                    Err(MapError::InvalidName {
+                        name: "injected".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(stats.removed + stats.failed, stats.attempted);
+        assert_eq!(stats.removed, 2);
+        assert_ne!(stats.removed, stats.attempted);
+        // Only the actually-failed keys are handed back for retry bookkeeping.
+        assert_eq!(stats.failed_keys, vec![2, 4]);
+    }
+}
+
+#[cfg(test)]
+mod reload_commit_tests {
+    //! Engine-level (control-plane) tests of the reload commit decision: the
+    //! production `apply_and_commit` is driven directly with scripted maps —
+    //! no copy of its logic, no Engine construction (needs live aya maps).
+
+    use super::{apply_and_commit, ConfigArc};
+    use crate::collector::{Collector, IpStats};
+    use crate::txmaps::testmaps::{policy, FakeMaps, FakeWhitelist};
+    use arc_swap::ArcSwap;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use vm_bandwidth_common::{LimitKey, ALGO_GCRA, DIR_RX, DIR_TX};
+    use vm_bandwidth_core::config::{self, ValidatedConfig};
+    use vm_bandwidth_core::limiter::{IpTotals, LimitAction, Limiter};
+
+    const IP1: u32 = u32::from_be_bytes([10, 0, 0, 1]); // dropped by the new config
+    const IP2: u32 = u32::from_be_bytes([10, 0, 0, 2]); // kept, rate changed
+
+    fn cfg(range: &str, rx_limit: &str, tx_limit: &str) -> ValidatedConfig {
+        let text = format!(
+            r#"
+[network]
+bridge = "br0"
+[security]
+ip_ownership = "external"
+acknowledge_external_anti_spoofing = true
+[[ip_ranges]]
+name = "r1"
+range = "{range}"
+[ip_ranges.policy]
+rx_threshold = "100Kbps"
+tx_threshold = "100Kbps"
+window = "2s"
+trigger_ratio = "100%"
+rx_limit = "{rx_limit}"
+tx_limit = "{tx_limit}"
+limit_duration = "30m"
+burst = "1MiB"
+"#
+        );
+        config::parse(&text).expect("test config must parse")
+    }
+
+    /// Limiter with two flows LIMITED in both directions, maps pre-armed with
+    /// the old policies the way an earlier successful apply would have left them.
+    /// The new config drops IP1 (-> Removes) and changes IP2's rates (-> Installs).
+    fn setup() -> (Limiter, FakeMaps, Collector, ValidatedConfig) {
+        let old_cfg = cfg("10.0.0.1-10.0.0.4", "100Kbps", "110Kbps");
+        let mut limiter = Limiter::new(1);
+        let plan = limiter.plan_reload(&old_cfg, 0).expect("initial plan");
+        limiter.commit_reload(plan);
+
+        let mut totals = HashMap::new();
+        for ip in [IP1, IP2] {
+            totals.insert(
+                ip,
+                IpTotals {
+                    rx_bytes: 100_000,
+                    tx_bytes: 100_000,
+                    rx_packets: 10,
+                    tx_packets: 10,
+                },
+            );
+        }
+        limiter.tick(10, &totals);
+        for ip in [IP1, IP2] {
+            totals.get_mut(&ip).unwrap().rx_bytes += 200_000;
+            totals.get_mut(&ip).unwrap().tx_bytes += 200_000;
+        }
+        let actions = limiter.tick(11, &totals);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, LimitAction::Install { .. })),
+            "flows must trigger LIMITED: {} action(s)",
+            actions.len()
+        );
+        for ip in [IP1, IP2] {
+            assert!(limiter.is_limited(ip, DIR_RX));
+            assert!(limiter.is_limited(ip, DIR_TX));
+        }
+
+        // Dataplane as committed by the earlier successful apply.
+        let mut maps = FakeMaps::default();
+        let mut journal = crate::txmaps::TxJournal::default();
+        for ip in [IP1, IP2] {
+            for dir in [DIR_RX, DIR_TX] {
+                crate::txmaps::install_limit(
+                    &mut maps,
+                    &mut journal,
+                    LimitKey::new(ip, dir),
+                    policy(ALGO_GCRA),
+                )
+                .unwrap();
+            }
+        }
+
+        let mut collector = Collector::new();
+        // IP1 is NOT covered by the new config: a commit would prune its
+        // collector state; a rejected apply must not.
+        collector.totals.insert(IP1, IpStats::default());
+        (limiter, maps, collector, old_cfg)
+    }
+
+    #[test]
+    fn failed_apply_commits_nothing_and_reports_rollback_failure() {
+        let (mut limiter, mut maps, mut collector, old_cfg) = setup();
+        let mut w = FakeWhitelist::default();
+        let new_cfg = cfg("10.0.0.2-10.0.0.4", "120Kbps", "130Kbps");
+        let plan = limiter.plan_reload(&new_cfg, 12).expect("reload plan");
+        // 2 Removes (IP1) + 2 Installs (IP2), deterministic shape.
+        assert_eq!(plan.actions.len(), 4);
+
+        let config: ConfigArc = Arc::new(ArcSwap::from_pointee(old_cfg.clone()));
+        let old_arc = config.load_full();
+        let mut generation = 1u64;
+
+        // Mid-apply failure: whichever IP2 direction installs first fails its
+        // state write (both Removes already succeeded). Rollback failure: the
+        // re-arm of the removed IP1/RX policy fails. Both injections are keyed
+        // by (op, key), so the scenario is independent of map iteration order.
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_RX));
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_TX));
+        maps.fail_next("arm_policy", LimitKey::new(IP1, DIR_RX));
+
+        let rb = apply_and_commit(
+            &mut maps,
+            &mut w,
+            &mut limiter,
+            &mut collector,
+            &config,
+            &mut generation,
+            &super::prefix_set(&old_cfg),
+            plan,
+            new_cfg.clone(),
+        )
+        .expect_err("apply must fail");
+
+        // Nothing committed: visible config, generation, limiter and collector
+        // all stay exactly where they were.
+        assert_eq!(generation, 1, "generation must not advance on failure");
+        assert!(
+            Arc::ptr_eq(&config.load_full(), &old_arc),
+            "visible config must not switch on failure"
+        );
+        assert!(
+            limiter.is_limited(IP1, DIR_RX)
+                && limiter.is_limited(IP1, DIR_TX)
+                && limiter.is_limited(IP2, DIR_RX)
+                && limiter.is_limited(IP2, DIR_TX),
+            "limiter must not commit the new plan"
+        );
+        assert!(
+            collector.totals.contains_key(&IP1),
+            "collector must not be pruned with the new config"
+        );
+        // The rollback degraded: the removed IP1/RX policy could not be
+        // re-armed. dataplane_degraded and rollback_failures_total in Status
+        // are derived from exactly this report.
+        assert!(!rb.report.dataplane_consistent);
+        assert_eq!(rb.report.failures.len(), 1);
+        assert_eq!(rb.report.failures[0].key, LimitKey::new(IP1, DIR_RX));
+        assert_eq!(rb.report.failures[0].op, "re-arm removed policy");
+        // Everything else rolled back cleanly on top of that one failure:
+        // IP1/TX re-armed, both IP2 directions restored to the old policy.
+        assert!(maps.policies.contains_key(&LimitKey::new(IP1, DIR_TX)));
+        assert!(!maps.policies.contains_key(&LimitKey::new(IP1, DIR_RX)));
+        assert_eq!(maps.policies.len(), 3);
+        // IP1/RX state stays behind as a bounded orphan; hard invariant holds.
+        assert!(maps.artifact(&LimitKey::new(IP1, DIR_RX), ALGO_GCRA));
+        maps.assert_invariants();
+
+        // Health wiring: the SAME report the engine passes to
+        // surface_rollback_report goes through the production RollbackHealth
+        // recorder — degraded flag set, counter advanced by the EXACT failure
+        // count, and per-failure details survive (not clobbered by the apply
+        // error). IPC Status reads exactly health.degraded/failures_total.
+        let mut health = super::RollbackHealth::default();
+        health.record(&rb.report);
+        assert!(health.degraded);
+        assert_eq!(health.failures_total, 1);
+        assert_eq!(
+            health.failures_total, 1,
+            "reading health must not increment"
+        );
+        assert!(rb.message.to_string().contains("installing limit policy"));
+        assert!(format!("{:#}", rb.message).contains("write_fresh_state"));
+        assert_eq!(rb.report.failures[0].op, "re-arm removed policy");
+    }
+
+    #[test]
+    fn failed_apply_with_clean_rollback_does_not_degrade() {
+        let (mut limiter, mut maps, mut collector, old_cfg) = setup();
+        let mut w = FakeWhitelist::default();
+        let new_cfg = cfg("10.0.0.2-10.0.0.4", "120Kbps", "130Kbps");
+        let plan = limiter.plan_reload(&new_cfg, 12).expect("reload plan");
+
+        let config: ConfigArc = Arc::new(ArcSwap::from_pointee(old_cfg.clone()));
+        let old_arc = config.load_full();
+        let mut generation = 1u64;
+
+        // Forward failure only (first IP2 install's state write); the rollback
+        // itself runs clean.
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_RX));
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_TX));
+
+        let rb = super::apply_and_commit(
+            &mut maps,
+            &mut w,
+            &mut limiter,
+            &mut collector,
+            &config,
+            &mut generation,
+            &super::prefix_set(&old_cfg),
+            plan,
+            new_cfg.clone(),
+        )
+        .expect_err("apply must fail");
+
+        // Nothing committed.
+        assert_eq!(generation, 1);
+        assert!(Arc::ptr_eq(&config.load_full(), &old_arc));
+        assert!(rb.report.dataplane_consistent, "{:?}", rb.report.failures);
+
+        // A clean rollback must NOT flag the dataplane degraded nor advance
+        // the failure counter.
+        let mut health = super::RollbackHealth::default();
+        health.record(&rb.report);
+        assert!(!health.degraded, "clean rollback must not degrade");
+        assert_eq!(health.failures_total, 0);
+
+        // Fully restored: all four keys carry the old policy, no orphans.
+        assert_eq!(maps.policies.len(), 4);
+        maps.assert_invariants();
+        maps.assert_no_orphans();
+    }
+
+    #[test]
+    fn multiple_rollback_failures_accumulate_exactly_and_keep_details() {
+        let (mut limiter, mut maps, mut collector, old_cfg) = setup();
+        let mut w = FakeWhitelist::default();
+        let new_cfg = cfg("10.0.0.2-10.0.0.4", "120Kbps", "130Kbps");
+        let plan = limiter.plan_reload(&new_cfg, 12).expect("reload plan");
+
+        let config: ConfigArc = Arc::new(ArcSwap::from_pointee(old_cfg.clone()));
+        let mut generation = 1u64;
+
+        // Forward: first IP2 install fails. Rollback: BOTH IP1 re-arms fail.
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_RX));
+        maps.fail_next("write_fresh_state", LimitKey::new(IP2, DIR_TX));
+        maps.fail_next("arm_policy", LimitKey::new(IP1, DIR_RX));
+        maps.fail_next("arm_policy", LimitKey::new(IP1, DIR_TX));
+
+        let rb = super::apply_and_commit(
+            &mut maps,
+            &mut w,
+            &mut limiter,
+            &mut collector,
+            &config,
+            &mut generation,
+            &super::prefix_set(&old_cfg),
+            plan,
+            new_cfg.clone(),
+        )
+        .expect_err("apply must fail");
+
+        assert_eq!(generation, 1);
+        assert!(!rb.report.dataplane_consistent);
+        // Two failures, each with its own op/key — per-step detail preserved.
+        assert_eq!(rb.report.failures.len(), 2);
+        for f in &rb.report.failures {
+            assert_eq!(f.op, "re-arm removed policy");
+        }
+        let mut failed_keys: Vec<_> = rb.report.failures.iter().map(|f| f.key).collect();
+        failed_keys.sort_by_key(|k| (k.ipv4, k.direction));
+        assert_eq!(
+            failed_keys,
+            vec![LimitKey::new(IP1, DIR_RX), LimitKey::new(IP1, DIR_TX)]
+        );
+
+        // Counter accumulates the exact per-report failure count (not one per
+        // report): a single report with two failures adds two; a later
+        // incident's report adds its own count on top.
+        let mut health = super::RollbackHealth::default();
+        health.record(&rb.report);
+        assert_eq!(health.failures_total, 2);
+        health.record(&rb.report);
+        assert_eq!(
+            health.failures_total, 4,
+            "each recorded report adds its failure count"
+        );
+        assert!(health.degraded);
+
+        // Both IP1 directions unarmed with bounded orphan states; IP2 restored.
+        assert!(!maps.policies.contains_key(&LimitKey::new(IP1, DIR_RX)));
+        assert!(!maps.policies.contains_key(&LimitKey::new(IP1, DIR_TX)));
+        assert!(maps.artifact(&LimitKey::new(IP1, DIR_RX), ALGO_GCRA));
+        assert!(maps.artifact(&LimitKey::new(IP1, DIR_TX), ALGO_GCRA));
+        assert_eq!(
+            maps.policies.len(),
+            2,
+            "only both IP2 directions remain armed"
+        );
+        maps.assert_invariants();
+    }
+
+    #[test]
+    fn successful_apply_commits_everything_exactly_once() {
+        let (mut limiter, mut maps, mut collector, old_cfg) = setup();
+        let mut w = FakeWhitelist::default();
+        let new_cfg = cfg("10.0.0.2-10.0.0.4", "120Kbps", "130Kbps");
+        let plan = limiter.plan_reload(&new_cfg, 12).expect("reload plan");
+
+        let config: ConfigArc = Arc::new(ArcSwap::from_pointee(old_cfg.clone()));
+        let old_arc = config.load_full();
+        let mut generation = 1u64;
+
+        apply_and_commit(
+            &mut maps,
+            &mut w,
+            &mut limiter,
+            &mut collector,
+            &config,
+            &mut generation,
+            &super::prefix_set(&old_cfg),
+            plan,
+            new_cfg.clone(),
+        )
+        .expect("apply must succeed");
+
+        assert_eq!(generation, 2, "generation advances exactly once");
+        assert!(
+            !Arc::ptr_eq(&config.load_full(), &old_arc),
+            "visible config must switch on success"
+        );
+        assert!(
+            !collector.totals.contains_key(&IP1),
+            "collector pruned under the new config"
+        );
+        // Committed limiter state matches the new config: a re-plan against it
+        // has nothing left to do (IP1 flows reset, IP2 policies up to date).
+        let again = limiter.plan_reload(&new_cfg, 12).expect("re-plan");
+        assert!(
+            again.actions.is_empty(),
+            "committed state must leave nothing to do: {} action(s)",
+            again.actions.len()
+        );
+        // IP1 disarmed entirely, IP2 armed with the NEW rates.
+        assert!(!maps.policies.contains_key(&LimitKey::new(IP1, DIR_RX)));
+        assert!(!maps.policies.contains_key(&LimitKey::new(IP1, DIR_TX)));
+        for (dir, rate) in [(DIR_RX, 120_000u64), (DIR_TX, 130_000)] {
+            let p = maps
+                .policies
+                .get(&LimitKey::new(IP2, dir))
+                .expect("armed after commit");
+            assert_eq!(p.enabled, 1);
+            assert_eq!(p.rate_bps, rate);
+        }
+        maps.assert_invariants();
+        maps.assert_no_orphans();
+    }
+}
+
+#[cfg(test)]
+mod pending_removal_tests {
+    //! Lifecycle tests for transient counter-removal failures: the production
+    //! retry path is `PendingRemovals::retry_traffic` (called from every TAP
+    //! rescan) fed by `remove_counter_keys().failed_keys` (the prune path) —
+    //! exactly what `Engine::rescan_taps` wires.
+
+    use super::{remove_counter_keys, traffic_key_display, PendingRemovals};
+    use aya::maps::MapError;
+    use std::collections::{HashMap, HashSet};
+    use vm_bandwidth_common::TrafficKey;
+
+    /// Scripted TRAFFIC map: presence + per-key injected failure counts.
+    #[derive(Default)]
+    struct FakeTraffic {
+        present: HashSet<TrafficKey>,
+        /// Remaining injected transient failures per key; decremented per attempt.
+        fail_times: HashMap<TrafficKey, u32>,
+        /// Keys that never succeed (until removed from this set).
+        fail_forever: HashSet<TrafficKey>,
+        calls: HashMap<TrafficKey, u32>,
+    }
+
+    impl FakeTraffic {
+        fn insert(&mut self, k: TrafficKey) {
+            self.present.insert(k);
+        }
+        fn remove(&mut self, k: &TrafficKey) -> Result<(), MapError> {
+            *self.calls.entry(*k).or_insert(0) += 1;
+            if self.fail_forever.contains(k) {
+                return Err(MapError::IoError(std::io::Error::other("injected")));
+            }
+            if let Some(n) = self.fail_times.get_mut(k) {
+                if *n > 0 {
+                    *n -= 1;
+                    return Err(MapError::IoError(std::io::Error::other(
+                        "injected transient",
+                    )));
+                }
+            }
+            self.present.remove(k);
+            Ok(())
+        }
+    }
+
+    fn key(ifindex: u32, ip: [u8; 4]) -> TrafficKey {
+        TrafficKey {
+            ifindex,
+            ipv4: u32::from_be_bytes(ip),
+        }
+    }
+
+    fn absent_enoent() -> MapError {
+        MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: std::io::Error::from_raw_os_error(2), // ENOENT
+        })
+    }
+
+    #[test]
+    fn transient_failure_is_retried_next_cycle_and_cleans_up() {
+        let mut map = FakeTraffic::default();
+        let k = key(9, [10, 0, 0, 1]);
+        map.insert(k);
+        map.fail_times.insert(k, 1);
+        let mut pending = PendingRemovals::default();
+
+        // Cycle 1 (the prune attempt): transient failure -> key stays in the map
+        // AND enters the pending set.
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "stale-TAP prune",
+            &[k],
+            traffic_key_display,
+            |k| map.remove(k),
+        );
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.failed_keys, vec![k]);
+        pending.traffic.extend(stats.failed_keys);
+        assert!(map.present.contains(&k), "failed key must stay in the map");
+        assert_eq!(pending.traffic.len(), 1);
+
+        // Cycle 2 (next maintenance pass): retried immediately — no idle
+        // threshold, no TAP-set-change requirement — and fully cleaned.
+        let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+        assert_eq!(retry.removed, 1);
+        assert_eq!(retry.still_pending, 0);
+        assert!(!map.present.contains(&k), "map cleaned after retry");
+        assert!(pending.traffic.is_empty(), "pending cleaned after retry");
+    }
+
+    #[test]
+    fn absent_key_is_success_not_permanent_retry() {
+        let mut pending = PendingRemovals::default();
+        let k = key(9, [10, 0, 0, 2]);
+        pending.traffic.insert(k); // a failure recorded on an earlier pass
+
+        let retry = pending.retry_traffic(&HashSet::new(), |_| Err(MapError::KeyNotFound));
+        assert_eq!(retry.removed, 1);
+        assert_eq!(retry.still_pending, 0);
+        assert!(
+            pending.traffic.is_empty(),
+            "absent must not enter permanent retry"
+        );
+
+        // The ENOENT syscall variant (aya 0.14's delete-elem shape) behaves alike.
+        pending.traffic.insert(k);
+        let retry = pending.retry_traffic(&HashSet::new(), |_| Err(absent_enoent()));
+        assert_eq!(retry.removed, 1);
+        assert!(pending.traffic.is_empty());
+    }
+
+    #[test]
+    fn mixed_batch_cleans_successes_and_retries_the_failure() {
+        let mut map = FakeTraffic::default();
+        let ok_k = key(1, [10, 0, 0, 1]);
+        let absent_k = key(1, [10, 0, 0, 2]); // never in the map
+        let bad_k = key(1, [10, 0, 0, 3]);
+        map.insert(ok_k);
+        map.insert(bad_k);
+        map.fail_times.insert(bad_k, 1);
+        let mut pending = PendingRemovals::default();
+
+        let stats = remove_counter_keys(
+            "TRAFFIC",
+            "stale-TAP prune",
+            &[ok_k, absent_k, bad_k],
+            traffic_key_display,
+            |k| map.remove(k),
+        );
+        assert_eq!(stats.attempted, 3);
+        assert_eq!(stats.removed, 2, "success + confirmed-absent both clean");
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.failed_keys, vec![bad_k]);
+        pending.traffic.extend(stats.failed_keys);
+        assert!(!map.present.contains(&ok_k), "successful key cleaned");
+        assert!(map.present.contains(&bad_k), "failed key retained");
+
+        // Next pass resolves the remainder.
+        let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+        assert_eq!(retry.removed, 1);
+        assert!(!map.present.contains(&bad_k));
+        assert!(pending.traffic.is_empty());
+    }
+
+    #[test]
+    fn reused_ifindex_cancels_pending_without_deleting_live_counters() {
+        let mut map = FakeTraffic::default();
+        let k = key(7, [10, 0, 0, 9]);
+        map.insert(k); // counters now belong to the NEW tap reusing ifindex 7
+        let mut pending = PendingRemovals::default();
+        pending.traffic.insert(k);
+
+        let mut live = HashSet::new();
+        live.insert(7);
+        let retry = pending.retry_traffic(&live, |k| map.remove(k));
+        assert_eq!(retry.cancelled_reused, 1);
+        assert_eq!(retry.removed, 0);
+        assert_eq!(
+            map.calls.get(&k).copied().unwrap_or(0),
+            0,
+            "no deletion attempt may touch a reused ifindex"
+        );
+        assert!(
+            map.present.contains(&k),
+            "live counters of the reused ifindex must survive"
+        );
+        assert!(
+            pending.traffic.is_empty(),
+            "cancelled key leaves the pending set"
+        );
+    }
+
+    #[test]
+    fn repeated_failures_stay_bounded_and_retriable_without_busy_loop() {
+        let mut map = FakeTraffic::default();
+        let k = key(3, [10, 0, 1, 1]);
+        map.insert(k);
+        map.fail_forever.insert(k);
+        let mut pending = PendingRemovals::default();
+        pending.traffic.insert(k);
+
+        for pass in 0..3u32 {
+            let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+            assert_eq!(retry.still_pending, 1, "pass {pass}");
+            assert_eq!(retry.removed, 0, "pass {pass}");
+            assert_eq!(
+                pending.traffic.len(),
+                1,
+                "pending set must stay bounded, never duplicate (pass {pass})"
+            );
+        }
+        // Exactly one attempt per maintenance pass: no in-pass retry loop.
+        assert_eq!(map.calls.get(&k).copied(), Some(3));
+
+        // Recovery stays possible once the error clears.
+        map.fail_forever.remove(&k);
+        let retry = pending.retry_traffic(&HashSet::new(), |k| map.remove(k));
+        assert_eq!(retry.removed, 1);
+        assert!(pending.traffic.is_empty());
+        assert!(!map.present.contains(&k));
+    }
+
+    #[test]
+    fn display_distinguishes_same_ip_on_different_ifindexes() {
+        let a = key(3, [10, 0, 0, 5]);
+        let b = key(9, [10, 0, 0, 5]);
+        let (da, db) = (traffic_key_display(&a), traffic_key_display(&b));
+        assert_ne!(da, db, "same IP on different TAPs must not conflate");
+        for d in [&da, &db] {
+            assert!(d.contains("ipv4 10.0.0.5"), "{d}");
+        }
+        assert!(da.contains("ifindex 3"), "{da}");
+        assert!(db.contains("ifindex 9"), "{db}");
+    }
+}
+
+#[cfg(test)]
 mod push_guard_tests {
-    use crate::daemon::PushGuard;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::daemon::PushCounters;
     use std::sync::Arc;
 
     #[test]
     fn guard_releases_on_normal_drop() {
-        let flag = Arc::new(AtomicBool::new(true));
+        let counters = Arc::new(PushCounters::new());
         {
-            let _guard = PushGuard(flag.clone());
+            let _guard = counters.try_start().expect("slot free");
         }
-        assert!(!flag.load(Ordering::Acquire));
+        assert!(
+            counters.try_start().is_some(),
+            "slot must be free after the guard drops"
+        );
     }
 
     #[test]
     fn guard_releases_on_panic_unwind() {
-        let flag = Arc::new(AtomicBool::new(true));
-        let f = flag.clone();
+        let counters = Arc::new(PushCounters::new());
+        let c = counters.clone();
         let result = std::panic::catch_unwind(move || {
-            let _guard = PushGuard(f);
+            let _guard = c.try_start().expect("slot free");
             panic!("simulated push-task panic");
         });
         assert!(result.is_err());
-        assert!(!flag.load(Ordering::Acquire), "flag stuck after panic");
+        assert!(
+            counters.try_start().is_some(),
+            "slot stuck after panic unwinding"
+        );
     }
 
     #[test]
     fn guard_releases_on_simulated_cancellation() {
         // A cancelled future drops its locals; model that by dropping the guard
         // mid-flight without ever reaching completion.
-        let flag = Arc::new(AtomicBool::new(true));
-        let guard = PushGuard(flag.clone());
+        let counters = Arc::new(PushCounters::new());
+        let guard = counters.try_start().expect("slot free");
         drop(guard);
-        assert!(!flag.load(Ordering::Acquire), "flag stuck after cancel");
+        assert!(counters.try_start().is_some(), "slot stuck after cancel");
+    }
+
+    #[test]
+    fn concurrent_start_counts_a_skip_and_keeps_outcomes_separate() {
+        let counters = Arc::new(PushCounters::new());
+        let guard = counters.try_start().expect("slot free");
+        assert!(counters.try_start().is_none(), "second start must skip");
+        assert!(counters.try_start().is_none());
+        counters.note_success();
+        counters.note_failure();
+        drop(guard);
+        // Outcomes are independent of skips; all counters stay monotonic.
+        assert_eq!(counters.successes(), 1);
+        assert_eq!(counters.failures(), 1);
+        assert_eq!(counters.skipped(), 2);
+        assert!(counters.try_start().is_some(), "slot free after drop");
     }
 }
 
@@ -1431,9 +2661,11 @@ mod lock_tests {
 #[cfg(test)]
 mod ipc_tests {
     use super::{handle_connection, IpcReq};
+    use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio::sync::mpsc;
+    use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
     use vm_bandwidth_core::ipc::{
         validate_frame_len, IpDetail, RangeDetail, Request, Response, MAX_REQUEST_FRAME,
         MAX_RESPONSE_FRAME,
@@ -1591,6 +2823,78 @@ mod ipc_tests {
             assert_eq!(validate_frame_len(max as u32, max), Ok(max));
             assert!(validate_frame_len(max as u32 + 1, max).is_err());
             assert!(validate_frame_len(u32::MAX, max).is_err());
+        }
+    }
+
+    /// A RangeDetail with an ASCII-padded name: serialized length is base + pad,
+    /// so one measurement plus one delta adjustment lands exactly on a target.
+    fn padded_range_detail(pad: usize) -> Response {
+        Response::RangeDetail(Box::new(RangeDetail {
+            name: "a".repeat(pad),
+            range: "10.0.0.0/8".to_string(),
+            ips: (0..32)
+                .map(|i| IpDetail {
+                    ip: i,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    // 6. A response body of EXACTLY MAX_RESPONSE_FRAME round-trips over a real
+    //    socket through the daemon's real FramedWrite and a real client codec.
+    //    Pure validate_frame_len boundaries are covered above; this exercises the
+    //    ceiling on the wire. Payload size is adjusted dynamically against the
+    //    actual serde_json output length (no assumed JSON overhead).
+    #[tokio::test]
+    async fn response_at_exactly_max_frame_round_trips_over_real_socket() {
+        let (mut client, mut rx) = pair();
+        write_raw(
+            &mut client,
+            &serde_json::to_vec(&Request::Overview).unwrap(),
+        )
+        .await;
+        let (_, reply) = rx.recv().await.unwrap();
+
+        let mut pad = MAX_RESPONSE_FRAME - 1_000_000;
+        let resp = loop {
+            let candidate = padded_range_detail(pad);
+            let len = serde_json::to_vec(&candidate).unwrap().len();
+            if len == MAX_RESPONSE_FRAME {
+                break candidate;
+            }
+            // ASCII padding is byte-linear in the JSON output: one delta lands it.
+            pad = (pad as i64 + MAX_RESPONSE_FRAME as i64 - len as i64) as usize;
+        };
+        reply.send(resp).unwrap();
+
+        // Client side: a real LengthDelimitedCodec configured with the response
+        // ceiling, reading the whole frame off the socket.
+        let mut framed = FramedRead::new(
+            client,
+            LengthDelimitedCodec::builder()
+                .length_field_type::<u32>()
+                .max_frame_length(MAX_RESPONSE_FRAME)
+                .new_codec(),
+        );
+        let frame = framed
+            .next()
+            .await
+            .expect("frame expected")
+            .expect("frame must decode at the ceiling");
+        assert_eq!(
+            frame.len(),
+            MAX_RESPONSE_FRAME,
+            "body must sit exactly on the response ceiling"
+        );
+        match serde_json::from_slice::<Response>(&frame).unwrap() {
+            Response::RangeDetail(rd) => {
+                assert_eq!(rd.ips.len(), 32, "payload content must be intact");
+                assert_eq!(rd.name.len(), pad);
+                assert!(rd.name.bytes().all(|b| b == b'a'));
+            }
+            other => panic!("expected range detail, got {other:?}"),
         }
     }
 

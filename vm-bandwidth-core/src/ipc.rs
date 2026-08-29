@@ -75,13 +75,43 @@ pub struct Status {
     pub config_watcher_healthy: bool,
     pub config_watcher_errors_total: u64,
     pub config_watcher_last_error: String,
-    /// True once a map rollback could not fully restore the dataplane. Affected
-    /// flows are unarmed (fail-open) until they re-trigger; the flag persists so the
-    /// degradation stays visible. `#[serde(default)]` keeps older daemons readable.
+    /// True once a map rollback could not fully restore the dataplane. The
+    /// dataplane may then differ from the active configuration; the exact state
+    /// of each affected flow is carried by the per-step `RollbackFailure` entries
+    /// in the daemon log (an old policy may be re-armed, a new limit may stay
+    /// armed, or a flow may be unarmed with a bounded orphan artifact). The hard
+    /// invariant `armed policy => matching state exists` still holds. The flag
+    /// persists so the degradation stays visible. `#[serde(default)]` keeps older
+    /// daemons readable.
     #[serde(default)]
     pub dataplane_degraded: bool,
     #[serde(default)]
     pub rollback_failures_total: u64,
+    /// Operational counters, cumulative since daemon start (additive protocol
+    /// fields: older daemons omit them, `#[serde(default)]` → 0).
+    ///
+    /// Lag semantics — two DIFFERENT surfaces:
+    /// - IPC `Status` (this struct): reads the process atomics directly, so
+    ///   these values are CURRENT at query time and never lag.
+    /// - The VictoriaMetrics payload: a push cannot include its own outcome
+    ///   (it has not finished yet), so the `vmbw_metrics_push_successes_total`
+    ///   SERIES exported to VM lags the true count by at most one push
+    ///   interval. failures/skipped are rendered before the request, so they
+    ///   are current even in the payload.
+    #[serde(default)]
+    pub tap_attach_failures_total: u64,
+    /// TAP recreations seen since daemon start (same name, new ifindex). Each
+    /// event means external per-ifindex enforcement (anti-spoofing rules) is
+    /// INACTIVE on that TAP until the platform re-applies it; the daemon warns
+    /// with a SECURITY log line and counts the event here. 0 in steady state.
+    #[serde(default)]
+    pub antispoof_reapply_alerts_total: u64,
+    #[serde(default)]
+    pub metrics_push_successes_total: u64,
+    #[serde(default)]
+    pub metrics_push_failures_total: u64,
+    #[serde(default)]
+    pub metrics_push_skipped_total: u64,
     /// Anti-spoofing contract (see config `[security]`): which mode is in effect,
     /// whether THIS program enforces it (currently always false — external), and that
     /// the operator acknowledgement is on file.
@@ -271,7 +301,41 @@ mod tests {
         let json = r#"{"type":"status","generation":1,"config_loaded_at":"","last_reload_at":"","last_reload_ok":true,"last_reload_error":"","bridge":"br0","tap_count":0,"config_watcher_healthy":true,"config_watcher_errors_total":0,"config_watcher_last_error":"","dataplane_degraded":false,"rollback_failures_total":0,"swl_map_capacity":0,"swl_map_used":0,"ranges":[]}"#;
         let resp: Response = serde_json::from_str(json).unwrap();
         match resp {
-            Response::Status(s) => assert_eq!(s.protocol_version, 0),
+            Response::Status(s) => {
+                assert_eq!(s.protocol_version, 0);
+                // Additive operational fields: an older daemon omits them entirely
+                // and the client must read zeros, not an error.
+                assert_eq!(s.tap_attach_failures_total, 0);
+                assert_eq!(s.antispoof_reapply_alerts_total, 0);
+                assert_eq!(s.metrics_push_successes_total, 0);
+                assert_eq!(s.metrics_push_failures_total, 0);
+                assert_eq!(s.metrics_push_skipped_total, 0);
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operational_counters_round_trip() {
+        let status = Status {
+            protocol_version: PROTOCOL_VERSION,
+            tap_attach_failures_total: 7,
+            antispoof_reapply_alerts_total: 2,
+            metrics_push_successes_total: 100,
+            metrics_push_failures_total: 3,
+            metrics_push_skipped_total: 1,
+            ..Default::default()
+        };
+        let frame = encode(&Response::Status(Box::new(status))).unwrap();
+        let back: Response = decode(&frame[4..]).unwrap();
+        match back {
+            Response::Status(s) => {
+                assert_eq!(s.tap_attach_failures_total, 7);
+                assert_eq!(s.antispoof_reapply_alerts_total, 2);
+                assert_eq!(s.metrics_push_successes_total, 100);
+                assert_eq!(s.metrics_push_failures_total, 3);
+                assert_eq!(s.metrics_push_skipped_total, 1);
+            }
             other => panic!("expected status, got {other:?}"),
         }
     }

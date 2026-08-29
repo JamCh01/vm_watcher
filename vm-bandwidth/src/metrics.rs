@@ -19,8 +19,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BODY: usize = 1 << 20;
 
 /// Render the aggregate IPv6 pseudo-series (`ip="ipv6-all"`, `range="IPv6"`).
-/// IPv6 is counted per address in eBPF but surfaced as one aggregate; a single
-/// bounded series set keeps VictoriaMetrics cardinality flat.
+/// IPv6 is counted per TAP (ifindex) in eBPF (TRAFFIC6) and surfaced here as
+/// one aggregate — there is no per-address breakdown; a single bounded series
+/// set keeps VictoriaMetrics cardinality flat.
 pub fn render_prom_lines_ipv6(t: &crate::collector::IpStats, now_ms: i64) -> String {
     if t.rx_bytes | t.tx_bytes | t.rx_packets | t.tx_packets == 0 {
         return String::new();
@@ -57,6 +58,41 @@ pub fn render_prom_lines_oversized(
             "vmbw_oversized_{dir}_packets_total {packets} {now_ms}\nvmbw_oversized_{dir}_bytes_total {bytes} {now_ms}\n",
             packets = stats.packets,
             bytes = stats.bytes
+        ));
+    }
+    out
+}
+
+/// Process-lifetime operational counters: attach failures, anti-spoof re-apply
+/// alerts and metrics-push outcomes. Fixed label set (`instance="process"`) →
+/// exactly five series, constant cardinality. Rendered even when zero so
+/// `rate()`/`increase()` have a continuous series from daemon start.
+///
+/// Success-lag semantics: a push cannot observe its own outcome while it is
+/// still running, so the success value in any payload is the count from BEFORE
+/// that push — success lags by at most one push interval by construction.
+/// failures/skipped are current at render time (they happen before the render).
+pub fn render_prom_lines_process(
+    tap_attach_failures: u64,
+    antispoof_reapply_alerts: u64,
+    push_successes: u64,
+    push_failures: u64,
+    push_skipped: u64,
+    now_ms: i64,
+) -> String {
+    let mut out = String::with_capacity(256);
+    for (name, value) in [
+        ("vmbw_tap_attach_failures_total", tap_attach_failures),
+        (
+            "vmbw_antispoof_reapply_alerts_total",
+            antispoof_reapply_alerts,
+        ),
+        ("vmbw_metrics_push_successes_total", push_successes),
+        ("vmbw_metrics_push_failures_total", push_failures),
+        ("vmbw_metrics_push_skipped_total", push_skipped),
+    ] {
+        out.push_str(&format!(
+            "{name}{{instance=\"process\"}} {value} {now_ms}\n"
         ));
     }
     out
@@ -168,7 +204,12 @@ pub fn client() -> reqwest::Client {
 /// Read a response body with a hard cap.
 pub async fn body_capped(mut resp: reqwest::Response) -> Result<String> {
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.context("reading response body")? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| e.without_url())
+        .context("reading response body")?
+    {
         if body.len() + chunk.len() > MAX_RESPONSE_BODY {
             bail!("response body exceeds {MAX_RESPONSE_BODY} bytes");
         }
@@ -178,18 +219,25 @@ pub async fn body_capped(mut resp: reqwest::Response) -> Result<String> {
 }
 
 /// Push one payload to `{base_url}/api/v1/import/prometheus`.
+///
+/// Diagnostics never carry more than scheme://host[:port] of the endpoint
+/// (`safe_endpoint_display`): reqwest errors can embed the full URL, so every
+/// error leaving this function is passed through `without_url()` and the
+/// context strings use the redacted form.
 pub async fn push(client: &reqwest::Client, base_url: &str, lines: &str) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
     let url = format!("{base_url}/api/v1/import/prometheus");
+    let safe = vm_bandwidth_core::config::safe_endpoint_display(base_url);
     let resp = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(lines.to_string())
         .send()
         .await
-        .with_context(|| format!("POST {url}"))?;
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("POST {safe}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = body_capped(resp).await.unwrap_or_default();
@@ -296,5 +344,274 @@ mod tests {
             !lines.contains("10.0.0.1"),
             "unpoliced IP must emit nothing"
         );
+    }
+
+    #[test]
+    fn process_counters_render_fixed_series_with_current_values() {
+        let lines = super::render_prom_lines_process(2, 4, 10, 3, 1, 123);
+        for needle in [
+            "vmbw_tap_attach_failures_total{instance=\"process\"} 2 123",
+            "vmbw_antispoof_reapply_alerts_total{instance=\"process\"} 4 123",
+            "vmbw_metrics_push_successes_total{instance=\"process\"} 10 123",
+            "vmbw_metrics_push_failures_total{instance=\"process\"} 3 123",
+            "vmbw_metrics_push_skipped_total{instance=\"process\"} 1 123",
+        ] {
+            assert!(lines.contains(needle), "missing {needle:?} in:\n{lines}");
+        }
+        // Exactly five series, constant cardinality, cumulative semantics: the
+        // values are whatever the daemon accumulated — the renderer adds nothing
+        // and drops nothing (zero values still render so rate() sees continuity).
+        assert_eq!(lines.lines().count(), 5, "{lines}");
+        let zeros = super::render_prom_lines_process(0, 0, 0, 0, 0, 1);
+        assert_eq!(zeros.lines().count(), 5, "zero counters must still render");
+    }
+}
+
+#[cfg(test)]
+mod push_io_tests {
+    //! Real-socket tests for the push path. Counter semantics are driven through
+    //! the PRODUCTION orchestration `daemon::run_metrics_push` (the exact future
+    //! `Engine::push_metrics` spawns) — no test-side mirror of the guard/push/
+    //! counter sequence. Redaction is asserted on `metrics::push` error chains.
+
+    use crate::daemon::{run_metrics_push, PushCounters};
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn payload() -> String {
+        "vmbw_rx_bytes_total{ip=\"10.0.0.1\",range=\"r\"} 1 1\n".to_string()
+    }
+
+    fn short_timeout_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    /// Single-connection HTTP server: reads one request head, writes the canned
+    /// response. Returns the base URL and a connection counter.
+    fn serve_once(response: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf); // request head; body irrelevant
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, accepts)
+    }
+
+    /// Server that ACCEPTS connections and keeps every socket open without ever
+    /// answering, until the test signals stop. This is a genuine stall: the
+    /// client waits on a live connection, so only its timeout can end the
+    /// request (an immediate close would surface as EOF/reset, not a timeout).
+    fn serve_hold() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let mut held: Vec<std::net::TcpStream> = Vec::new();
+            while !stop_c.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(held); // sockets released only when the test is done
+        });
+        (url, stop, handle)
+    }
+
+    #[tokio::test]
+    async fn production_push_2xx_counts_success_and_releases_the_slot() {
+        let (url, _accepts) = serve_once("HTTP/1.1 204 No Content\r\n\r\n");
+        let counters = Arc::new(PushCounters::new());
+
+        run_metrics_push(counters.clone(), short_timeout_client(), url, payload()).await;
+
+        assert_eq!(counters.successes(), 1);
+        assert_eq!(counters.failures(), 0);
+        assert_eq!(counters.skipped(), 0);
+        // Guard released after the request: the next push can start.
+        assert!(counters.try_start().is_some());
+    }
+
+    #[tokio::test]
+    async fn production_push_5xx_counts_failure() {
+        let (url, _accepts) =
+            serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        let counters = Arc::new(PushCounters::new());
+
+        run_metrics_push(counters.clone(), short_timeout_client(), url, payload()).await;
+
+        assert_eq!(counters.failures(), 1);
+        assert_eq!(counters.successes(), 0);
+        assert_eq!(counters.skipped(), 0);
+        assert!(
+            counters.try_start().is_some(),
+            "slot released after failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_push_connection_refused_counts_failure() {
+        // Nothing listens on port 1.
+        let counters = Arc::new(PushCounters::new());
+        run_metrics_push(
+            counters.clone(),
+            short_timeout_client(),
+            "http://127.0.0.1:1".to_string(),
+            payload(),
+        )
+        .await;
+        assert_eq!(counters.failures(), 1);
+        assert_eq!(counters.successes(), 0);
+    }
+
+    #[tokio::test]
+    async fn inflight_second_push_skips_without_request_then_recovers() {
+        let (url, accepts) = serve_once("HTTP/1.1 204 No Content\r\n\r\n");
+        let counters = Arc::new(PushCounters::new());
+
+        // A previous push still in flight: hold its slot.
+        let held = counters.try_start().expect("slot free");
+        run_metrics_push(
+            counters.clone(),
+            short_timeout_client(),
+            url.clone(),
+            payload(),
+        )
+        .await;
+        assert_eq!(counters.skipped(), 1);
+        assert_eq!(counters.successes(), 0);
+        assert_eq!(counters.failures(), 0);
+        // A skipped push must not create an HTTP request.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(accepts.load(Ordering::SeqCst), 0);
+        drop(held);
+
+        // After the previous push ends, the next one runs normally.
+        run_metrics_push(counters.clone(), short_timeout_client(), url, payload()).await;
+        assert_eq!(counters.successes(), 1, "guard released: recovery works");
+        assert_eq!(counters.skipped(), 1, "no extra skip");
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_payload_contract_counts_success_without_http() {
+        // The contract of the production helper for an empty payload: push()
+        // returns Ok without any HTTP, so the run counts as a success. In the
+        // daemon this input is unreachable once metrics are enabled — the
+        // process-metric renderer always emits four series — and push_metrics
+        // returns before spawning when lines are empty.
+        let (url, accepts) = serve_once("HTTP/1.1 204 No Content\r\n\r\n");
+        let counters = Arc::new(PushCounters::new());
+        run_metrics_push(counters.clone(), short_timeout_client(), url, String::new()).await;
+        assert_eq!(counters.successes(), 1, "empty payload is an Ok no-op push");
+        assert_eq!(counters.failures(), 0);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "no HTTP request for empty payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_failure_error_chain_never_echoes_credentials() {
+        let (base, _accepts) =
+            serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        let stripped = base.strip_prefix("http://").unwrap();
+        let url = format!("http://operator:hunter2@{stripped}/secret/path?api_key=tok123#frag");
+
+        let err = crate::metrics::push(&short_timeout_client(), &url, &payload())
+            .await
+            .expect_err("500 must fail");
+        let shown = format!("{err:#}");
+        for secret in [
+            "hunter2",
+            "operator",
+            "secret/path",
+            "api_key",
+            "tok123",
+            "frag",
+        ] {
+            assert!(!shown.contains(secret), "{secret:?} leaked in: {shown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_refused_error_chain_never_echoes_credentials() {
+        let url = "http://operator:hunter2@127.0.0.1:1/secret?api_key=tok123";
+        let err = crate::metrics::push(&short_timeout_client(), url, &payload())
+            .await
+            .expect_err("refused must fail");
+        let shown = format!("{err:#}");
+        for secret in ["hunter2", "operator", "secret", "api_key", "tok123"] {
+            assert!(!shown.contains(secret), "{secret:?} leaked in: {shown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_server_triggers_a_real_timeout() {
+        let (url, stop, handle) = serve_hold();
+        let counters = Arc::new(PushCounters::new());
+        let timeout = Duration::from_millis(300);
+        let client = reqwest::Client::builder().timeout(timeout).build().unwrap();
+
+        // Production orchestration against the stalling server: counts a failure.
+        let start = Instant::now();
+        run_metrics_push(counters.clone(), client.clone(), url.clone(), payload()).await;
+        let production_elapsed = start.elapsed();
+        assert_eq!(counters.failures(), 1);
+        assert_eq!(counters.successes(), 0);
+
+        // Same server, direct push: the error must be classified as a timeout
+        // (not EOF/reset), and it must respect the injected deadline.
+        let start = Instant::now();
+        let err = crate::metrics::push(&client, &url, &payload())
+            .await
+            .expect_err("stalled server must fail");
+        let elapsed = start.elapsed();
+        let reqwest_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<reqwest::Error>())
+            .expect("error chain must carry the reqwest error");
+        assert!(reqwest_err.is_timeout(), "must be a real timeout: {err:#}");
+        assert!(
+            elapsed >= timeout.saturating_sub(Duration::from_millis(100)),
+            "ended too early ({elapsed:?}) — looks like an immediate close, not a timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must end by the injected {timeout:?}, elapsed {elapsed:?}"
+        );
+        assert!(
+            production_elapsed < Duration::from_secs(2),
+            "production push also bounded by the client timeout"
+        );
+        // Timeout errors are redacted like every other push failure.
+        let shown = format!("{err:#}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("api_key"),
+            "{shown}"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle.join().expect("server thread must exit after stop");
     }
 }

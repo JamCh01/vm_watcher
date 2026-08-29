@@ -402,6 +402,25 @@ fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> 
 /// URL policy for the metrics endpoint, enforced with a real URL parser (no string
 /// prefix guessing): https anywhere; http only for loopback hosts unless the operator
 /// explicitly accepts insecure remote transport.
+/// Log/error-safe display of a metrics endpoint URL: scheme + host (+ explicit
+/// port) only. Userinfo, path, query and fragment may carry credentials or
+/// tokens and must never reach diagnostics. IPv6 hosts keep their bracketed
+/// form; default ports stay implicit. Unparseable input becomes a fixed
+/// placeholder — the raw value is never echoed back.
+pub fn safe_endpoint_display(raw: &str) -> String {
+    const PLACEHOLDER: &str = "<unparseable metrics endpoint>";
+    let Ok(url) = url::Url::parse(raw) else {
+        return PLACEHOLDER.to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return PLACEHOLDER.to_string();
+    };
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
 fn validate_metrics_url(raw: &str, allow_insecure_http: bool) -> Result<(), String> {
     use url::Host;
     let url = url::Url::parse(raw).map_err(|e| format!("metrics.url is not a valid URL: {e}"))?;
@@ -421,7 +440,10 @@ fn validate_metrics_url(raw: &str, allow_insecure_http: bool) -> Result<(), Stri
                 Ok(())
             } else {
                 Err(format!(
-                    "metrics.url {raw:?}: remote plain HTTP would send customer bandwidth                      figures unencrypted; use https:// or set allow_insecure_http = true                      to accept the risk"
+                    "metrics.url {}: remote plain HTTP would send customer bandwidth \
+                     figures unencrypted; use https:// or set allow_insecure_http = true \
+                     to accept the risk",
+                    safe_endpoint_display(raw)
                 ))
             }
         }
@@ -1088,5 +1110,63 @@ swl_map_max_entries = 999999",
         let text = format!("{POLICY_EXAMPLE}{dup}");
         let err = load_str(&text).unwrap_err();
         assert!(err.contains("duplicate override"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod safe_endpoint_display_tests {
+    use super::safe_endpoint_display;
+
+    #[test]
+    fn userinfo_path_query_and_fragment_never_leak() {
+        let shown = safe_endpoint_display(
+            "https://user:secret@example.com:8443/private/token?api_key=abc#frag",
+        );
+        assert_eq!(shown, "https://example.com:8443");
+        for secret in [
+            "user", "secret", "private", "token", "api_key", "abc", "frag",
+        ] {
+            assert!(!shown.contains(secret), "{secret:?} leaked in {shown}");
+        }
+    }
+
+    #[test]
+    fn plain_hosts_and_ports() {
+        assert_eq!(
+            safe_endpoint_display("http://127.0.0.1:8428"),
+            "http://127.0.0.1:8428"
+        );
+        assert_eq!(
+            safe_endpoint_display("http://localhost"),
+            "http://localhost"
+        );
+        assert_eq!(
+            safe_endpoint_display("https://metrics.example.com"),
+            "https://metrics.example.com"
+        );
+        // Default ports stay implicit.
+        assert_eq!(
+            safe_endpoint_display("https://example.com:443/x"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn ipv6_hosts_keep_brackets() {
+        assert_eq!(
+            safe_endpoint_display("http://[::1]:8428"),
+            "http://[::1]:8428"
+        );
+        assert_eq!(
+            safe_endpoint_display("https://[2001:db8::9]/push?k=secret"),
+            "https://[2001:db8::9]"
+        );
+    }
+
+    #[test]
+    fn malformed_input_becomes_a_fixed_placeholder() {
+        let shown = safe_endpoint_display("not a url \u{0000} with:secret@inside");
+        assert_eq!(shown, "<unparseable metrics endpoint>");
+        assert!(!shown.contains("secret"));
     }
 }

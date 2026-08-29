@@ -68,10 +68,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: AYA_BUILD_SKIP=1 cargo clippy --all-targets -- -D warnings
+        run: AYA_BUILD_SKIP=1 cargo clippy --all-targets --locked -- -D warnings
 
       - name: Unit tests
-        run: AYA_BUILD_SKIP=1 cargo test
+        run: AYA_BUILD_SKIP=1 cargo test --locked
 
   ebpf:
     name: eBPF build
@@ -128,10 +128,10 @@ jobs:
       - name: Clippy eBPF crate (deny warnings)
         run: |
           cargo +nightly-2026-06-15 clippy -p vm-bandwidth-ebpf \
-            --target bpfel-unknown-none -Z build-std=core -- -D warnings
+            --target bpfel-unknown-none -Z build-std=core --locked -- -D warnings
 
       - name: Build release binary (including eBPF object)
-        run: VM_BW_EBPF_TOOLCHAIN=nightly-2026-06-15 cargo build --release
+        run: VM_BW_EBPF_TOOLCHAIN=nightly-2026-06-15 cargo build --release --locked
 
       - name: Upload binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

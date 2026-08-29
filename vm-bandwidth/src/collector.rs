@@ -169,7 +169,7 @@ impl Delta {
 
 pub struct Collector {
     prev: HashMap<TrafficKey, TrafficValue>,
-    totals: HashMap<u32, IpStats>,
+    pub(crate) totals: HashMap<u32, IpStats>,
     prev6: HashMap<u32, TrafficValue>,
     /// Running IPv6 aggregate (cumulative counters + last-interval rates).
     ipv6: IpStats,

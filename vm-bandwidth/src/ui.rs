@@ -95,7 +95,8 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         if cfg.metrics_enabled {
             println!(
                 "metrics: querying {} (refresh {}s)",
-                cfg.metrics_url, cfg.metrics_push_interval_secs
+                vm_bandwidth_core::config::safe_endpoint_display(&cfg.metrics_url),
+                cfg.metrics_push_interval_secs
             );
         }
     }
@@ -556,7 +557,7 @@ async fn fetch_series(
         ])
         .send()
         .await
-        .map_err(|e| format!("metrics GET failed: {e}"))?;
+        .map_err(|e| format!("metrics GET failed: {}", e.without_url()))?;
     let status = resp.status();
     let body = crate::metrics::body_capped(resp)
         .await
