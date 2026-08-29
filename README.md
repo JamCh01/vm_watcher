@@ -171,7 +171,17 @@ acknowledge_external_anti_spoofing = true # 确认外部反欺骗已部署
 2. IPv6 源地址是否同样受控（隐私地址/SLAAC 轮换使逐地址绑定更困难，至少限制
    前缀范围）；
 3. 规则对 TAP 重建/迁移后仍然生效（规则挂在接口名还是桥端口上，谁负责同步）；
-4. 变更由谁负责：虚拟化平台、宿主防火墙，还是本配置——写进运维文档。
+   TAP 重建会更换 ifindex，任何按 ifindex 绑定的强制（netdev 钩子、XDP）都会
+   失效。daemon 在检测到重建时输出 `SECURITY` 告警并累计
+   `antispoof_reapply_alerts_total`（IPC `Status` 与 `vmbw_antispoof_reapply_alerts_total`
+   指标），但**重挂规则是平台的责任**——本程序不持有反欺骗；
+4. 变更由谁负责：虚拟化平台、宿主防火墙，还是本配置——写进运维文档；
+5. **强制点必须位于 TC ingress 钩子之前**（XDP 或等效的驱动层位置）。实测钩子顺序：
+   TC ingress（本程序计数/限速所在）先于 nftables netdev-ingress 链——放在
+   netdev-ingress 的反欺骗丢包**晚于**计数，伪造帧仍会先消耗受害 IP 的限速预算：
+   实验室裁决中这使受害者合法吞吐下降 70.7%（攻击帧本身 100% 被丢弃）。XDP 在
+   TC 之前，参考实现与部署验证见 `scripts/antispoof-xdp/`，裁决证据与验证步骤见
+   `docs/antispoof-boundary.md`。
 
 隔离双 TAP 欺骗验证方案见 `docs/kernel-validation.md`（只在一次性测试环境执行）。
 IPC `Status` 暴露 `anti_spoof_mode`/`anti_spoof_enforced_by_program`（当前恒为
