@@ -164,6 +164,13 @@ struct Engine {
     /// neither attempts nor failures (they are retried by a later scan).
     /// Engine-owned, updated only by the engine task.
     tap_attach_failures_total: u64,
+    /// TAP RECREATIONS observed since daemon start (same name, new ifindex).
+    /// Each recreation kills any external per-ifindex enforcement (anti-spoofing
+    /// rules) until the platform re-applies it, so every event is warned with a
+    /// SECURITY log and counted here for IPC/metrics observability. This program
+    /// does not (and by design cannot) re-apply external enforcement itself.
+    /// Engine-owned, updated only by the engine task.
+    antispoof_reapply_alerts_total: u64,
     /// Counter-map keys whose removal failed transiently; retried on every TAP
     /// rescan (bounded maintenance cycle) until removed or confirmed absent.
     pending_removes: PendingRemovals,
@@ -299,6 +306,7 @@ impl Engine {
         ));
         lines.push_str(&crate::metrics::render_prom_lines_process(
             self.tap_attach_failures_total,
+            self.antispoof_reapply_alerts_total,
             self.push_counters.successes(),
             self.push_counters.failures(),
             self.push_counters.skipped(),
@@ -331,8 +339,18 @@ impl Engine {
     fn rescan_taps(&mut self) {
         match interface::discover_taps(&self.bridge) {
             Ok(found) => {
-                let (added, failed) = self.manager.reconcile(&found);
+                let (added, failed, recreated) = self.manager.reconcile(&found);
                 self.tap_attach_failures_total += failed as u64;
+                if !recreated.is_empty() {
+                    self.antispoof_reapply_alerts_total += recreated.len() as u64;
+                    log::warn!(
+                        "SECURITY: TAP(s) {} recreated with a NEW ifindex — external \
+                         anti-spoofing rules bound to the OLD ifindex are INACTIVE on \
+                         them until the platform re-applies them \
+                         (see docs/antispoof-boundary.md)",
+                        recreated.join(", ")
+                    );
+                }
                 if added > 0 || failed > 0 {
                     log::info!("scan: {added} attached, {failed} failed");
                 }
@@ -640,6 +658,7 @@ impl Engine {
             dataplane_degraded: self.rollback_health.degraded,
             rollback_failures_total: self.rollback_health.failures_total,
             tap_attach_failures_total: self.tap_attach_failures_total,
+            antispoof_reapply_alerts_total: self.antispoof_reapply_alerts_total,
             metrics_push_successes_total: self.push_counters.successes(),
             metrics_push_failures_total: self.push_counters.failures(),
             metrics_push_skipped_total: self.push_counters.skipped(),
@@ -1280,7 +1299,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     let mut startup_attach_failures = 0usize;
     match interface::discover_taps(&cfg.bridge) {
         Ok(found) => {
-            let (added, failed) = manager.reconcile(&found);
+            let (added, failed, _recreated) = manager.reconcile(&found);
             startup_attach_failures = failed;
             log::info!("initial scan: {added} TAP(s) attached, {failed} failed");
             taps = manager.taps();
@@ -1327,6 +1346,7 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         http: crate::metrics::client(),
         push_counters: Arc::new(PushCounters::new()),
         tap_attach_failures_total: startup_attach_failures as u64,
+        antispoof_reapply_alerts_total: 0,
         pending_removes: PendingRemovals::default(),
         epoch: std::time::Instant::now(),
     };
