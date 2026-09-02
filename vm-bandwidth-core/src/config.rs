@@ -186,6 +186,13 @@ pub struct DisplayConfig {
     pub show_interface: bool,
     #[serde(default)]
     pub show_packets: bool,
+    /// Enumerate EVERY address of every configured range in IPC/UI, including
+    /// addresses that never showed traffic (they appear as zero rows). Off by
+    /// default: ranges can be arbitrarily large, and enumerating millions of
+    /// zero rows per poll is the operator's deliberate trade-off; ranges larger
+    /// than the collector's idle-enumeration cap stay observation-only anyway.
+    #[serde(default)]
+    pub show_idle_ips: bool,
     #[serde(default = "default_sort")]
     pub default_sort: String,
 }
@@ -199,6 +206,7 @@ impl Default for DisplayConfig {
         Self {
             show_interface: false,
             show_packets: false,
+            show_idle_ips: false,
             default_sort: default_sort(),
         }
     }
@@ -468,6 +476,7 @@ pub struct ValidatedConfig {
     pub swl_map_max_entries: u32,
     pub show_interface: bool,
     pub show_packets: bool,
+    pub show_idle_ips: bool,
     pub default_sort: SortMode,
     /// VictoriaMetrics export (validated `[metrics]` section).
     pub metrics_enabled: bool,
@@ -621,6 +630,7 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         swl_map_max_entries: config.collector.swl_map_max_entries,
         show_interface: config.display.show_interface,
         show_packets: config.display.show_packets,
+        show_idle_ips: config.display.show_idle_ips,
         default_sort,
         metrics_enabled: metrics.enabled,
         metrics_url: metrics.url.trim_end_matches('/').to_string(),
@@ -693,6 +703,7 @@ range = "10.0.0.1-10.0.0.2"
         assert_eq!(cfg.map_max_entries, 8192);
         assert!(!cfg.show_interface);
         assert!(!cfg.show_packets);
+        assert!(!cfg.show_idle_ips);
     }
 
     #[test]
@@ -721,6 +732,13 @@ name = "A"
 range = "10.0.0.1-10.0.0.2"
 "#;
         assert!(load_str(text).is_ok());
+    }
+
+    #[test]
+    fn show_idle_ips_flag_parses() {
+        let text = "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n[display]\nshow_idle_ips = true\n\n[[ip_ranges]]\nname = \"A\"\nrange = \"10.0.0.1-10.0.0.4\"\n";
+        let cfg = load_str(text).unwrap();
+        assert!(cfg.show_idle_ips);
     }
 
     #[test]

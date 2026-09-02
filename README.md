@@ -108,6 +108,8 @@ map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / LIMIT_STATE / SWL
 
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
+# show_idle_ips = true            # 可选：枚举段内全部 IP（含零流量，显示 0 值行）。
+                                  # 默认关闭：段可以任意大，超过 4096 个地址的段即使开启也不枚举
 
 [metrics]                         # 可选：历史趋势（VictoriaMetrics）
 enabled = false
