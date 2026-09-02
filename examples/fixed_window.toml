@@ -1,0 +1,28 @@
+# Fixed Window — hard byte budget per window.
+#
+# Every fixed window of length `limit_window` gets a budget of
+# `limit × limit_window` bytes; packets are admitted until the budget is
+# exhausted, then dropped until the next window starts. Simplest mental
+# model and the strictest per-window cap, but up to 2× the nominal rate can
+# pass across a window boundary (classic fixed-window edge effect).
+
+[network]
+bridge = "br0"
+
+[collector]
+refresh_interval_ms = 1000
+
+[[ip_ranges]]
+name = "example-range"
+range = "10.0.0.1-10.0.0.16"
+
+  [ip_ranges.policy]
+  algorithm      = "fixed_window"
+  rx_threshold   = "1Gbps"
+  tx_threshold   = "1Gbps"
+  window         = "5m"
+  trigger_ratio  = "80%"
+  rx_limit       = "500Mbps"   # budget rate: budget = limit × limit_window
+  tx_limit       = "500Mbps"
+  limit_duration = "30m"
+  limit_window   = "1s"        # window length (1s–60s)

@@ -1,0 +1,28 @@
+# Token Bucket — classic RFC-style policer.
+#
+# Tokens refill at the configured rate; every packet spends its byte length
+# in tokens; a packet is dropped when the bucket cannot pay for it. The
+# bucket capacity is `burst`, which bounds how much traffic may pass in a
+# short surge after an idle period. Predictable, widely understood; the
+# natural choice when a downstream system expects token-bucket semantics.
+
+[network]
+bridge = "br0"
+
+[collector]
+refresh_interval_ms = 1000
+
+[[ip_ranges]]
+name = "example-range"
+range = "10.0.0.1-10.0.0.16"
+
+  [ip_ranges.policy]
+  algorithm      = "token_bucket"
+  rx_threshold   = "1Gbps"
+  tx_threshold   = "1Gbps"
+  window         = "5m"
+  trigger_ratio  = "80%"
+  rx_limit       = "500Mbps"   # token refill rate
+  tx_limit       = "500Mbps"
+  limit_duration = "30m"
+  burst          = "4MiB"      # bucket capacity (max surge)

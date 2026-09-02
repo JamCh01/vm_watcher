@@ -28,7 +28,6 @@ push_interval_secs = 60           # 推送周期（5..=3600）
 [experimental]
 enable_sliding_window_log = false
 
-# 注：旧版的 `[security]` 段（反欺骗确认）已移除——该段仍可被解析但被忽略。
 # 本程序按报文源地址计数和限速、无法验证源地址归属，是已知限制，见 README
 # 「已知限制：源地址信任」。
 
@@ -52,7 +51,7 @@ enable_sliding_window_log = false
 #     burst          = "4MiB"     # GCRA 瞬时突发容忍量
 #
 # 单台机器例外用 [[ip_ranges.overrides]]（写在所属段内部，未写字段继承段策略）。
-# 完整字段说明、触发语义、热加载行为见 README「限速策略配置详解」。
+# 完整字段说明、触发语义、热加载行为见 README「限速」章节与 examples/ 目录。
 # ============================================================
 
 [[ip_ranges]]

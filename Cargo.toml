@@ -6,6 +6,7 @@ default-members = ["vm-bandwidth", "vm-bandwidth-common", "vm-bandwidth-core"]
 [workspace.package]
 version = "0.7.0"
 edition = "2021"
+license = "MIT"
 
 [profile.release.package.vm-bandwidth-ebpf]
 debug = 2

@@ -51,7 +51,7 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
-    pub security: SecurityConfig,
+    pub security: LegacyConfigSection,
     #[serde(default)]
     pub experimental: ExperimentalConfig,
     #[serde(default, rename = "ip_ranges")]
@@ -109,20 +109,10 @@ impl Default for CollectorConfig {
     }
 }
 
-/// Vestigial `[security]` section: accepted and IGNORED. Anti-spoofing tooling and
-/// its startup acknowledgement gate were removed as out of the program's scope
-/// (2026-08-30 decision). The section stays parseable so existing configs keep
-/// loading; nothing reads it. Note the unchanged underlying fact: this program
-/// counts and limits by packet source address and cannot verify TAP ownership —
-/// see README "known limitation".
+/// Legacy config section kept parseable for compatibility with older config
+/// files; its content is ignored entirely.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SecurityConfig {
-    #[serde(default)]
-    pub ip_ownership: String,
-    #[serde(default)]
-    pub acknowledge_external_anti_spoofing: bool,
-}
+pub struct LegacyConfigSection {}
 
 /// Capability switches for features that are expensive or experimental. Sliding
 /// Window Log is deliberately NOT a normal algorithm choice: every packet scans a
@@ -554,8 +544,8 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         }
     }
 
-    // Security contract removed (2026-08-30): `[security]` is vestigial — parsed
-    // and ignored so existing configs keep loading; absence is equally fine.
+    // Legacy config section: parsed and ignored for old-config compatibility;
+    // its absence is equally fine.
 
     let ranges = validate_ranges(&config.ip_ranges)?;
 
@@ -647,8 +637,6 @@ mod tests {
 [network]
 bridge = "br0"
 
-[security]
-acknowledge_external_anti_spoofing = true
 
 [collector]
 refresh_interval_ms = 1000
@@ -690,8 +678,6 @@ range = "10.30.9.1-10.30.9.16"
 [network]
 bridge = "br0"
 
-[security]
-acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "A"
@@ -707,15 +693,14 @@ range = "10.0.0.1-10.0.0.2"
     }
 
     #[test]
-    fn security_section_is_vestigial_and_ignored() {
-        // With the section: parses, loads, nothing reads it.
+    fn legacy_section_is_parsed_and_ignored() {
+        // With the legacy section present: parses, loads, nothing reads it.
         let text = r#"
 [network]
 bridge = "br0"
 
 [security]
-ip_ownership = "anything"
-acknowledge_external_anti_spoofing = false
+anything = "whatever"
 
 [[ip_ranges]]
 name = "A"
@@ -835,8 +820,7 @@ url = \"{url}\"
 
     #[test]
     fn rejects_missing_ranges() {
-        let text =
-            "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n";
+        let text = "[network]\nbridge = \"br0\"\n";
         let err = load_str(text).unwrap_err();
         assert!(err.contains("[[ip_ranges]]"), "{err}");
     }
@@ -858,7 +842,7 @@ url = \"{url}\"
         // The whitelist is an LPM trie of CIDR prefixes: range size no longer costs
         // one map entry per address, so large ranges are valid.
         let text =
-            "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
+            "[network]\nbridge = \"br0\"\n\n[[ip_ranges]]\nname = \"huge\"\nrange = \"192.0.0.0-195.255.255.255\"\n";
         assert!(load_str(text).is_ok());
     }
 
@@ -866,8 +850,6 @@ url = \"{url}\"
 [network]
 bridge = "br0"
 
-[security]
-acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "Range-A"
@@ -921,8 +903,6 @@ range = "10.30.8.1-10.30.8.16"
 [network]
 bridge = "br0"
 
-[security]
-acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "A"
@@ -966,8 +946,6 @@ range = "10.0.0.1-10.0.0.2"
 [network]
 bridge = "br0"
 
-[security]
-acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "Range-A"
@@ -1007,8 +985,6 @@ enable_sliding_window_log = true
 [network]
 bridge = "br0"
 
-[security]
-acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "Range-A"
