@@ -368,19 +368,14 @@ impl AttachManager {
     }
 
     /// Converge attachments onto `found`. A single failing attach never affects the
-    /// rest; it is logged and retried on the next scan. Returns `(added, failed,
-    /// recreated)` where `recreated` lists TAPs that were attached under the same
-    /// name but with a DIFFERENT ifindex — i.e. the device was deleted and
-    /// re-created. Callers treat that as a security-relevant event: any external
-    /// per-ifindex enforcement (e.g. anti-spoofing rules) is dead on the new
-    /// ifindex until it is re-applied.
-    pub fn reconcile(&mut self, found: &[Tap]) -> (usize, usize, Vec<String>) {
+    /// rest; it is logged and retried on the next scan. Returns `(added, failed)`.
+    pub fn reconcile(&mut self, found: &[Tap]) -> (usize, usize) {
         let attached_view: Vec<(String, u32)> = self
             .attached
             .values()
             .map(|a| (a.tap.name.clone(), a.tap.ifindex))
             .collect();
-        let (to_detach, to_add, recreated) = reconcile_plan(&attached_view, found);
+        let (to_detach, to_add) = reconcile_plan(&attached_view, found);
 
         for name in &to_detach {
             match found.iter().find(|t| t.name == *name) {
@@ -422,7 +417,7 @@ impl AttachManager {
                 }
             }
         }
-        (added, failed, recreated)
+        (added, failed)
     }
 
     fn attach(
@@ -513,13 +508,8 @@ fn flow_error(e: AttachFlowError, tap: &Tap) -> anyhow::Error {
 }
 
 /// Pure reconcile decision, split out for unit tests: which attached TAPs to detach
-/// (removed, or recreated with a new ifindex), which found TAPs to attach, and which
-/// detach names are RECREATIONS (device still exists under a new ifindex) as opposed
-/// to plain removals.
-fn reconcile_plan(
-    attached: &[(String, u32)],
-    found: &[Tap],
-) -> (Vec<String>, Vec<Tap>, Vec<String>) {
+/// (removed, or recreated with a new ifindex) and which found TAPs to attach.
+fn reconcile_plan(attached: &[(String, u32)], found: &[Tap]) -> (Vec<String>, Vec<Tap>) {
     let to_detach: Vec<String> = attached
         .iter()
         .filter(|(name, ifindex)| {
@@ -531,11 +521,6 @@ fn reconcile_plan(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    let recreated: Vec<String> = to_detach
-        .iter()
-        .filter(|name| found.iter().any(|t| &t.name == *name))
-        .cloned()
-        .collect();
     let to_add: Vec<Tap> = found
         .iter()
         .filter(|t| match attached.iter().find(|(n, _)| n == &t.name) {
@@ -544,7 +529,7 @@ fn reconcile_plan(
         })
         .cloned()
         .collect();
-    (to_detach, to_add, recreated)
+    (to_detach, to_add)
 }
 
 impl Drop for AttachManager {
@@ -756,10 +741,9 @@ mod tests {
             name: "tap0".into(),
             ifindex: 7,
         }];
-        let (to_detach, to_add, recreated) = reconcile_plan(&attached, &found);
+        let (to_detach, to_add) = reconcile_plan(&attached, &found);
         assert!(to_detach.is_empty());
         assert!(to_add.is_empty());
-        assert!(recreated.is_empty());
     }
 
     // 10. Removed TAPs detach; ifindex changes re-attach; unchanged TAPs are skipped.
@@ -776,14 +760,10 @@ mod tests {
                 ifindex: 4,
             },
         ];
-        let (to_detach, to_add, recreated) = reconcile_plan(&attached, &found);
+        let (to_detach, to_add) = reconcile_plan(&attached, &found);
         assert_eq!(to_detach, vec!["gone".to_string(), "moved".to_string()]);
         let added: Vec<&str> = to_add.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(added, vec!["moved", "fresh"]);
-        // A recreation is a detach name that still exists under a new ifindex; a
-        // plain removal is not. The split is what lets callers raise the
-        // external-enforcement alert exactly on recreations.
-        assert_eq!(recreated, vec!["moved".to_string()]);
     }
 
     // Backoff: failures double the wait (capped), success clears it.

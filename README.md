@@ -148,46 +148,14 @@ range = "10.30.8.1-10.30.8.16"
   （5..=3600）秒向 `url` 推送一次累计计数器；`url` 仅支持 `http://`（内置客户端
   无 TLS，本机部署即可）。未启用时不产生任何出站请求。
 
-## 安全前提（反 IP 欺骗）
+## 已知限制：源地址信任
 
 本程序按报文**源地址**计数与限速，但没有 VM 清单、也没有可信的 TAP→IP 绑定来源，
-因此**无法**验证某个源地址是否属于它到达的 TAP。源地址反欺骗必须由**外部**强制，
-这是运行本程序的硬性前提，配置里以 `[security]` 显式确认（未确认时 daemon 拒绝启动）：
-
-```toml
-[security]
-ip_ownership = "external"                 # 目前唯一支持的模式
-acknowledge_external_anti_spoofing = true # 确认外部反欺骗已部署
-```
-
-未部署反欺骗时的风险：VM 可伪造其他受监控 IP 的源地址——污染其统计/计费，或消耗
-其限速预算（触发其 LIMITED）。本程序的 `LimitKey` 故意不含 ifindex（同 IP 跨 TAP
-共享一份预算），把 ifindex 加进 key 并不能解决欺骗，只是拆分预算。
-
-**部署检查清单**（由平台侧负责，逐项确认后再设 `acknowledge = true`）：
-
-1. 每台 VM 的 TAP 是否限制其可用源 IPv4（Linux bridge + `ebtables/nftables`
-   `ether saddr`/`ip saddr` 绑定，或 Proxmox 防火墙的 `-ipfilter`/IPSet）；
-2. IPv6 源地址是否同样受控（隐私地址/SLAAC 轮换使逐地址绑定更困难，至少限制
-   前缀范围）；
-3. 规则对 TAP 重建/迁移后仍然生效（规则挂在接口名还是桥端口上，谁负责同步）；
-   TAP 重建会更换 ifindex，任何按 ifindex 绑定的强制（netdev 钩子、XDP）都会
-   失效。daemon 在检测到重建时输出 `SECURITY` 告警并累计
-   `antispoof_reapply_alerts_total`（IPC `Status` 与 `vmbw_antispoof_reapply_alerts_total`
-   指标），但**重挂规则是平台的责任**——本程序不持有反欺骗；
-4. 变更由谁负责：虚拟化平台、宿主防火墙，还是本配置——写进运维文档；
-5. **强制点必须位于 TC ingress 钩子之前**（XDP 或等效的驱动层位置）。实测钩子顺序：
-   TC ingress（本程序计数/限速所在）先于 nftables netdev-ingress 链——放在
-   netdev-ingress 的反欺骗丢包**晚于**计数，伪造帧仍会先消耗受害 IP 的限速预算：
-   实验室裁决中这使受害者合法吞吐下降 70.7%（攻击帧本身 100% 被丢弃）。XDP 在
-   TC 之前，参考实现与部署验证见 `scripts/antispoof-xdp/`，裁决证据与验证步骤见
-   `docs/antispoof-boundary.md`。
-
-隔离双 TAP 欺骗验证方案见 `docs/kernel-validation.md`（只在一次性测试环境执行）。
-IPC `Status` 暴露 `anti_spoof_mode`/`anti_spoof_enforced_by_program`（当前恒为
-false：非本程序强制）/`anti_spoof_acknowledged`，供工具核对契约。真正的严格
-TAP-IP 绑定（所有权数据源、VM 创建/迁移/换 IP 的同步、ifindex 变化、失败语义）
-是独立设计课题，不在当前范围内。
+因此**无法**验证某个源地址是否属于它到达的 TAP。若宿主/平台层未部署源地址反欺骗，
+VM 可以伪造其他受监控 IP 的源地址，污染其统计/计费或消耗其限速预算——本程序对此
+不做检测、不做强制，也不提供相关工具（反欺骗相关功能已于 2026-08-30 移出产品范围）。
+需要该保证的部署请自行在平台层落实源地址管控。旧配置中的 `[security]` 段仍可被
+解析但已被忽略。
 
 ## 限速策略配置详解
 

@@ -26,13 +26,9 @@ push_interval_secs = 60           # 推送周期（5..=3600）
 [experimental]
 enable_sliding_window_log = false
 
-# 安全契约（必填）：本程序按报文源地址计数和限速，但无法验证该源地址属于它到达的
-# TAP（没有 VM 清单，也没有可信的 TAP→IP 来源）。源地址反欺骗必须由外部强制：
-# Linux bridge 防火墙 / nftables / 虚拟化平台（如 Proxmox 防火墙），见 README
-# 「安全前提（反 IP 欺骗）」。未显式确认时 daemon 拒绝启动。
-[security]
-ip_ownership = "external"                 # 目前唯一支持的模式
-acknowledge_external_anti_spoofing = true # 操作员确认外部反欺骗已部署
+# 注：旧版的 `[security]` 段（反欺骗确认）已移除——该段仍可被解析但被忽略。
+# 本程序按报文源地址计数和限速、无法验证源地址归属，是已知限制，见 README
+# 「已知限制：源地址信任」。
 
 # ============================================================
 # 默认配置：仅监控带宽，不启用任何限速策略（各段都不写 [ip_ranges.policy]）。
