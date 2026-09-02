@@ -10,6 +10,8 @@ swl_map_max_entries = 256         # SWL_LOG 专用容量：每条 ≈16.4 KiB �
 
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
+# show_idle_ips = true            # 可选：枚举段内全部 IP（含零流量的 0 值行）；
+                                  # 超过 4096 个地址的段不枚举（保护轮询开销）
 
 # 历史趋势统计（可选）：把累计流量推送到 VictoriaMetrics，--ui 里选中 IP 按 Enter
 # 可查看 1h / 24h / 7d / 30d 的带宽与发包量趋势。VictoriaMetrics 部署见

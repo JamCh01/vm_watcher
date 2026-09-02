@@ -20,6 +20,9 @@ use vm_bandwidth_core::limiter::IpTotals;
 /// handles counter resets). This is what bounds the maps under IP churn — TAP
 /// recreation is additionally covered by the ifindex-based reclaim in rescan.
 pub const IDLE_EVICT_POLLS: u32 = 300; // ~5 minutes at the default 1s cadence
+/// Idle-enumeration cap for `show_idle_ips`: ranges with more addresses than
+/// this are never enumerated (millions of zero rows per poll would pin a core).
+pub const IDLE_ENUM_CAP: u64 = 4096;
 
 struct IdleTracker<K: Eq + std::hash::Hash> {
     counts: HashMap<K, u32>,
@@ -224,6 +227,7 @@ impl Collector {
         traffic6: &PerCpuHashMap<MapData, u32, TrafficValue>,
         policer: &PerCpuHashMap<MapData, LimitKey, PolicerStats>,
         ranges: &[IpRange],
+        show_idle_ips: bool,
     ) -> PollResult {
         let now = Instant::now();
         // 0.0 on the first poll: no previous sample, all rates zero.
@@ -289,7 +293,7 @@ impl Collector {
             cur6,
             cur_policer,
         };
-        self.apply_poll(inputs, elapsed_secs, ranges)
+        self.apply_poll(inputs, elapsed_secs, ranges, show_idle_ips)
     }
 
     /// Pure delta/rate math over one poll's aggregated map values. Split out of
@@ -300,6 +304,7 @@ impl Collector {
         inputs: PollInputs,
         elapsed_secs: f64,
         ranges: &[IpRange],
+        show_idle_ips: bool,
     ) -> PollResult {
         let PollInputs {
             cur,
@@ -466,6 +471,23 @@ impl Collector {
             rs.ips.push((ip, stats.clone()));
         }
 
+        // Option show_idle_ips: enumerate every address of each range so idle
+        // (never observed) addresses appear as zero rows instead of disappearing.
+        // Ranges above IDLE_ENUM_CAP stay observation-only — enumerating huge
+        // ranges every poll would pin a core for zero information.
+        if show_idle_ips {
+            for (rs, range) in snap_ranges.iter_mut().zip(ranges.iter()) {
+                if range.len() > IDLE_ENUM_CAP {
+                    continue;
+                }
+                for ip in range.start..=range.end {
+                    if !self.totals.contains_key(&ip) {
+                        rs.ips.push((ip, IpStats::default()));
+                    }
+                }
+            }
+        }
+
         let totals = self
             .totals
             .iter()
@@ -539,6 +561,102 @@ mod tests {
         assert!(t.observe(&present, &nothing).is_empty());
     }
 
+    // ---------- show_idle_ips enumeration tests (issue #8) ----------
+
+    fn four_range() -> IpRange {
+        IpRange {
+            name: "r".to_string(),
+            start: u32::from_be_bytes([10, 0, 0, 1]),
+            end: u32::from_be_bytes([10, 0, 0, 4]),
+        }
+    }
+
+    fn observed_input(k: TrafficKey, rx_bytes: u64) -> PollInputs {
+        PollInputs {
+            cur: HashMap::from([(
+                k,
+                TrafficValue {
+                    rx_bytes,
+                    ..Default::default()
+                },
+            )]),
+            cur6: HashMap::new(),
+            cur_policer: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn idle_ips_hidden_by_default_shown_with_flag() {
+        let range = four_range();
+        let k = TrafficKey {
+            ifindex: 5,
+            ipv4: u32::from_be_bytes([10, 0, 0, 2]),
+        };
+
+        // Flag off: only the observed address appears (pre-existing behavior).
+        // First poll establishes the baseline; the second produces the delta.
+        let mut c = Collector::new();
+        c.apply_poll(
+            observed_input(k, 100),
+            1.0,
+            std::slice::from_ref(&range),
+            false,
+        );
+        let r = c.apply_poll(
+            observed_input(k, 200),
+            1.0,
+            std::slice::from_ref(&range),
+            false,
+        );
+        assert_eq!(r.snapshot.ranges[0].ips.len(), 1);
+
+        // Flag on: all four addresses appear; the idle three are zero rows.
+        let mut c = Collector::new();
+        c.apply_poll(
+            observed_input(k, 100),
+            1.0,
+            std::slice::from_ref(&range),
+            true,
+        );
+        let r = c.apply_poll(
+            observed_input(k, 200),
+            1.0,
+            std::slice::from_ref(&range),
+            true,
+        );
+        let ips = &r.snapshot.ranges[0].ips;
+        assert_eq!(ips.len(), 4);
+        let observed = ips.iter().find(|(ip, _)| *ip == k.ipv4).unwrap();
+        assert_eq!(observed.1.rx_bytes, 100);
+        for (ip, s) in ips {
+            if *ip != k.ipv4 {
+                assert!(
+                    s.rx_bytes | s.tx_bytes | s.rx_packets | s.tx_packets == 0,
+                    "idle address {ip} must be a zero row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idle_enumeration_skips_ranges_above_the_cap() {
+        // 4097 addresses > IDLE_ENUM_CAP: never enumerated even with the flag,
+        // so a giant range cannot pin a core emitting zero rows every poll.
+        let big = IpRange {
+            name: "big".to_string(),
+            start: u32::from_be_bytes([10, 0, 0, 0]),
+            end: u32::from_be_bytes([10, 0, 0, 0]) + IDLE_ENUM_CAP as u32,
+        };
+        let inputs = PollInputs {
+            cur: HashMap::new(),
+            cur6: HashMap::new(),
+            cur_policer: HashMap::new(),
+        };
+        let mut c = Collector::new();
+        let r = c.apply_poll(inputs, 1.0, std::slice::from_ref(&big), true);
+        assert!(r.snapshot.ranges[0].ips.is_empty());
+    }
+
     // ---------- IPv6 per-TAP aggregation tests ----------
 
     /// One poll round feeding only aggregate IPv6 counters (keyed by TAP ifindex).
@@ -548,7 +666,7 @@ mod tests {
             cur6: cur6.iter().copied().collect(),
             cur_policer: HashMap::new(),
         };
-        c.apply_poll(inputs, 1.0, &[])
+        c.apply_poll(inputs, 1.0, &[], false)
     }
 
     // IPv6 counters are aggregated PER TAP: the key space grows with the number of
@@ -639,7 +757,7 @@ mod tests {
             start: 0,
             end: u32::MAX,
         };
-        c.apply_poll(inputs, 1.0, &[all])
+        c.apply_poll(inputs, 1.0, &[all], false)
     }
 
     fn ip_stats(r: &PollResult, ip: u32) -> &IpStats {

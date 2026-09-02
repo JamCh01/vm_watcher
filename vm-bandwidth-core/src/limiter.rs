@@ -458,6 +458,7 @@ mod tests {
             swl_map_max_entries: 256,
             show_interface: false,
             show_packets: false,
+            show_idle_ips: false,
             default_sort: SortMode::Ip,
             metrics_enabled: false,
             metrics_url: String::new(),

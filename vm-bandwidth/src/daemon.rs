@@ -177,7 +177,9 @@ impl Engine {
     }
 
     fn collect_tick(&mut self) {
-        let ranges = self.config.load().ip_ranges();
+        let cfg = self.config.load();
+        let ranges = cfg.ip_ranges();
+        let show_idle_ips = cfg.show_idle_ips;
         let PollResult {
             snapshot,
             totals,
@@ -185,9 +187,13 @@ impl Engine {
             policer,
             stale_traffic,
             stale_traffic6,
-        } = self
-            .collector
-            .poll(&self.traffic, &self.traffic6, &self.policer_stats, &ranges);
+        } = self.collector.poll(
+            &self.traffic,
+            &self.traffic6,
+            &self.policer_stats,
+            &ranges,
+            show_idle_ips,
+        );
         // Idle eviction: drop counter-map entries frozen long enough; the data path
         // recreates them on the next packet (reset-safe deltas, see collector).
         let idle4 = remove_counter_keys(
