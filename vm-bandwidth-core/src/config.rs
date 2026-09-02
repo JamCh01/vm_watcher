@@ -736,7 +736,7 @@ range = "10.0.0.1-10.0.0.2"
 
     #[test]
     fn show_idle_ips_flag_parses() {
-        let text = "[network]\nbridge = \"br0\"\n[security]\nacknowledge_external_anti_spoofing = true\n[display]\nshow_idle_ips = true\n\n[[ip_ranges]]\nname = \"A\"\nrange = \"10.0.0.1-10.0.0.4\"\n";
+        let text = "[network]\nbridge = \"br0\"\n[display]\nshow_idle_ips = true\n\n[[ip_ranges]]\nname = \"A\"\nrange = \"10.0.0.1-10.0.0.4\"\n";
         let cfg = load_str(text).unwrap();
         assert!(cfg.show_idle_ips);
     }
