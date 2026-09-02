@@ -292,8 +292,6 @@ cd dist && docker compose up -d     # 单节点，127.0.0.1:8428，保留 35 天
 
 ## 文档
 
-- [docs/development.md](docs/development.md) —— 开发工作流与 CI 门禁
 - [docs/kernel-validation.md](docs/kernel-validation.md) —— 一次性内核/数据面验证手册
 - [docs/production-validation.md](docs/production-validation.md) —— 生产验证记录
-- [docs/release.sh](docs/release.sh) —— 发布脚本（changelog → tag → 构建 → 发布）
 - [examples/](examples/) —— 各限速算法的可运行配置示例

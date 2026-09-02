@@ -319,8 +319,6 @@ cd dist && docker compose up -d     # シングルノード、127.0.0.1:8428、3
 
 ## ドキュメント
 
-- [docs/development.md](docs/development.md) — 開発ワークフローと CI ゲート
 - [docs/kernel-validation.md](docs/kernel-validation.md) — 使い捨てのカーネル/データプレーン検証手順書
 - [docs/production-validation.md](docs/production-validation.md) — 本番検証記録
-- [docs/release.sh](docs/release.sh) — リリースヘルパー（changelog → tag → ビルド → 公開）
 - [examples/](examples/) — アルゴリズムごとの動作するレート制限設定例

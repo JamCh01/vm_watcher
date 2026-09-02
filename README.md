@@ -331,8 +331,6 @@ This project is dual-licensed by component:
 
 ## Documentation
 
-- [docs/development.md](docs/development.md) — development workflow and CI gates
 - [docs/kernel-validation.md](docs/kernel-validation.md) — one-off kernel/dataplane validation playbook
 - [docs/production-validation.md](docs/production-validation.md) — production validation records
-- [docs/release.sh](docs/release.sh) — release helper (changelog → tag → build → publish)
 - [examples/](examples/) — runnable per-algorithm rate-limiting configs
