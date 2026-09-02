@@ -281,6 +281,15 @@ cd dist && docker compose up -d     # 单节点，127.0.0.1:8428，保留 35 天
 - 累计流量自本次启动起计（每次启动重建 map）。
 - 限速是 policing：超限直接丢包，不做缓冲/整形。
 
+## 许可证
+
+本项目按组件双许可：
+
+- **用户态 crates**（`vm-bandwidth`、`vm-bandwidth-core`、`vm-bandwidth-common`）——[MIT](LICENSE)
+- **eBPF 程序**（`vm-bandwidth-ebpf`）——[GPL-2.0-only](vm-bandwidth-ebpf/LICENSE)，
+  因为它使用了内核的 GPL-only helper（`bpf_spin_lock`）；Linux 内核要求调用
+  这类 helper 的程序声明 GPL 兼容许可。
+
 ## 文档
 
 - [docs/development.md](docs/development.md) —— 开发工作流与 CI 门禁

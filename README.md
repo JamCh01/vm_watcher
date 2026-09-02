@@ -320,6 +320,15 @@ semantics.
 - Enforcement is policing: excess packets are dropped, never buffered or
   shaped.
 
+## License
+
+This project is dual-licensed by component:
+
+- **Userspace crates** (`vm-bandwidth`, `vm-bandwidth-core`, `vm-bandwidth-common`) — [MIT](LICENSE)
+- **eBPF program** (`vm-bandwidth-ebpf`) — [GPL-2.0-only](vm-bandwidth-ebpf/LICENSE),
+  because it uses GPL-only kernel helpers (`bpf_spin_lock`); the Linux kernel
+  requires GPL-compatible programs to call them.
+
 ## Documentation
 
 - [docs/development.md](docs/development.md) — development workflow and CI gates

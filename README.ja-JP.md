@@ -308,6 +308,15 @@ cd dist && docker compose up -d     # シングルノード、127.0.0.1:8428、3
 - 適用は policing：超過パケットはドロップされ、バッファリングやシェーピングは
   行いません。
 
+## ライセンス
+
+本プロジェクトはコンポーネントごとのデュアルライセンスです：
+
+- **ユーザ空間クレート**（`vm-bandwidth`、`vm-bandwidth-core`、`vm-bandwidth-common`）— [MIT](LICENSE)
+- **eBPF プログラム**（`vm-bandwidth-ebpf`）— [GPL-2.0-only](vm-bandwidth-ebpf/LICENSE)。
+  GPL-only のカーネルヘルパー（`bpf_spin_lock`）を使用しており、Linux カーネルは
+  そのようなヘルパーを呼び出すプログラムに GPL 互換ライセンスを要求するためです。
+
 ## ドキュメント
 
 - [docs/development.md](docs/development.md) — 開発ワークフローと CI ゲート
