@@ -176,7 +176,6 @@ struct HeaderLine {
 }
 
 const PRIO_PLAIN: u8 = 1;
-const PRIO_SPOOF: u8 = 2;
 const PRIO_NOTE: u8 = 3;
 const PRIO_CONFIG_FAILURE: u8 = 4;
 const PRIO_WATCHER: u8 = 5;
@@ -185,13 +184,12 @@ const PRIO_ERROR: u8 = 7;
 
 // The keep-priority ladder, pinned at compile time: daemon error > dataplane
 // degraded > watcher unhealthy > config/reload failure > protocol warning >
-// anti-spoof warning > plain info.
+// plain info.
 const _: () = {
     assert!(PRIO_ERROR > PRIO_DEGRADED);
     assert!(PRIO_DEGRADED > PRIO_CONFIG_FAILURE);
     assert!(PRIO_CONFIG_FAILURE > PRIO_NOTE);
-    assert!(PRIO_NOTE > PRIO_SPOOF);
-    assert!(PRIO_SPOOF > PRIO_PLAIN);
+    assert!(PRIO_NOTE > PRIO_PLAIN);
 };
 
 /// Build every header line the current state asks for (no truncation here).
@@ -246,15 +244,6 @@ fn header_lines(app: &UiState) -> Vec<HeaderLine> {
         },
     ];
     if let Some(s) = status {
-        if !s.anti_spoof_acknowledged {
-            lines.push(HeaderLine {
-                prio: PRIO_SPOOF,
-                line: Line::from(Span::styled(
-                    "ANTI-SPOOF: external anti-spoofing not confirmed by this daemon",
-                    Style::default().fg(ratatui::style::Color::Yellow),
-                )),
-            });
-        }
         if !s.config_watcher_healthy {
             lines.push(HeaderLine {
                 prio: PRIO_WATCHER,
@@ -1087,7 +1076,6 @@ mod header_tests {
             config_watcher_last_error: "inotify failed".to_string(),
             dataplane_degraded: true,
             rollback_failures_total: 2,
-            anti_spoof_acknowledged: true,
             ..Default::default()
         }
     }
@@ -1103,7 +1091,6 @@ mod header_tests {
             bridge: "br0".to_string(),
             tap_count: 2,
             config_watcher_healthy: true,
-            anti_spoof_acknowledged: true,
             ..Default::default()
         }
     }
@@ -1229,20 +1216,6 @@ mod header_tests {
             "equal priorities must keep visual order:\n{text}"
         );
         assert!(!text.contains("protocol:"), "{text}");
-    }
-
-    #[test]
-    fn anti_spoof_warning_beats_plain_but_loses_to_protocol() {
-        let mut app = base_app();
-        let mut status = ok_status();
-        status.anti_spoof_acknowledged = false; // legacy daemon: unconfirmed
-        app.status = Some(status);
-        app.protocol_note = Some("daemon newer".to_string());
-        // 2 content rows: protocol (3) and anti-spoof (2) survive; plain lines drop.
-        let text = render(&mut app, 120, 6);
-        assert!(text.contains("protocol: daemon newer"), "{text}");
-        assert!(text.contains("ANTI-SPOOF"), "{text}");
-        assert!(!text.contains("VM Bandwidth Monitor"), "{text}");
     }
 }
 

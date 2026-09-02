@@ -109,36 +109,19 @@ impl Default for CollectorConfig {
     }
 }
 
-/// Trust contract for packet-source ownership. This program has no VM inventory and
-/// no trusted TAP→IP source, so it cannot verify that a packet's source address
-/// belongs to the TAP it arrived on. Anti-spoofing must therefore be enforced
-/// EXTERNALLY (bridge firewall / nftables / the virtualization platform); the config
-/// records the operator's explicit acknowledgement of that contract.
-#[derive(Debug, Clone, Deserialize)]
+/// Vestigial `[security]` section: accepted and IGNORED. Anti-spoofing tooling and
+/// its startup acknowledgement gate were removed as out of the program's scope
+/// (2026-08-30 decision). The section stays parseable so existing configs keep
+/// loading; nothing reads it. Note the unchanged underlying fact: this program
+/// counts and limits by packet source address and cannot verify TAP ownership —
+/// see README "known limitation".
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
-    /// Only `external` is supported: source-address anti-spoofing is enforced outside
-    /// this program. Any other value is rejected (there is no internal mode yet).
-    #[serde(default = "default_ip_ownership")]
+    #[serde(default)]
     pub ip_ownership: String,
-    /// Must be `true` for the daemon to start: the operator confirms that external
-    /// anti-spoofing is actually deployed for the bridged TAPs. A reload that drops
-    /// the acknowledgement is rejected like any validation error.
     #[serde(default)]
     pub acknowledge_external_anti_spoofing: bool,
-}
-
-fn default_ip_ownership() -> String {
-    "external".to_string()
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            ip_ownership: default_ip_ownership(),
-            acknowledge_external_anti_spoofing: false,
-        }
-    }
 }
 
 /// Capability switches for features that are expensive or experimental. Sliding
@@ -483,8 +466,6 @@ pub struct ValidatedConfig {
     pub interface_scan_interval_secs: u64,
     pub map_max_entries: u32,
     pub swl_map_max_entries: u32,
-    /// Anti-spoofing contract from `[security]` (validated above).
-    pub ip_ownership: String,
     pub show_interface: bool,
     pub show_packets: bool,
     pub default_sort: SortMode,
@@ -564,20 +545,8 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         }
     }
 
-    // Security contract: refuse to run without an explicit anti-spoofing
-    // acknowledgement (and refuse ownership modes this program does not have).
-    if config.security.ip_ownership != "external" {
-        return Err(format!(
-            "security.ip_ownership {:?} is not supported (only \"external\": anti-spoofing enforced outside this program)",
-            config.security.ip_ownership
-        ));
-    }
-    if !config.security.acknowledge_external_anti_spoofing {
-        return Err(
-            "security.acknowledge_external_anti_spoofing must be true: this program counts and limits by the packet's source address and CANNOT verify that the address belongs to the TAP it arrived on. Deploy source-address anti-spoofing on the bridge/platform (see README security prerequisites) and set [security] acknowledge_external_anti_spoofing = true"
-                .to_string(),
-        );
-    }
+    // Security contract removed (2026-08-30): `[security]` is vestigial — parsed
+    // and ignored so existing configs keep loading; absence is equally fine.
 
     let ranges = validate_ranges(&config.ip_ranges)?;
 
@@ -650,7 +619,6 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
         interface_scan_interval_secs: config.collector.interface_scan_interval_secs,
         map_max_entries: config.collector.map_max_entries,
         swl_map_max_entries: config.collector.swl_map_max_entries,
-        ip_ownership: config.security.ip_ownership.clone(),
         show_interface: config.display.show_interface,
         show_packets: config.display.show_packets,
         default_sort,
@@ -728,48 +696,31 @@ range = "10.0.0.1-10.0.0.2"
     }
 
     #[test]
-    fn security_acknowledgement_is_required() {
-        // No [security] section at all: refused.
+    fn security_section_is_vestigial_and_ignored() {
+        // With the section: parses, loads, nothing reads it.
         let text = r#"
 [network]
 bridge = "br0"
 
-[[ip_ranges]]
-name = "A"
-range = "10.0.0.1-10.0.0.2"
-"#;
-        let err = load_str(text).unwrap_err();
-        assert!(err.contains("acknowledge_external_anti_spoofing"), "{err}");
-
-        // Section present but acknowledgement false: refused.
-        let text = format!(
-            "{text}
 [security]
+ip_ownership = "anything"
 acknowledge_external_anti_spoofing = false
-"
-        );
-        let err = load_str(&text).unwrap_err();
-        assert!(err.contains("acknowledge_external_anti_spoofing"), "{err}");
-
-        // Acknowledged: accepted, ownership recorded.
-        let text = r#"
-[network]
-bridge = "br0"
-
-[security]
-acknowledge_external_anti_spoofing = true
 
 [[ip_ranges]]
 name = "A"
 range = "10.0.0.1-10.0.0.2"
 "#;
-        let cfg = load_str(text).unwrap();
-        assert_eq!(cfg.ip_ownership, "external");
+        assert!(load_str(text).is_ok());
+        // Without it: equally fine.
+        let text = r#"
+[network]
+bridge = "br0"
 
-        // Unsupported ownership modes are rejected explicitly.
-        let text = format!("{text}\nip_ownership = \"automatic\"\n");
-        let err = load_str(&text).unwrap_err();
-        assert!(err.contains("ip_ownership"), "{err}");
+[[ip_ranges]]
+name = "A"
+range = "10.0.0.1-10.0.0.2"
+"#;
+        assert!(load_str(text).is_ok());
     }
 
     #[test]

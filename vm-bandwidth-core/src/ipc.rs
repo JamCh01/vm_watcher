@@ -100,27 +100,12 @@ pub struct Status {
     ///   are current even in the payload.
     #[serde(default)]
     pub tap_attach_failures_total: u64,
-    /// TAP recreations seen since daemon start (same name, new ifindex). Each
-    /// event means external per-ifindex enforcement (anti-spoofing rules) is
-    /// INACTIVE on that TAP until the platform re-applies it; the daemon warns
-    /// with a SECURITY log line and counts the event here. 0 in steady state.
-    #[serde(default)]
-    pub antispoof_reapply_alerts_total: u64,
     #[serde(default)]
     pub metrics_push_successes_total: u64,
     #[serde(default)]
     pub metrics_push_failures_total: u64,
     #[serde(default)]
     pub metrics_push_skipped_total: u64,
-    /// Anti-spoofing contract (see config `[security]`): which mode is in effect,
-    /// whether THIS program enforces it (currently always false — external), and that
-    /// the operator acknowledgement is on file.
-    #[serde(default)]
-    pub anti_spoof_mode: String,
-    #[serde(default)]
-    pub anti_spoof_enforced_by_program: bool,
-    #[serde(default)]
-    pub anti_spoof_acknowledged: bool,
     /// Packets above the policer's MAX_POLICED_LEN that passed fail-open while a
     /// limit policy was armed (cumulative since daemon start). Nonzero values mean
     /// the environment can produce oversized frames at the TC hooks — see
@@ -306,7 +291,6 @@ mod tests {
                 // Additive operational fields: an older daemon omits them entirely
                 // and the client must read zeros, not an error.
                 assert_eq!(s.tap_attach_failures_total, 0);
-                assert_eq!(s.antispoof_reapply_alerts_total, 0);
                 assert_eq!(s.metrics_push_successes_total, 0);
                 assert_eq!(s.metrics_push_failures_total, 0);
                 assert_eq!(s.metrics_push_skipped_total, 0);
@@ -320,7 +304,6 @@ mod tests {
         let status = Status {
             protocol_version: PROTOCOL_VERSION,
             tap_attach_failures_total: 7,
-            antispoof_reapply_alerts_total: 2,
             metrics_push_successes_total: 100,
             metrics_push_failures_total: 3,
             metrics_push_skipped_total: 1,
@@ -331,7 +314,6 @@ mod tests {
         match back {
             Response::Status(s) => {
                 assert_eq!(s.tap_attach_failures_total, 7);
-                assert_eq!(s.antispoof_reapply_alerts_total, 2);
                 assert_eq!(s.metrics_push_successes_total, 100);
                 assert_eq!(s.metrics_push_failures_total, 3);
                 assert_eq!(s.metrics_push_skipped_total, 1);
