@@ -1,0 +1,28 @@
+# Leaky Bucket — dual view of the token bucket.
+#
+# The bucket fills with each packet's bytes and drains at the configured
+# rate; a packet is dropped when adding it would overflow the bucket
+# (capacity `burst`). Equivalent long-term behavior to token bucket with
+# inverted accounting; keep it when existing documentation or downstream
+# systems speak in leaky-bucket terms.
+
+[network]
+bridge = "br0"
+
+[collector]
+refresh_interval_ms = 1000
+
+[[ip_ranges]]
+name = "example-range"
+range = "10.0.0.1-10.0.0.16"
+
+  [ip_ranges.policy]
+  algorithm      = "leaky_bucket"
+  rx_threshold   = "1Gbps"
+  tx_threshold   = "1Gbps"
+  window         = "5m"
+  trigger_ratio  = "80%"
+  rx_limit       = "500Mbps"   # drain rate
+  tx_limit       = "500Mbps"
+  limit_duration = "30m"
+  burst          = "4MiB"      # bucket capacity

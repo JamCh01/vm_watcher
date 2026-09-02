@@ -1,0 +1,30 @@
+# GCRA (Generic Cell Rate Algorithm) — the DEFAULT algorithm.
+#
+# Virtual-scheduling policer: each flow carries a Theoretical Arrival Time
+# (TAT); a packet is admitted if the TAT it would produce stays within the
+# allowed tolerance, and it polices to the configured rate while admitting
+# bursts up to `burst`. One state word per flow, no window bookkeeping —
+# the cheapest and smoothest choice for general rate limiting.
+#
+# `algorithm` may be omitted entirely; "gcra" is shown here for clarity.
+
+[network]
+bridge = "br0"
+
+[collector]
+refresh_interval_ms = 1000
+
+[[ip_ranges]]
+name = "example-range"
+range = "10.0.0.1-10.0.0.16"
+
+  [ip_ranges.policy]
+  algorithm      = "gcra"
+  rx_threshold   = "1Gbps"     # observation threshold (per direction)
+  tx_threshold   = "1Gbps"
+  window         = "5m"        # rolling observation window
+  trigger_ratio  = "80%"       # enforcement arms at threshold × 80%
+  rx_limit       = "500Mbps"   # enforced rate once armed (per direction)
+  tx_limit       = "500Mbps"
+  limit_duration = "30m"       # enforcement time before auto-recovery
+  burst          = "4MiB"      # instantaneous burst tolerance

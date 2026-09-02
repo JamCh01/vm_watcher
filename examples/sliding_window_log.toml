@@ -1,0 +1,36 @@
+# Sliding Window Log — EXACT sliding window, opt-in.
+#
+# Keeps a bounded per-flow log of recent packets and computes the exact
+# sliding-window byte count; no boundary effects at all. The cost is real:
+# every packet scans the flow's log, and each flow reserves one fixed-size
+# map entry (16.4 KiB memlock each, see docs/kernel-validation.md §4).
+#
+# Gated behind an experimental switch on purpose; enable it AND raise the
+# map capacity for your expected flow count before using this algorithm.
+# At high packet rates the verdict is deliberately looser than the quota
+# (documented model behavior) — validate against your workload first.
+
+[network]
+bridge = "br0"
+
+[collector]
+refresh_interval_ms = 1000
+swl_map_max_entries = 8192     # one entry per policed flow; size for your fleet
+
+[experimental]
+enable_sliding_window_log = true   # required, or the config is rejected
+
+[[ip_ranges]]
+name = "example-range"
+range = "10.0.0.1-10.0.0.16"
+
+  [ip_ranges.policy]
+  algorithm      = "sliding_window_log"
+  rx_threshold   = "1Gbps"
+  tx_threshold   = "1Gbps"
+  window         = "5m"
+  trigger_ratio  = "80%"
+  rx_limit       = "500Mbps"
+  tx_limit       = "500Mbps"
+  limit_duration = "30m"
+  limit_window   = "1s"        # window length (1s–60s)

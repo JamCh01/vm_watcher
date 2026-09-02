@@ -1,0 +1,27 @@
+# Sliding Window Counter — weighted two-window approximation.
+#
+# Blends the current fixed window with the previous one (weighted by how far
+# into the current window we are) to approximate a true sliding window at
+# O(1) per-packet cost. Removes the fixed-window boundary burst almost
+# entirely while keeping the same tiny state footprint.
+
+[network]
+bridge = "br0"
+
+[collector]
+refresh_interval_ms = 1000
+
+[[ip_ranges]]
+name = "example-range"
+range = "10.0.0.1-10.0.0.16"
+
+  [ip_ranges.policy]
+  algorithm      = "sliding_window_counter"
+  rx_threshold   = "1Gbps"
+  tx_threshold   = "1Gbps"
+  window         = "5m"
+  trigger_ratio  = "80%"
+  rx_limit       = "500Mbps"
+  tx_limit       = "500Mbps"
+  limit_duration = "30m"
+  limit_window   = "1s"        # window length (1s–60s)

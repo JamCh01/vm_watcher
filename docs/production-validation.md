@@ -14,12 +14,10 @@
 
 | 项 | 结果 |
 |---|---|
-| 安全门（负） | 无 `[security]` 确认时 v0.7.0 拒绝启动，错误消息与代码一致 |
-| 安全门（正） | 确认后启动，`SECURITY: ip_ownership = "external"…` warn 日志 |
 | SWL 内存 | `bpftool map show`：`SWL_LOG` memlock `135,467,392 B`（v0.6.6，8192 条）→ `4,745,600 B`（v0.7.0，256 条），-96.5% |
 | IPv6 重键 | `TRAFFIC6` key 变为 4 B（u32 ifindex） |
 | OVERSIZED map | 存在（key 1 B，max_entries 4） |
-| IPC Status | `protocol_version=1`、`anti_spoof_*`、`swl_map_capacity/used`、`dataplane_degraded=false`、`oversized_*=0`、watcher healthy |
+| IPC Status | `protocol_version=1`、`swl_map_capacity/used`、`dataplane_degraded=false`、`oversized_*=0`、watcher healthy |
 | lockfile | 停机后保留（`LOCKFILE-PERSISTED`） |
 | 热加载 | 探针注释触发：generation `1 → 2`，0 错误 |
 | metrics | `sum(vmbw_rx_bytes_total)` 70 s 增长 ≈ 636 Mbit/s，与实际流量吻合 |
@@ -57,10 +55,9 @@
 
 | 项 | 结果 |
 |---|---|
-| 启动 | 11 IP 段、whitelist 50 CIDR 前缀覆盖 130 个 IPv4；`SECURITY: ip_ownership = "external"` warn |
+| 启动 | 11 IP 段、whitelist 50 CIDR 前缀覆盖 130 个 IPv4 |
 | 挂载 | 112 TAP 全部 TCX（ingress+egress 共 224 条），`initial scan: 112 attached, 0 failed` |
 | IPC Status | `protocol_version=1`、`generation=1`、`dataplane_degraded=false`、watcher healthy、`rollback_failures_total=0`、`tap_attach_failures_total=0` |
-| 新字段 | `antispoof_reapply_alerts_total=0` 存在（PR #6 新增；正例路径仅实验室验证过） |
 | metrics | 200s 观察窗内推送 1→4 成功、0 失败；VictoriaMetrics
   `sum(vmbw_tx_bytes_total)` 实时可查且与 TRAFFIC 总量吻合（推送周期内的正常滞后） |
 | 流量 | 观察窗内 `TRAFFIC` tx 累计 +14.6 GB / 200s ≈ **584 Mbit/s**，与生产流量量级吻合 |
@@ -74,15 +71,9 @@
 
 1. 观察窗内 `LIMIT_POLICIES` 无武装条目（流量低于所有触发阈值，当前配置无 policy），
    `oversized_* = 0` 依然**不能裁决 GSO/oversized**；需在武装窗口内读数。
-2. `antispoof_reapply_alerts_total` 的正例（TAP 重建触发告警）只在实验室验证；
-   生产观察窗内无重建事件，计数保持 0 属预期。观察窗内曾见新 TAP **创建**
-  （非重建），正确地未触发该计数。
-3. 外部反欺骗层在生产桥上的实际部署形态与有效性未在本次窗口内核查（保持开放）。
 
 ## 未验证（保持开放）
 
 - GSO/oversized 的真实裁决（需武装策略窗口）；
-- 外部反欺骗在生产桥/平台层的实际有效性（`kernel-validation.md` §5 方案）；
-- `antispoof_reapply_alerts_total` 生产正例（等待自然发生的 TAP 重建）；
 - <6.6 内核的 legacy TC 回退——**已放弃**（2026-08-30 决策：生产为 6.12 走 TCX，
   无旧内核环境，不再投入）。

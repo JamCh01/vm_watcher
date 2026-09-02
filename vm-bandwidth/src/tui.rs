@@ -233,7 +233,7 @@ fn header_lines(app: &UiState) -> Vec<HeaderLine> {
         },
         HeaderLine {
             // A successful reload / generation line is plain info and must not
-            // out-priority a protocol or anti-spoof warning; only an actual
+            // out-priority a protocol warning; only an actual
             // reload failure earns the config-failure priority.
             prio: if reload_failed {
                 PRIO_CONFIG_FAILURE
