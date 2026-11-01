@@ -64,6 +64,16 @@ pub struct TrendView {
     pub error: Option<String>,
 }
 
+impl TrendView {
+    /// The window or metric changed: drop what is shown (it belongs to the previous
+    /// selection and must not appear under the new title) and fetch again.
+    pub fn clear_for_new_selection(&mut self) {
+        self.data = None;
+        self.error = None;
+        self.fetched_at = None;
+    }
+}
+
 /// Everything the UI needs to render one frame.
 pub struct UiState {
     pub bridge: String,

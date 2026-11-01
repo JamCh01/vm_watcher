@@ -208,6 +208,20 @@ impl Drop for TerminalGuard {
 
 /// Fetch overview (and detail, when on the detail screen) from the daemon.
 fn poll(client: &mut Option<Client>, app: &mut UiState) {
+    // Trends come straight from VictoriaMetrics, not from the daemon: keep them fresh
+    // even while the daemon is unreachable (the early returns below).
+    if matches!(app.screen, Screen::Trend) {
+        let stale = app
+            .trend
+            .as_ref()
+            .and_then(|t| t.fetched_at)
+            .map(|t| t.elapsed() > Duration::from_secs(30))
+            .unwrap_or(true);
+        if stale {
+            fetch_trend(app);
+        }
+    }
+
     if client.is_none() {
         *client = Client::connect().ok();
         if client.is_some() {
@@ -248,18 +262,6 @@ fn poll(client: &mut Option<Client>, app: &mut UiState) {
             app.error = Some(format!("{e:#}"));
             *client = None;
             return;
-        }
-    }
-
-    if matches!(app.screen, Screen::Trend) {
-        let stale = app
-            .trend
-            .as_ref()
-            .and_then(|t| t.fetched_at)
-            .map(|t| t.elapsed() > Duration::from_secs(30))
-            .unwrap_or(true);
-        if stale {
-            fetch_trend(app);
         }
     }
 
@@ -319,7 +321,13 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
     }
     match key.code {
         KeyCode::Char('q') => return UiAction::Quit,
-        KeyCode::Char('r') => return UiAction::Refresh,
+        KeyCode::Char('r') => {
+            // On the trend screen, "refresh now" includes the VictoriaMetrics query.
+            if let Some(trend) = app.trend.as_mut().filter(|_| app.screen == Screen::Trend) {
+                trend.fetched_at = None;
+            }
+            return UiAction::Refresh;
+        }
         KeyCode::Char('h') if matches!(app.screen, Screen::Overview) => app.show_help = true,
         KeyCode::Up => match app.screen {
             Screen::Overview => {
@@ -357,7 +365,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
                 };
                 if next != trend.win {
                     trend.win = next;
-                    trend.fetched_at = None;
+                    trend.clear_for_new_selection();
                     return UiAction::Refresh;
                 }
             }
@@ -365,7 +373,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
         KeyCode::Right if matches!(app.screen, Screen::Trend) => {
             if let Some(trend) = app.trend.as_mut() {
                 trend.win = (trend.win + 1) % TREND_WINDOWS.len();
-                trend.fetched_at = None;
+                trend.clear_for_new_selection();
                 return UiAction::Refresh;
             }
         }
@@ -373,7 +381,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
             if let Some(trend) = app.trend.as_mut() {
                 if trend.kind != TrendKind::Bandwidth {
                     trend.kind = TrendKind::Bandwidth;
-                    trend.fetched_at = None;
+                    trend.clear_for_new_selection();
                     return UiAction::Refresh;
                 }
             }
@@ -382,7 +390,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
             if let Some(trend) = app.trend.as_mut() {
                 if trend.kind != TrendKind::Packets {
                     trend.kind = TrendKind::Packets;
-                    trend.fetched_at = None;
+                    trend.clear_for_new_selection();
                     return UiAction::Refresh;
                 }
             }
@@ -490,7 +498,8 @@ fn fetch_trend(app: &mut UiState) {
         return;
     };
     trend.fetched_at = Some(std::time::Instant::now());
-    trend.data = None;
+    // Keep showing the current chart until the new data arrives (no "Loading…" flash
+    // on every periodic refresh); a new window or metric already cleared it.
     trend.error = None;
 
     if !app.metrics_enabled {
@@ -668,6 +677,59 @@ mod tests {
             REFRESH,
             vm_bandwidth_core::config::SortMode::Ip,
         )
+    }
+
+    fn trend_screen_app() -> UiState {
+        let mut app = app();
+        app.screen = Screen::Trend;
+        app.trend = Some(TrendView {
+            target: ip([10, 0, 0, 1]),
+            from: Screen::Detail,
+            win: 0,
+            kind: TrendKind::Bandwidth,
+            data: Some(tui::TrendData::default()),
+            fetched_at: Some(std::time::Instant::now()),
+            error: None,
+        });
+        app
+    }
+
+    #[test]
+    fn trend_refresh_does_not_wait_for_the_daemon() {
+        let mut app = trend_screen_app();
+        app.trend.as_mut().unwrap().fetched_at = None; // due for a refresh
+                                                       // No daemon socket in the test environment: poll() reports it unreachable,
+                                                       // yet the trend (served by VictoriaMetrics) must still have been refreshed.
+        let mut client = None;
+        poll(&mut client, &mut app);
+        assert!(app.trend.as_ref().unwrap().fetched_at.is_some());
+    }
+
+    #[test]
+    fn switching_the_metric_drops_the_previous_selections_data() {
+        let mut app = trend_screen_app();
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(matches!(handle_key(&mut app, key), UiAction::Refresh));
+        let trend = app.trend.as_ref().unwrap();
+        assert!(trend.kind == TrendKind::Packets);
+        assert!(
+            trend.data.is_none(),
+            "bandwidth data must not be shown as pps"
+        );
+        assert!(trend.fetched_at.is_none());
+    }
+
+    #[test]
+    fn refresh_key_refetches_the_trend() {
+        let mut app = trend_screen_app();
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(matches!(handle_key(&mut app, key), UiAction::Refresh));
+        let trend = app.trend.as_ref().unwrap();
+        assert!(trend.fetched_at.is_none());
+        assert!(
+            trend.data.is_some(),
+            "the chart stays up until new data arrives"
+        );
     }
 
     #[test]
