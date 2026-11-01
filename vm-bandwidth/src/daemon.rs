@@ -25,6 +25,7 @@ use notify_debouncer_full::Debouncer;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::bytes::Bytes;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use vm_bandwidth_common::{
     LimitKey, LimitPolicy, LimitState, OversizedStats, PolicerStats, SwlRing, TrafficKey,
@@ -1756,7 +1757,7 @@ async fn send_response(
         let err_resp = Response::Error { message };
         let err_body =
             serde_json::to_vec(&err_resp).map_err(|e| SendFailure::Encode(e.to_string()))?;
-        if let Err(e) = sink.send(err_body.into()).await {
+        if let Err(e) = sink.send(Bytes::from(err_body)).await {
             return Err(SendFailure::Write(e.to_string()));
         }
         return Err(SendFailure::TooLarge {
@@ -1764,7 +1765,7 @@ async fn send_response(
             max: ipc::MAX_RESPONSE_FRAME,
         });
     }
-    sink.send(body.into())
+    sink.send(Bytes::from(body))
         .await
         .map_err(|e| SendFailure::Write(e.to_string()))
 }
