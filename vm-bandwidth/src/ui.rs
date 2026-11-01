@@ -522,7 +522,7 @@ fn fetch_trend(app: &mut UiState) {
         TrendKind::Bandwidth => " * 8",
         TrendKind::Packets => "",
     };
-    let rate_window = app.rate_window_secs;
+    let rate_window = trend_rate_window(app.rate_window_secs, step);
     let rx_query = trend_query(&trend.target, rx_metric, rate_window, scale);
     let tx_query = trend_query(&trend.target, tx_metric, rate_window, scale);
     let base = app.metrics_url.clone();
@@ -536,16 +536,26 @@ fn fetch_trend(app: &mut UiState) {
     });
 }
 
+/// The `rate()` window for a trend sampled every `step_secs`: at least the base
+/// window (two push intervals, never below two minutes) and at least one step, so
+/// each point summarizes the whole step before it. A window shorter than the step
+/// (2 minutes against the 15-minute to 3-hour steps of the long views) turns the
+/// chart into spot samples that miss everything in between.
+fn trend_rate_window(base_secs: u64, step_secs: u64) -> u64 {
+    base_secs.max(step_secs)
+}
+
 /// Build one PromQL expression for a trend series.
 ///
 /// The shape is load-bearing: `rate()` drops the metric name, so mixing both
 /// directions in one `{__name__=~...}` selector yields duplicate label sets that
-/// VictoriaMetrics rejects; and range trends must wrap the rate in `sum()` or each
-/// IP comes back as its own series.
+/// VictoriaMetrics rejects; and the rate is always wrapped in `sum()` so one series
+/// comes back — a range has a series per IP, and even one IP's series splits by its
+/// `range` label when a reload renames its range.
 fn trend_query(target: &TrendTarget, metric: &str, rate_window: u64, scale: &str) -> String {
     match target {
         TrendTarget::Ip(ipv4) => format!(
-            "rate({metric}{{ip=\"{}\"}}[{rate_window}s]){scale}",
+            "sum(rate({metric}{{ip=\"{}\"}}[{rate_window}s])){scale}",
             std::net::Ipv4Addr::from(*ipv4)
         ),
         TrendTarget::Range(name) => format!(
@@ -705,17 +715,33 @@ mod tests {
 
     #[test]
     fn ip_bandwidth_query_is_a_per_ip_rate_scaled_to_bits() {
+        // sum(): an IP whose range was renamed by a reload has one series per
+        // `range` label value; unsummed they came back as two interleaved series.
         let q = trend_query(&ip([10, 30, 10, 121]), "vmbw_rx_bytes_total", 120, " * 8");
         assert_eq!(
             q,
-            "rate(vmbw_rx_bytes_total{ip=\"10.30.10.121\"}[120s]) * 8"
+            "sum(rate(vmbw_rx_bytes_total{ip=\"10.30.10.121\"}[120s])) * 8"
         );
     }
 
     #[test]
     fn ip_packets_query_carries_no_scale() {
         let q = trend_query(&ip([10, 30, 10, 121]), "vmbw_rx_packets_total", 120, "");
-        assert_eq!(q, "rate(vmbw_rx_packets_total{ip=\"10.30.10.121\"}[120s])");
+        assert_eq!(
+            q,
+            "sum(rate(vmbw_rx_packets_total{ip=\"10.30.10.121\"}[120s]))"
+        );
+    }
+
+    #[test]
+    fn rate_window_covers_at_least_one_step() {
+        for (label, _, step) in TREND_WINDOWS {
+            let w = trend_rate_window(120, step);
+            assert!(w >= step, "{label}: window {w}s shorter than step {step}s");
+            assert!(w >= 120, "{label}: window {w}s below the base window");
+        }
+        assert_eq!(trend_rate_window(120, 60), 120);
+        assert_eq!(trend_rate_window(120, 10_800), 10_800);
     }
 
     #[test]
