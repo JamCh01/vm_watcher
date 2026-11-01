@@ -822,7 +822,7 @@ impl RollbackHealth {
             log::error!(
                 "rollback failed at '{}' for {}: {}",
                 f.op,
-                std::net::Ipv4Addr::from(f.key.ipv4),
+                f.target,
                 f.error
             );
         }
@@ -2058,6 +2058,7 @@ mod reload_commit_tests {
     use super::{apply_and_commit, ConfigArc};
     use crate::collector::{Collector, IpStats};
     use crate::txmaps::testmaps::{policy, FakeMaps, FakeWhitelist};
+    use crate::txmaps::RollbackTarget;
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2208,7 +2209,10 @@ burst = "1MiB"
         // are derived from exactly this report.
         assert!(!rb.report.dataplane_consistent);
         assert_eq!(rb.report.failures.len(), 1);
-        assert_eq!(rb.report.failures[0].key, LimitKey::new(IP1, DIR_RX));
+        assert_eq!(
+            rb.report.failures[0].target,
+            RollbackTarget::Flow(LimitKey::new(IP1, DIR_RX))
+        );
         assert_eq!(rb.report.failures[0].op, "re-arm removed policy");
         // Everything else rolled back cleanly on top of that one failure:
         // IP1/TX re-armed, both IP2 directions restored to the old policy.
@@ -2320,7 +2324,15 @@ burst = "1MiB"
         for f in &rb.report.failures {
             assert_eq!(f.op, "re-arm removed policy");
         }
-        let mut failed_keys: Vec<_> = rb.report.failures.iter().map(|f| f.key).collect();
+        let mut failed_keys: Vec<_> = rb
+            .report
+            .failures
+            .iter()
+            .map(|f| match f.target {
+                RollbackTarget::Flow(key) => key,
+                other => panic!("unexpected rollback target {other}"),
+            })
+            .collect();
         failed_keys.sort_by_key(|k| (k.ipv4, k.direction));
         assert_eq!(
             failed_keys,
