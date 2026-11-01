@@ -359,7 +359,7 @@ impl Engine {
                     // with dead (ifindex, IP) keys as VMs churn (§33). Keys already
                     // pending were retried above; skip them this pass.
                     let mut stale = Vec::new();
-                    for (key, _) in self.traffic.iter().flatten() {
+                    for key in self.traffic.keys().flatten() {
                         if !new_ifindexes.contains(&key.ifindex)
                             && !self.pending_removes.traffic.contains(&key)
                         {
@@ -634,7 +634,8 @@ impl Engine {
             oversized_tx_packets: self.oversized.1.packets,
             oversized_tx_bytes: self.oversized.1.bytes,
             swl_map_capacity: self.config.load().swl_map_max_entries,
-            swl_map_used: self.swl_log.iter().filter_map(|i| i.ok()).count() as u32,
+            // Keys only: iterating values would copy every ~16.4 KiB ring per poll.
+            swl_map_used: self.swl_log.keys().filter_map(Result::ok).count() as u32,
             ranges,
         }
     }
