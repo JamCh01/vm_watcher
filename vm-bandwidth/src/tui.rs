@@ -207,7 +207,8 @@ const PRIO_ERROR: u8 = 7;
 // plain info.
 const _: () = {
     assert!(PRIO_ERROR > PRIO_DEGRADED);
-    assert!(PRIO_DEGRADED > PRIO_CONFIG_FAILURE);
+    assert!(PRIO_DEGRADED > PRIO_WATCHER);
+    assert!(PRIO_WATCHER > PRIO_CONFIG_FAILURE);
     assert!(PRIO_CONFIG_FAILURE > PRIO_NOTE);
     assert!(PRIO_NOTE > PRIO_PLAIN);
 };

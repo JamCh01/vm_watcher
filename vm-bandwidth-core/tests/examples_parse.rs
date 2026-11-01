@@ -22,3 +22,11 @@ fn all_example_configs_load() {
     }
     assert_eq!(count, 6, "expected six algorithm example configs");
 }
+
+#[test]
+fn shipped_root_config_loads() {
+    let path = project_root().join("config.toml");
+    let cfg = vm_bandwidth_core::config::load(&path)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
+    assert!(!cfg.ranges.is_empty(), "{}: no ranges", path.display());
+}
