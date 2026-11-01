@@ -5,7 +5,7 @@
 //! into (or remove from) the eBPF `LIMIT_POLICIES` / `LIMIT_STATE` maps. It never touches
 //! eBPF directly, so the whole state machine is unit-testable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use vm_bandwidth_common::{DIR_RX, DIR_TX};
 
@@ -344,13 +344,18 @@ impl Limiter {
         let mut actions = Vec::new();
         self.expired.clear();
 
-        // Evaluate every IP that either has traffic or is currently LIMITED.
-        let mut ips: Vec<u32> = totals.keys().copied().collect();
-        for (flow, state) in &self.states {
-            if state.phase == Phase::Limited && !ips.contains(&flow.0) {
-                ips.push(flow.0);
-            }
-        }
+        // Evaluate every IP that has traffic, is LIMITED, or already owns a rolling
+        // window. An IP drops out of `totals` once the collector evicts its idle counter
+        // keys; its windows must keep aging with zero-traffic ticks meanwhile, or the old
+        // samples would survive the idle stretch and later count as current traffic.
+        let mut ips: HashSet<u32> = totals.keys().copied().collect();
+        ips.extend(self.windows.keys().map(|&(ip, _)| ip));
+        ips.extend(
+            self.states
+                .iter()
+                .filter(|(_, s)| s.phase == Phase::Limited)
+                .map(|(&(ip, _), _)| ip),
+        );
 
         for ip in ips {
             let Some(policy) = self.effective_policy(ip) else {
@@ -778,6 +783,27 @@ mod tests {
                 "window {window_secs}s @ tick {tick_secs}s"
             );
         }
+    }
+
+    #[test]
+    fn idle_ips_absent_from_totals_keep_aging_their_window() {
+        let ip = u32::from(std::net::Ipv4Addr::from(IP));
+        let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
+        let mut l = Limiter::new(1);
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
+        // Heavy traffic for part of the 3s window (no trigger before it is full).
+        l.tick(1, &totals(IP, BYTES_PER_TICK, 0));
+        l.tick(2, &totals(IP, BYTES_PER_TICK * 2, 0));
+        assert!(l.window_avg_bps(ip, DIR_RX) > 0.0);
+
+        // The collector evicts the idle IP's counters: it is absent from now on.
+        let evicted = HashMap::new();
+        for t in 3..=10 {
+            assert!(l.tick(t, &evicted).is_empty());
+        }
+        // Every sample is older than the window by now; none may linger as if current.
+        assert_eq!(l.window_avg_bps(ip, DIR_RX), 0.0);
     }
 
     #[test]
