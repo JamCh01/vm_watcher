@@ -288,7 +288,10 @@ impl Limiter {
             match dir_policy {
                 None => false,
                 Some(np) => {
-                    if np.window_secs != w.capacity_secs() {
+                    // Compare configured lengths: the ring's capacity differs from the
+                    // configured window whenever it is truncated to whole ticks or
+                    // capped at MAX_SAMPLES, which made every reload wipe such windows.
+                    if np.window_secs != w.window_secs() {
                         w.resize(np.window_secs, tick_secs);
                     }
                     true
@@ -748,6 +751,33 @@ mod tests {
             l.window_avg_bps(u32::from(std::net::Ipv4Addr::from(IP)), DIR_RX),
             0.0
         );
+    }
+
+    #[test]
+    fn reload_keeps_windows_the_ring_cannot_represent_exactly() {
+        // (window, tick): capped at MAX_SAMPLES ticks, and not a multiple of the tick.
+        for (window_secs, tick_secs) in [(7200, 1), (45, 2)] {
+            let mut pf = policy_fields();
+            pf.window_secs = Some(window_secs);
+            let cfg = cfg_from(vec![range("A", IP, IP, pf)]);
+            let mut l = Limiter::new(tick_secs);
+            let plan = l.plan_reload(&cfg, 0).unwrap();
+            l.commit_reload(plan);
+            l.tick(1, &totals(IP, BYTES_PER_TICK, 0));
+            l.tick(2, &totals(IP, BYTES_PER_TICK * 2, 0));
+            let ip = u32::from(std::net::Ipv4Addr::from(IP));
+            let before = l.window_avg_bps(ip, DIR_RX);
+            assert!(before > 0.0);
+
+            // Reloading the very same config must keep the accumulated history.
+            let plan = l.plan_reload(&cfg, 3).unwrap();
+            l.commit_reload(plan);
+            assert_eq!(
+                l.window_avg_bps(ip, DIR_RX),
+                before,
+                "window {window_secs}s @ tick {tick_secs}s"
+            );
+        }
     }
 
     #[test]
