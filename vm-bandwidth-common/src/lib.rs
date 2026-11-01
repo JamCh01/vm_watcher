@@ -33,6 +33,12 @@ pub struct PolicerStats {
     pub dropped_packets: u64,
 }
 
+/// Largest frame the policer judges (`skb->len`, L2 header included). Larger frames
+/// pass unpoliced and are counted in `OVERSIZED`. Frames up to this size — GSO/TSO
+/// aggregates included — are judged as a whole, so a bucket or window allowance below
+/// it can never admit them; it also keeps the time-increment arithmetic inside `u64`.
+pub const MAX_POLICED_LEN: u64 = 65535;
+
 /// Direction of traffic relative to the VM. Kept as plain `u8` constants so the
 /// value is usable identically in `#![no_std]` eBPF code and userspace.
 pub const DIR_RX: u8 = 0; // packet is being received by the VM (TAP egress)

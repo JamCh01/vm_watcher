@@ -469,6 +469,9 @@ impl Engine {
         self.config_loaded_at = stamp;
         self.last_config_bytes = bytes;
         log::info!("config reload succeeded; generation {}", self.generation);
+        for warning in self.config.load().small_burst_warnings() {
+            log::warn!("{warning}");
+        }
 
         // Rebuild the IPC snapshot immediately under the NEW config: build_status pairs
         // snapshot ranges with config ranges by index, so serving the old snapshot
@@ -1225,6 +1228,9 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         cfg.ranges.len(),
         cfg.bridge
     );
+    for warning in cfg.small_burst_warnings() {
+        log::warn!("{warning}");
+    }
 
     // 2. Single-instance lock. The file is created once and NEVER deleted: deleting
     //    it on shutdown opens an inode race (another process locks the old inode

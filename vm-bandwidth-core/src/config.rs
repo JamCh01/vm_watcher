@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::path::Path;
 
 use serde::Deserialize;
+use vm_bandwidth_common::MAX_POLICED_LEN;
 
 use crate::ip_range::{validate_ranges, IpRange};
 use crate::policy::{self, PolicyFields};
@@ -483,6 +484,46 @@ impl ValidatedConfig {
     pub fn ip_ranges(&self) -> Vec<IpRange> {
         self.ranges.iter().map(|r| r.inner.clone()).collect()
     }
+
+    /// One warning per range/override direction whose policy can never admit a frame
+    /// the data path polices whole (up to [`MAX_POLICED_LEN`], GSO/TSO aggregates
+    /// included): while LIMITED every larger frame is dropped instead of rate-limited.
+    /// Such configs stay valid for compatibility; the daemon logs these at load.
+    pub fn small_burst_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for vr in &self.ranges {
+            let range_scope = format!("range {}", vr.inner.name);
+            let mut overrides: Vec<(&u32, &PolicyFields)> = vr.overrides.iter().collect();
+            overrides.sort_unstable_by_key(|(ip, _)| **ip);
+            let override_scopes = overrides.into_iter().map(|(ip, fields)| {
+                let scope = format!("{range_scope} ip {}", std::net::Ipv4Addr::from(*ip));
+                (scope, Some(fields))
+            });
+            let scopes = std::iter::once((range_scope.clone(), None)).chain(override_scopes);
+            for (scope, override_fields) in scopes {
+                // Validated at parse time; a policy that does not resolve has no limit.
+                let Ok(eff) = policy::resolve(&vr.policy, override_fields, &scope) else {
+                    continue;
+                };
+                for (dir, dir_policy) in [("rx", eff.rx), ("tx", eff.tx)] {
+                    let Some(dir_policy) = dir_policy else {
+                        continue;
+                    };
+                    let admissible = dir_policy.max_admissible_frame_bytes();
+                    if admissible < MAX_POLICED_LEN {
+                        warnings.push(format!(
+                            "{scope}: the {dir} policy admits frames of at most {admissible} B \
+                             (burst, or limit x limit_window for window algorithms), below \
+                             the {MAX_POLICED_LEN} B the policer judges whole: while limited, \
+                             every larger frame (e.g. a GSO/TSO aggregate) is dropped instead \
+                             of rate-limited; use at least 64KiB"
+                        ));
+                    }
+                }
+            }
+        }
+        warnings
+    }
 }
 
 pub fn load(path: &Path) -> Result<ValidatedConfig, String> {
@@ -694,6 +735,46 @@ range = "10.30.9.1-10.30.9.16"
             let err = load_str(&with(bad)).expect_err(bad);
             assert!(err.starts_with("collector."), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn policies_that_cannot_admit_policed_frames_are_warned_about() {
+        let with = |policy: &str| {
+            format!(
+                "[network]\nbridge = \"br0\"\n[[ip_ranges]]\nname = \"A\"\n\
+                 range = \"10.0.0.1-10.0.0.4\"\n[ip_ranges.policy]\n\
+                 rx_threshold = \"1Gbps\"\nrx_limit = \"100Kbps\"\nwindow = \"5m\"\n\
+                 trigger_ratio = \"80%\"\nlimit_duration = \"10m\"\n{policy}\n\
+                 [[ip_ranges.overrides]]\nip = \"10.0.0.2\"\nburst = \"1MiB\"\n"
+            )
+        };
+        let cfg = load_str(&with("burst = \"32KiB\"")).unwrap();
+        let warnings = cfg.small_burst_warnings();
+        // The range default is too small; the override's 1MiB burst is fine.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("range A: the rx policy admits frames of at most 32768 B"),
+            "{warnings:?}"
+        );
+
+        assert!(load_str(&with("burst = \"64KiB\""))
+            .unwrap()
+            .small_burst_warnings()
+            .is_empty());
+
+        // Window algorithms: 100Kbps x 1s = 12 500 B allowance, for the range default
+        // and for the override (whose burst does not apply to a window algorithm).
+        let window = "algorithm = \"fixed_window\"\nlimit_window = \"1s\"";
+        let warnings = load_str(&with(window)).unwrap().small_burst_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[1]
+                .starts_with("range A ip 10.0.0.2: the rx policy admits frames of at most 12500 B"),
+            "{warnings:?}"
+        );
+
+        // Monitoring-only configs have nothing to warn about.
+        assert!(load_str(EXAMPLE).unwrap().small_burst_warnings().is_empty());
     }
 
     #[test]

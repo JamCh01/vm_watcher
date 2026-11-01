@@ -53,16 +53,12 @@ use vm_bandwidth_common::{
     is_vlan_tag, swc_carried_bytes, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats,
     SwlEntry, TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
     ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, ETHERTYPE_IPV4,
-    ETHERTYPE_IPV6, SWL_LOG_CAP, VLAN_HDR_LEN,
+    ETHERTYPE_IPV6, MAX_POLICED_LEN, SWL_LOG_CAP, VLAN_HDR_LEN,
 };
 
 /// Compile-time default; userspace overrides `max_entries` at load time
 /// (`EbpfLoader::map_max_entries`) before the maps are created.
 const MAP_CAPACITY: usize = 8192;
-
-/// Packets larger than this are never policed (fail open); it also keeps the
-/// time-increment arithmetic provably inside `u64`.
-const MAX_POLICED_LEN: u64 = 65535;
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 const BITS_PER_BYTE: u64 = 8;

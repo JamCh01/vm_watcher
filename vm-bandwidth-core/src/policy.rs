@@ -81,6 +81,18 @@ pub struct DirPolicy {
 }
 
 impl DirPolicy {
+    /// The largest frame this policy can ever admit while enforcing: the bucket
+    /// capacity (`burst`) for token bucket, leaky bucket and GCRA, the window allowance
+    /// (`limit × limit_window`) for the window algorithms. A frame above it is dropped
+    /// however idle the flow was.
+    pub fn max_admissible_frame_bytes(&self) -> u64 {
+        if is_window_algo(self.algorithm) {
+            (self.limit_bps / 8).saturating_mul(self.limit_window_secs)
+        } else {
+            self.burst_bytes
+        }
+    }
+
     /// Trigger line in bits per second: `threshold * trigger_ratio`.
     pub fn trigger_bps(&self) -> u64 {
         // u64 × u8 cannot overflow in practice (threshold is bounded by config sanity),
