@@ -520,11 +520,13 @@ impl Engine {
 
         // The trie capacity is fixed at startup; refuse a reload that would overflow it
         // before touching any map, instead of failing halfway through the install phase.
-        let new_count = u32::try_from(new_prefixes.len()).unwrap_or(u32::MAX);
-        if new_count > self.whitelist_capacity {
+        let peak = whitelist_peak(&old_prefixes, &new_prefixes);
+        if peak > self.whitelist_capacity as usize {
             anyhow::bail!(
-                "new config needs {new_count} whitelist prefixes but MONITORED_IPS capacity \
-                 is {} (sized at startup); restart the daemon to resize it",
+                "new config needs {} whitelist prefixes ({peak} while the reload swaps them \
+                 in) but MONITORED_IPS capacity is {} (sized at startup); restart the daemon \
+                 to resize it",
+                new_prefixes.len(),
                 self.whitelist_capacity
             );
         }
@@ -1182,6 +1184,12 @@ fn apply_and_commit<M: crate::txmaps::LimitMaps, W: crate::txmaps::WhitelistOps>
     config.store(Arc::new(new_cfg));
     *generation += 1;
     Ok(())
+}
+
+/// Whitelist entries the trie holds at the peak of a reload: additions are inserted
+/// before removals are deleted (§27), so old and new prefixes briefly coexist.
+fn whitelist_peak(old: &HashSet<Cidr>, new: &HashSet<Cidr>) -> usize {
+    old.union(new).count()
 }
 
 fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
@@ -2585,6 +2593,41 @@ mod timer_tests {
         assert_eq!(rescheduled(push_due, 60 * SEC, t0 + 50 * SEC), push_due);
         // A shorter interval pulls the deadline in.
         assert_eq!(rescheduled(push_due, 2 * SEC, t0 + 50 * SEC), t0 + 52 * SEC);
+    }
+}
+
+#[cfg(test)]
+mod whitelist_capacity_tests {
+    use super::whitelist_peak;
+    use std::collections::HashSet;
+    use vm_bandwidth_core::ip_range::Cidr;
+
+    fn cidrs(networks: &[[u8; 4]]) -> HashSet<Cidr> {
+        networks
+            .iter()
+            .map(|n| Cidr {
+                prefix_len: 24,
+                network: u32::from_be_bytes(*n),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn peak_counts_old_and_new_prefixes_together() {
+        // One /24 at startup sizes the trie at 2. Swapping it for two other /24s ends
+        // at 2 entries but holds 3 mid-reload: the reload must be refused up front.
+        let old = cidrs(&[[10, 0, 0, 0]]);
+        let new = cidrs(&[[10, 0, 1, 0], [10, 0, 2, 0]]);
+        assert_eq!(new.len(), 2);
+        assert_eq!(whitelist_peak(&old, &new), 3);
+    }
+
+    #[test]
+    fn kept_prefixes_count_once() {
+        let old = cidrs(&[[10, 0, 0, 0], [10, 0, 1, 0]]);
+        let new = cidrs(&[[10, 0, 1, 0], [10, 0, 2, 0]]);
+        assert_eq!(whitelist_peak(&old, &new), 3);
+        assert_eq!(whitelist_peak(&old, &old), 2);
     }
 }
 
