@@ -263,9 +263,21 @@ impl AyaBackend<'_> {
         tap: &str,
         dir: TcAttachType,
     ) -> Result<SchedClassifierLinkId, AttachFailure> {
-        let prog = sched_program(self.bpf, name).map_err(|_| AttachFailure::Other)?;
-        prog.attach(tap, dir)
-            .map_err(|e| classify_attach_failure(&e))
+        let prog = sched_program(self.bpf, name).map_err(|e| {
+            log::warn!("TAP {tap}: {e:#}");
+            AttachFailure::Other
+        })?;
+        prog.attach(tap, dir).map_err(|e| {
+            let failure = classify_attach_failure(&e);
+            // The classification only steers the clsact fallback; the cause itself is
+            // visible nowhere else, so log it here. A missing qdisc is expected on legacy
+            // kernels and handled by the fallback, hence debug.
+            match failure {
+                AttachFailure::QdiscMissing => log::debug!("TAP {tap}: {name} attach: {e}"),
+                AttachFailure::Other => log::warn!("TAP {tap}: {name} attach failed: {e}"),
+            }
+            failure
+        })
     }
 }
 
@@ -281,8 +293,13 @@ impl AttachBackend for AyaBackend<'_> {
     }
 
     fn detach_ingress(&mut self, link: Self::Link) {
-        if let Ok(prog) = sched_program(self.bpf, PROGRAM_INGRESS) {
-            let _ = prog.detach(link);
+        match sched_program(self.bpf, PROGRAM_INGRESS) {
+            Ok(prog) => {
+                if let Err(e) = prog.detach(link) {
+                    log::warn!("rolling back a half-attached ingress link failed: {e}");
+                }
+            }
+            Err(e) => log::warn!("rolling back a half-attached ingress link failed: {e:#}"),
         }
     }
 
@@ -300,42 +317,67 @@ impl AttachBackend for AyaBackend<'_> {
 /// Cap on the backoff between attach retries: 5s, 10s, 20s, ... doubling to this.
 const MAX_RETRY_BACKOFF_SECS: u64 = 300;
 
+/// Attach retry state of one TAP whose attach failed.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    /// The interface the failures were seen on. A TAP recreated under the same name
+    /// is a new interface (new ifindex) and starts without backoff.
+    ifindex: u32,
+    /// Consecutive failures.
+    failures: u32,
+    /// Earliest instant of the next attempt.
+    retry_at: std::time::Instant,
+}
+
 /// Should this TAP be attempted now, per the backoff schedule?
-fn should_attempt(
-    backoff: &HashMap<String, (u32, std::time::Instant)>,
-    name: &str,
-    now: std::time::Instant,
-) -> bool {
+fn should_attempt(backoff: &HashMap<String, Backoff>, tap: &Tap, now: std::time::Instant) -> bool {
     backoff
-        .get(name)
-        .map(|(_, after)| now >= *after)
-        .unwrap_or(true)
+        .get(&tap.name)
+        .is_none_or(|b| b.ifindex != tap.ifindex || now >= b.retry_at)
 }
 
 /// Record a failure: returns the new consecutive-failure count and schedules the next
 /// attempt at `5s × 2^(n-1)` capped at [`MAX_RETRY_BACKOFF_SECS`].
 fn record_failure(
-    backoff: &mut HashMap<String, (u32, std::time::Instant)>,
-    name: &str,
+    backoff: &mut HashMap<String, Backoff>,
+    tap: &Tap,
     now: std::time::Instant,
 ) -> u32 {
-    let entry = backoff.entry(name.to_string()).or_insert((0, now));
-    entry.0 += 1;
-    let delay = (5u64 << (entry.0 - 1).min(6)).min(MAX_RETRY_BACKOFF_SECS);
-    entry.1 = now + std::time::Duration::from_secs(delay);
-    entry.0
+    let fresh = Backoff {
+        ifindex: tap.ifindex,
+        failures: 0,
+        retry_at: now,
+    };
+    let entry = backoff.entry(tap.name.clone()).or_insert(fresh);
+    if entry.ifindex != tap.ifindex {
+        *entry = fresh;
+    }
+    entry.failures += 1;
+    let delay = (5u64 << (entry.failures - 1).min(6)).min(MAX_RETRY_BACKOFF_SECS);
+    entry.retry_at = now + std::time::Duration::from_secs(delay);
+    entry.failures
 }
 
-fn record_success(backoff: &mut HashMap<String, (u32, std::time::Instant)>, name: &str) {
+fn record_success(backoff: &mut HashMap<String, Backoff>, name: &str) {
     backoff.remove(name);
+}
+
+/// Forget the backoff of TAPs that vanished or were recreated (new ifindex): their
+/// failure history belongs to an interface that no longer exists.
+fn prune_backoff(backoff: &mut HashMap<String, Backoff>, found: &[Tap]) {
+    backoff.retain(|name, b| {
+        found
+            .iter()
+            .any(|t| t.name == *name && t.ifindex == b.ifindex)
+    });
 }
 
 pub struct AttachManager {
     bpf: Ebpf,
     attached: HashMap<String, AttachedTap>,
-    /// Per-TAP attach backoff: consecutive failure count and earliest retry instant.
-    /// A persistent conflict (e.g. a foreign qdisc) must not warn every 5s forever.
-    retry_backoff: HashMap<String, (u32, std::time::Instant)>,
+    /// Per-TAP attach backoff, keyed by TAP name. A persistent conflict (e.g. a foreign
+    /// qdisc) must not warn every 5s forever.
+    retry_backoff: HashMap<String, Backoff>,
 }
 
 struct AttachedTap {
@@ -382,6 +424,7 @@ impl AttachManager {
             .map(|a| (a.tap.name.clone(), a.tap.ifindex))
             .collect();
         let (to_detach, to_add) = reconcile_plan(&attached_view, found);
+        prune_backoff(&mut self.retry_backoff, found);
 
         for name in &to_detach {
             match found.iter().find(|t| t.name == *name) {
@@ -395,7 +438,7 @@ impl AttachManager {
         let mut failed = 0;
         let now = std::time::Instant::now();
         for tap in to_add {
-            if !should_attempt(&self.retry_backoff, &tap.name, now) {
+            if !should_attempt(&self.retry_backoff, &tap, now) {
                 continue; // backing off after repeated failures; retried later
             }
             match self.attach(&tap) {
@@ -414,7 +457,7 @@ impl AttachManager {
                     added += 1;
                 }
                 Err(e) => {
-                    let n = record_failure(&mut self.retry_backoff, &tap.name, now);
+                    let n = record_failure(&mut self.retry_backoff, &tap, now);
                     log::warn!(
                         "failed to attach to TAP {} (failure {n}, next retry backed off): {e:#}",
                         tap.name
@@ -774,36 +817,73 @@ mod tests {
         assert_eq!(added, vec!["moved", "fresh"]);
     }
 
+    fn tap(name: &str, ifindex: u32) -> Tap {
+        Tap {
+            name: name.into(),
+            ifindex,
+        }
+    }
+
     // Backoff: failures double the wait (capped), success clears it.
     #[test]
     fn attach_backoff_doubles_and_caps() {
         let mut backoff = HashMap::new();
+        let tap0 = tap("tap0", 7);
         let t0 = std::time::Instant::now();
-        assert!(should_attempt(&backoff, "tap0", t0));
-        let n1 = record_failure(&mut backoff, "tap0", t0);
+        assert!(should_attempt(&backoff, &tap0, t0));
+        let n1 = record_failure(&mut backoff, &tap0, t0);
         assert_eq!(n1, 1);
-        assert!(!should_attempt(&backoff, "tap0", t0)); // inside the 5s backoff
+        assert!(!should_attempt(&backoff, &tap0, t0)); // inside the 5s backoff
         assert!(should_attempt(
             &backoff,
-            "tap0",
+            &tap0,
             t0 + std::time::Duration::from_secs(5)
         ));
         // Reach the cap: after enough failures the delay never exceeds 300s.
         for _ in 0..20 {
-            record_failure(&mut backoff, "tap0", t0);
+            record_failure(&mut backoff, &tap0, t0);
         }
         assert!(!should_attempt(
             &backoff,
-            "tap0",
+            &tap0,
             t0 + std::time::Duration::from_secs(299)
         ));
         assert!(should_attempt(
             &backoff,
-            "tap0",
+            &tap0,
             t0 + std::time::Duration::from_secs(300)
         ));
         record_success(&mut backoff, "tap0");
-        assert!(should_attempt(&backoff, "tap0", t0));
+        assert!(should_attempt(&backoff, &tap0, t0));
+    }
+
+    // A TAP recreated under the same name is a new interface: no inherited backoff.
+    #[test]
+    fn recreated_tap_does_not_inherit_backoff() {
+        let mut backoff = HashMap::new();
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 {
+            record_failure(&mut backoff, &tap("tap0", 7), t0);
+        }
+        assert!(!should_attempt(&backoff, &tap("tap0", 7), t0));
+        let recreated = tap("tap0", 9);
+        assert!(should_attempt(&backoff, &recreated, t0));
+        // Its own first failure starts the schedule over.
+        assert_eq!(record_failure(&mut backoff, &recreated, t0), 1);
+    }
+
+    // Vanished and recreated TAPs drop out of the backoff table.
+    #[test]
+    fn backoff_is_pruned_to_found_taps() {
+        let mut backoff = HashMap::new();
+        let t0 = std::time::Instant::now();
+        record_failure(&mut backoff, &tap("gone", 1), t0);
+        record_failure(&mut backoff, &tap("moved", 2), t0);
+        record_failure(&mut backoff, &tap("stuck", 3), t0);
+        prune_backoff(&mut backoff, &[tap("moved", 4), tap("stuck", 3)]);
+        let mut left: Vec<&str> = backoff.keys().map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, vec!["stuck"]);
     }
 
     // Error classification: typed, errno-based, no string matching.
