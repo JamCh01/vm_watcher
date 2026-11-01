@@ -14,9 +14,12 @@
 //! and non-IP payloads fail open like every other unhandled frame.
 //!
 //! Every path — parse failure, IP not whitelisted, map pressure, missing or invalid
-//! policy, arithmetic anomaly — ends in `TC_ACT_PIPE`: traffic is never dropped unless
-//! a policer explicitly classifies a packet as non-conforming while a valid limit is
-//! active.
+//! policy, arithmetic anomaly — ends in `TC_ACT_UNSPEC` ("no verdict"): traffic is never
+//! dropped unless a policer explicitly classifies a packet as non-conforming while a
+//! valid limit is active. `TC_ACT_UNSPEC` is `TCX_NEXT` under TCX, so programs attached
+//! after this one on the same hook still run (any other pass code, `TC_ACT_PIPE`
+//! included, ends the TCX chain early); legacy cls_bpf treats it exactly like
+//! `TC_ACT_PIPE` and continues with the next filter.
 //!
 //! Policing algorithms (selected per flow via `LimitPolicy.algorithm`):
 //! * token bucket — refill at the limit rate, spend per packet, bounded by `burst`
@@ -35,7 +38,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_PIPE, TC_ACT_SHOT},
+    bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_SHOT, TC_ACT_UNSPEC},
     btf_maps::{HashMap, PerCpuHashMap},
     helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
     macros::{btf_map, classifier, map},
@@ -160,7 +163,7 @@ pub fn tc_egress(ctx: TcContext) -> i32 {
 fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     let eth: EthHdr = match ctx.load(0) {
         Ok(e) => e,
-        Err(_) => return TC_ACT_PIPE,
+        Err(_) => return TC_ACT_UNSPEC,
     };
 
     // Walk the VLAN stack (bounded by common::MAX_VLAN_TAGS: one load per level, no
@@ -171,20 +174,20 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     if is_vlan_tag(et0) {
         let v: VlanHdr = match ctx.load(EthHdr::LEN) {
             Ok(v) => v,
-            Err(_) => return TC_ACT_PIPE,
+            Err(_) => return TC_ACT_UNSPEC,
         };
         et1 = u16::from_be(v.ether_type);
         if is_vlan_tag(et1) {
             let v: VlanHdr = match ctx.load(EthHdr::LEN + VLAN_HDR_LEN) {
                 Ok(v) => v,
-                Err(_) => return TC_ACT_PIPE,
+                Err(_) => return TC_ACT_UNSPEC,
             };
             et2 = u16::from_be(v.ether_type);
         }
     }
     let (tags, ether_type) = match vlan_walk(et0, et1, et2) {
         // Deeper stack than supported: give up (fail open).
-        None => return TC_ACT_PIPE,
+        None => return TC_ACT_UNSPEC,
         Some(t) => t,
     };
     let l3_off = EthHdr::LEN + tags * VLAN_HDR_LEN;
@@ -193,11 +196,11 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
         ETHERTYPE_IPV4 => {}
         ETHERTYPE_IPV6 => return handle_v6(ctx, is_tx, l3_off),
         // ARP, LLDP, STP and other non-IP payloads are not counted.
-        _ => return TC_ACT_PIPE,
+        _ => return TC_ACT_UNSPEC,
     }
     let ip: Ipv4Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
-        Err(_) => return TC_ACT_PIPE,
+        Err(_) => return TC_ACT_UNSPEC,
     };
     let ipv4 = u32::from_be_bytes(if is_tx { ip.src_addr } else { ip.dst_addr });
 
@@ -207,7 +210,7 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     unsafe {
         // The trie stores addresses in network byte order (see userspace trie_key).
         if MONITORED_IPS.get(TrieKey::new(32, ipv4.to_be())).is_none() {
-            return TC_ACT_PIPE;
+            return TC_ACT_UNSPEC;
         }
 
         count(ctx, ipv4, ifindex, is_tx);
@@ -222,7 +225,7 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
             return TC_ACT_SHOT;
         }
     }
-    TC_ACT_PIPE
+    TC_ACT_UNSPEC
 }
 
 /// Accumulate byte/packet counters for a whitelisted flow. Never fails the packet.
@@ -274,7 +277,7 @@ unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
 fn handle_v6(ctx: &TcContext, is_tx: bool, l3_off: usize) -> i32 {
     let ip: Ipv6Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
-        Err(_) => return TC_ACT_PIPE,
+        Err(_) => return TC_ACT_UNSPEC,
     };
     // The address itself is deliberately NOT part of the counter key: aggregate
     // per-TAP counting bounds map cardinality at the number of TAPs (see TRAFFIC6).
@@ -282,7 +285,7 @@ fn handle_v6(ctx: &TcContext, is_tx: bool, l3_off: usize) -> i32 {
     let _ = ip;
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
     unsafe { count6(ctx, ifindex, is_tx) };
-    TC_ACT_PIPE
+    TC_ACT_UNSPEC
 }
 
 /// Accumulate byte/packet counters for one TAP's aggregate IPv6 traffic. Never fails
