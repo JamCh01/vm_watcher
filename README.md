@@ -341,14 +341,9 @@ semantics.
 - Cumulative traffic counts from daemon start (maps rebuild on restart).
 - Enforcement is policing: excess packets are dropped, never buffered or
   shaped.
-- **Source-address trust**: TX is counted and policed by the packet's source
-  address and RX by its destination address, never by TAP. A VM sending with
-  another VM's address is counted against — and spends the limit budget of —
-  that address, and TC ingress runs before the bridge, so bridge-level
-  anti-spoofing cannot prevent it (only TC filters ordered ahead of this
-  program can). Frames the bridge floods (unknown unicast, e.g. once a silent
-  VM's MAC ages out of the forwarding table) leave through every TAP and are
-  counted and policed once per TAP for their destination address.
+- Frames the bridge floods (unknown unicast, e.g. once a silent VM's MAC ages
+  out of the forwarding table) leave through every TAP and are counted and
+  policed once per TAP for their destination address.
 - Metric series carry no host label: give every host its own VictoriaMetrics,
   or several hosts' series overwrite each other.
 - HTTPS metrics endpoints are verified against the bundled public CA roots
