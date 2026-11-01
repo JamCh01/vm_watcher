@@ -41,10 +41,20 @@ pub enum TrendKind {
 /// One fetched trend: per-direction (timestamp seconds, value) points.
 pub type Series = Vec<(i64, f64)>;
 
+/// Time axis of a fetched trend: the queried range and its step, in seconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrendAxis {
+    pub start: i64,
+    pub end: i64,
+    pub step: u64,
+}
+
 #[derive(Default)]
 pub struct TrendData {
     pub rx: Series,
     pub tx: Series,
+    /// The range the points were queried over; the chart lays them out on it.
+    pub axis: TrendAxis,
 }
 
 /// What the trend screen shows: one IP or a whole IP range aggregated.
@@ -863,8 +873,16 @@ fn waiting_widget(title: &'static str) -> Paragraph<'static> {
 
 const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-/// Bucket a series down to `width` columns and render as one sparkline row.
-fn sparkline(points: &[(i64, f64)], width: usize) -> (String, f64, f64, f64) {
+/// Columns of the "RX  " / "TX  " label in front of each sparkline.
+const SPARK_LABEL_COLS: u16 = 4;
+
+/// Render a series as one sparkline row of at most `width` columns laid out on `axis`.
+///
+/// A point's column follows its timestamp, so a stretch without samples stays blank
+/// instead of the remaining points being stretched across the whole chart. A window
+/// with fewer steps than columns gets one column per step, so its bars stay
+/// contiguous. Also returns min/avg/max of the reported samples.
+fn sparkline(points: &[(i64, f64)], axis: TrendAxis, width: usize) -> (String, f64, f64, f64) {
     if points.is_empty() || width == 0 {
         return ("(no data)".to_string(), 0.0, 0.0, 0.0);
     }
@@ -875,15 +893,19 @@ fn sparkline(points: &[(i64, f64)], width: usize) -> (String, f64, f64, f64) {
         .max(1e-9);
     let min = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let avg = points.iter().map(|p| p.1).sum::<f64>() / points.len() as f64;
-    // One bucket per point when the series is shorter than the chart width, so
-    // bars stay contiguous instead of scattering across empty space.
-    let n = width.max(1).min(points.len().max(1));
+
+    let span = u64::try_from(axis.end.saturating_sub(axis.start)).unwrap_or(0);
+    let steps = span / axis.step.max(1) + 1;
+    let n = usize::try_from(steps).unwrap_or(usize::MAX).clamp(1, width);
     let mut cols = vec![0.0f64; n];
     let mut cnt = vec![0u32; n];
-    for (i, p) in points.iter().enumerate() {
-        // Bucket by position so a short series still aligns to the right edge.
-        let idx = (i * n / points.len()).min(n - 1);
-        cols[idx] += p.1;
+    for &(ts, value) in points {
+        let offset = u64::try_from(ts.saturating_sub(axis.start))
+            .unwrap_or(0)
+            .min(span);
+        // offset <= span < span + 1, so the column is always below n.
+        let idx = (u128::from(offset) * n as u128 / (u128::from(span) + 1)) as usize;
+        cols[idx] += value;
         cnt[idx] += 1;
     }
     let line: String = cols
@@ -893,8 +915,10 @@ fn sparkline(points: &[(i64, f64)], width: usize) -> (String, f64, f64, f64) {
             if *c == 0 {
                 ' '
             } else {
-                let v = sum / *c as f64;
-                BARS[((v / max) * 7.0).round() as usize]
+                let level = (sum / f64::from(*c) / max * 7.0).round();
+                // Clamped: a huge (or non-finite) bucket average from a misbehaving
+                // endpoint must not index past the last bar.
+                BARS[(level.max(0.0) as usize).min(BARS.len() - 1)]
             }
         })
         .collect();
@@ -942,9 +966,11 @@ fn draw_trend(f: &mut Frame, app: &UiState, area: Rect) {
         None if trend.error.is_none() => lines.push(Line::from("Loading trend data…")),
         None => {}
         Some(data) => {
-            let width = area.width.saturating_sub(4) as usize;
+            // The block's two border columns and the label leave this much room; a
+            // wider line would be cut on the right, losing the newest buckets.
+            let width = area.width.saturating_sub(2 + SPARK_LABEL_COLS) as usize;
             for (label, series) in [("RX", &data.rx), ("TX", &data.tx)] {
-                let (spark, min, avg, max) = sparkline(series, width);
+                let (spark, min, avg, max) = sparkline(series, data.axis, width);
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{label}  "),
@@ -1106,6 +1132,41 @@ mod header_tests {
     }
 
     #[test]
+    fn trend_chart_keeps_its_newest_buckets_inside_the_frame() {
+        // One hour at 60s steps; only the last three samples are non-zero.
+        let points: Series = (0..=60)
+            .map(|k| (k * 60, if k >= 58 { 100.0 } else { 0.0 }))
+            .collect();
+        let mut app = base_app();
+        app.screen = Screen::Trend;
+        app.trend = Some(TrendView {
+            target: TrendTarget::Ip(u32::from_be_bytes([10, 0, 0, 1])),
+            from: Screen::Detail,
+            win: 0,
+            kind: TrendKind::Bandwidth,
+            data: Some(TrendData {
+                rx: points.clone(),
+                tx: points,
+                axis: TrendAxis {
+                    start: 0,
+                    end: 3600,
+                    step: 60,
+                },
+            }),
+            fetched_at: None,
+            error: None,
+        });
+        let screen = render(&mut app, 40, 20);
+        let rx_row = screen
+            .lines()
+            .find(|l| l.contains("RX  "))
+            .expect("RX sparkline row");
+        // The newest (rightmost) bucket is the tall one; a line two columns wider
+        // than the frame used to lose exactly those columns.
+        assert!(rx_row.contains('█'), "newest bucket cut off: {rx_row:?}");
+    }
+
+    #[test]
     fn no_notices_keeps_compact_header_with_body_and_footer() {
         let mut app = base_app();
         let text = render(&mut app, 100, 20);
@@ -1249,6 +1310,30 @@ mod tier_tests {
         assert_eq!(detail_cols(DETAIL_MID_MIN), DetailCols::Mid);
         assert_eq!(detail_cols(DETAIL_MID_MIN - 1), DetailCols::Min);
         assert_eq!(detail_cols(0), DetailCols::Min);
+    }
+
+    const TEN_MINUTES: TrendAxis = TrendAxis {
+        start: 0,
+        end: 600,
+        step: 60,
+    };
+
+    #[test]
+    fn sparkline_places_points_by_time_and_leaves_gaps_blank() {
+        // Samples only for the last two minutes of a ten-minute window: the first
+        // nine columns are a gap, not the two points stretched across the chart.
+        let (line, ..) = sparkline(&[(540, 1.0), (600, 2.0)], TEN_MINUTES, 80);
+        assert_eq!(line.chars().count(), 11, "one column per step: {line:?}");
+        assert!(line.starts_with(&" ".repeat(9)), "{line:?}");
+        assert_eq!(line.chars().last(), Some('█'));
+    }
+
+    #[test]
+    fn sparkline_survives_extreme_values() {
+        // Two finite but huge samples in one bucket sum to infinity; indexing the
+        // bars with `inf as usize` used to panic and kill the TUI.
+        let (line, ..) = sparkline(&[(0, 1e308), (0, 1e308)], TEN_MINUTES, 1);
+        assert_eq!(line, "█");
     }
 
     #[test]

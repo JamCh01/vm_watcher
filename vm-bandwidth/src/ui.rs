@@ -590,7 +590,11 @@ async fn fetch_pair(
         fetch_series(client, base, rx_query, start, end, step),
         fetch_series(client, base, tx_query, start, end, step),
     )?;
-    Ok(tui::TrendData { rx, tx })
+    Ok(tui::TrendData {
+        rx,
+        tx,
+        axis: tui::TrendAxis { start, end, step },
+    })
 }
 
 /// One VictoriaMetrics `query_range` request, with a capped response body.
