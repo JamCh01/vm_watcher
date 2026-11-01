@@ -1411,10 +1411,14 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
         let _ = reload_tx.try_send(WatchMsg::Reload);
     }
 
-    // 7. Engine loop. A config change reschedules all three timers immediately
-    //    (the scheduler is the component that rebuilds on the watch signal).
+    // 7. Engine loop. Timers run on fixed deadlines; a config change pulls a deadline
+    //    in when its interval got shorter but never pushes one out.
     let mut config_rx = config_watch.subscribe();
-    let (mut next_collect, mut next_scan, mut next_push) = schedules_from(&engine.config.load());
+    let start = tokio::time::Instant::now();
+    let intervals = TimerIntervals::of(&engine.config.load());
+    let mut next_collect = start + intervals.collect;
+    let mut next_scan = start + intervals.scan;
+    let mut next_push = start + intervals.push;
 
     log::info!("daemon running (generation {})", engine.generation);
     loop {
@@ -1444,9 +1448,14 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
             }
             r = config_rx.changed() => {
                 if r.is_ok() {
-                    // The reload applied above changed intervals; rebuild the
-                    // schedule now rather than one stale cycle later.
-                    (next_collect, next_scan, next_push) = schedules_from(&engine.config.load());
+                    // Apply new intervals now rather than one stale cycle later, but
+                    // only ever pull deadlines in: a config rewritten more often than
+                    // the push or scan interval must not postpone those forever.
+                    let now = tokio::time::Instant::now();
+                    let intervals = TimerIntervals::of(&engine.config.load());
+                    next_collect = rescheduled(next_collect, intervals.collect, now);
+                    next_scan = rescheduled(next_scan, intervals.scan, now);
+                    next_push = rescheduled(next_push, intervals.push, now);
                     log::info!(
                         "config generation {}: timers rescheduled",
                         *config_rx.borrow_and_update()
@@ -1462,18 +1471,18 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
             _ = tokio::time::sleep_until(next_collect) => {
                 // Map iteration is a burst of syscalls; same reasoning as above.
                 tokio::task::block_in_place(|| engine.collect_tick());
-                next_collect = tokio::time::Instant::now()
-                    + Duration::from_millis(engine.config.load().refresh_interval_ms.max(1));
+                let interval = TimerIntervals::of(&engine.config.load()).collect;
+                next_collect = next_deadline(next_collect, interval, tokio::time::Instant::now());
             }
             _ = tokio::time::sleep_until(next_scan) => {
                 tokio::task::block_in_place(|| engine.rescan_taps());
-                next_scan = tokio::time::Instant::now()
-                    + Duration::from_secs(engine.config.load().interface_scan_interval_secs.max(1));
+                let interval = TimerIntervals::of(&engine.config.load()).scan;
+                next_scan = next_deadline(next_scan, interval, tokio::time::Instant::now());
             }
             _ = tokio::time::sleep_until(next_push) => {
                 engine.push_metrics();
-                next_push = tokio::time::Instant::now()
-                    + Duration::from_secs(engine.config.load().metrics_push_interval_secs.max(5));
+                let interval = TimerIntervals::of(&engine.config.load()).push;
+                next_push = next_deadline(next_push, interval, tokio::time::Instant::now());
             }
         }
     }
@@ -1736,19 +1745,50 @@ async fn send_response(
 }
 
 /// (Re)build the three engine timers from a config snapshot.
-fn schedules_from(
-    cfg: &ValidatedConfig,
-) -> (
-    tokio::time::Instant,
-    tokio::time::Instant,
-    tokio::time::Instant,
-) {
-    let now = tokio::time::Instant::now();
-    (
-        now + Duration::from_millis(cfg.refresh_interval_ms.max(1)),
-        now + Duration::from_secs(cfg.interface_scan_interval_secs.max(1)),
-        now + Duration::from_secs(cfg.metrics_push_interval_secs.max(5)),
-    )
+/// The engine's three timer periods, taken from a config snapshot.
+struct TimerIntervals {
+    collect: Duration,
+    scan: Duration,
+    push: Duration,
+}
+
+impl TimerIntervals {
+    fn of(cfg: &ValidatedConfig) -> Self {
+        Self {
+            collect: Duration::from_millis(cfg.refresh_interval_ms.max(1)),
+            scan: Duration::from_secs(cfg.interface_scan_interval_secs.max(1)),
+            push: Duration::from_secs(cfg.metrics_push_interval_secs.max(5)),
+        }
+    }
+}
+
+/// The deadline after `prev` on a fixed cadence of `period`. Anchoring on the previous
+/// deadline instead of on `now` keeps the time spent handling a tick from stretching
+/// every period — the limiter counts each collection tick as exactly one
+/// `refresh_interval`, so a drifting cadence would inflate its window averages. A loop
+/// that fell a whole period behind re-anchors on `now` instead of firing a burst of
+/// catch-up ticks.
+fn next_deadline(
+    prev: tokio::time::Instant,
+    period: Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let next = prev + period;
+    if next > now {
+        next
+    } else {
+        now + period
+    }
+}
+
+/// Apply a (possibly) changed `period` to a pending deadline without ever postponing
+/// it: the earlier of the current deadline and one new period from `now`.
+fn rescheduled(
+    current: tokio::time::Instant,
+    period: Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    current.min(now + period)
 }
 
 /// Watch the config file's parent directory; debounce bursts and trigger one reload (§29).
@@ -2509,6 +2549,42 @@ burst = "1MiB"
         assert!(!maps.policies.contains_key(&key(IP_A)));
         assert!(!limiter.is_limited(IP_A, DIR_RX));
         maps.assert_no_orphans();
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::{next_deadline, rescheduled};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn cadence_is_anchored_on_the_previous_deadline() {
+        let t0 = Instant::now();
+        // The tick due at t0+1s was handled 300 ms late: the next one is still due at
+        // t0+2s, not 1s after the handler finished.
+        let late = t0 + SEC + Duration::from_millis(300);
+        assert_eq!(next_deadline(t0 + SEC, SEC, late), t0 + 2 * SEC);
+    }
+
+    #[test]
+    fn a_loop_a_whole_period_behind_reanchors_instead_of_bursting() {
+        let t0 = Instant::now();
+        let very_late = t0 + 5 * SEC;
+        assert_eq!(next_deadline(t0 + SEC, SEC, very_late), very_late + SEC);
+    }
+
+    #[test]
+    fn reload_never_postpones_a_pending_deadline() {
+        let t0 = Instant::now();
+        let push_due = t0 + 60 * SEC;
+        // A rewrite at t0+50s with the interval unchanged used to move the push to
+        // t0+110s; a config rewritten every 50s then never pushed at all.
+        assert_eq!(rescheduled(push_due, 60 * SEC, t0 + 50 * SEC), push_due);
+        // A shorter interval pulls the deadline in.
+        assert_eq!(rescheduled(push_due, 2 * SEC, t0 + 50 * SEC), t0 + 52 * SEC);
     }
 }
 
