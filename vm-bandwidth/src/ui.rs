@@ -224,7 +224,14 @@ fn poll(client: &mut Option<Client>, app: &mut UiState) {
             app.status = Some(*s);
             app.error = None;
         }
-        Ok(_) => app.error = Some("unexpected reply to Overview".to_string()),
+        Ok(_) => {
+            // A reply of the wrong type means the stream is out of step (e.g. a late
+            // reply to a request that timed out): reconnect instead of reading every
+            // later reply one request behind.
+            app.error = Some("unexpected reply to Overview; reconnecting".to_string());
+            *client = None;
+            return;
+        }
         Err(e) => {
             app.error = Some(format!("{e:#}"));
             *client = None;
@@ -246,15 +253,32 @@ fn poll(client: &mut Option<Client>, app: &mut UiState) {
 
     if matches!(app.screen, Screen::Detail) {
         let idx = app.detail_index.or_else(|| app.overview.selected());
-        if let (Some(c), Some(idx)) = (client.as_mut(), idx) {
-            match c.request(&Request::RangeDetail { index: idx }) {
-                Ok(Response::RangeDetail(d)) => {
-                    app.detail = Some(*d);
-                    app.detail_index = Some(idx);
-                }
-                Ok(Response::Error { .. }) => app.detail = None,
-                Ok(_) => app.detail = None,
-                Err(_) => app.detail = None,
+        let reply = match (client.as_mut(), idx) {
+            (Some(c), Some(idx)) => Some((idx, c.request(&Request::RangeDetail { index: idx }))),
+            _ => None,
+        };
+        match reply {
+            None => {}
+            Some((idx, Ok(Response::RangeDetail(d)))) => {
+                app.detail = Some(*d);
+                app.detail_index = Some(idx);
+            }
+            // The daemon says why (range gone after a reload, reply over the frame
+            // limit, ...): show it instead of an endless "Waiting for daemon data…".
+            Some((_, Ok(Response::Error { message }))) => {
+                app.detail = None;
+                app.error = Some(message);
+            }
+            // Out of step or broken: reconnect, as for the overview request.
+            Some((_, Ok(_))) => {
+                app.detail = None;
+                app.error = Some("unexpected reply to RangeDetail; reconnecting".to_string());
+                *client = None;
+            }
+            Some((_, Err(e))) => {
+                app.detail = None;
+                app.error = Some(format!("{e:#}"));
+                *client = None;
             }
         }
     }
@@ -600,6 +624,71 @@ mod tests {
 
     fn ip(addr: [u8; 4]) -> TrendTarget {
         TrendTarget::Ip(u32::from_be_bytes(addr))
+    }
+
+    /// A UI client wired to a scripted daemon end over a socketpair.
+    fn scripted_client() -> (Option<Client>, UnixStream) {
+        let (ui_end, daemon_end) = UnixStream::pair().expect("socketpair");
+        ui_end
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("read timeout");
+        (Some(Client { stream: ui_end }), daemon_end)
+    }
+
+    fn send(daemon_end: &mut UnixStream, resp: &Response) {
+        let frame = ipc::encode(resp).expect("encode");
+        daemon_end.write_all(&frame).expect("write reply");
+    }
+
+    fn app() -> UiState {
+        UiState::new(
+            "br0".to_string(),
+            REFRESH,
+            vm_bandwidth_core::config::SortMode::Ip,
+        )
+    }
+
+    #[test]
+    fn out_of_step_reply_drops_the_connection() {
+        // A late reply to an earlier (timed-out) RangeDetail request is still queued
+        // when the next Overview request goes out.
+        let (mut client, mut daemon_end) = scripted_client();
+        send(&mut daemon_end, &Response::RangeDetail(Box::default()));
+        let mut app = app();
+        poll(&mut client, &mut app);
+        assert!(
+            client.is_none(),
+            "an out-of-step stream must be reconnected"
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("unexpected reply")),
+            "{:?}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn daemon_error_reply_to_detail_is_shown() {
+        let (mut client, mut daemon_end) = scripted_client();
+        send(&mut daemon_end, &Response::Status(Box::default()));
+        send(
+            &mut daemon_end,
+            &Response::Error {
+                message: "range index 3 out of bounds".to_string(),
+            },
+        );
+        let mut app = app();
+        app.screen = Screen::Detail;
+        app.detail_index = Some(3);
+        poll(&mut client, &mut app);
+        assert!(
+            client.is_some(),
+            "a well-formed error reply keeps the stream"
+        );
+        assert!(app.detail.is_none());
+        assert_eq!(app.error.as_deref(), Some("range index 3 out of bounds"));
     }
 
     #[test]
