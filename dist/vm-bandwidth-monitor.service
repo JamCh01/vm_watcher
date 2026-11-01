@@ -9,7 +9,8 @@ ExecStart=/usr/local/bin/vm-bandwidth-monitor --config /etc/vm-bandwidth-monitor
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
-# One fd set per attached TAP (program/map/link fds); large hosts need headroom.
+# Two TC link fds per attached TAP on top of the shared program/map fds; large
+# hosts need headroom.
 LimitNOFILE=1048576
 
 # Hardening compatible with aya/netlink, the Unix socket and HTTP(S) metrics pushes.

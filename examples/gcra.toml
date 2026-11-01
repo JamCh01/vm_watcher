@@ -3,8 +3,8 @@
 # Virtual-scheduling policer: each flow carries a Theoretical Arrival Time
 # (TAT); a packet is admitted if the TAT it would produce stays within the
 # allowed tolerance, and it polices to the configured rate while admitting
-# bursts up to `burst`. One state word per flow, no window bookkeeping —
-# the cheapest and smoothest choice for general rate limiting.
+# bursts up to `burst`. One state word per flow, no window bookkeeping; its
+# verdicts match a token bucket with the same `burst` and rate.
 #
 # `algorithm` may be omitted entirely; "gcra" is shown here for clarity.
 

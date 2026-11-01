@@ -2,17 +2,17 @@
 
 Each `.toml` here is a **complete, runnable daemon config** demonstrating one
 policing algorithm. Copy one, adjust `bridge` / `range` / rates, and load it
-(`vm-bandwidth --config your.toml` or systemd + hot reload).
+(`vm-bandwidth-monitor --config your.toml` or systemd + hot reload).
 
 每个 `.toml` 都是一份**完整可直接运行**的配置示例，演示一种限速算法。复制后修改
-`bridge` / `range` / 速率，直接加载即可（`vm-bandwidth --config your.toml`
+`bridge` / `range` / 速率，直接加载即可（`vm-bandwidth-monitor --config your.toml`
 或 systemd 部署后热加载）。
 
 ## Algorithms / 算法一览
 
 | File / 文件 | Algorithm / 算法 | State per flow / 每流状态 | Notes / 说明 |
 |---|---|---|---|
-| `gcra.toml` | GCRA (default / 默认) | 1 word | Virtual-scheduling TAT policer; smooth, cheapest. 虚调度 TAT 策略器，最平滑、开销最低 |
+| `gcra.toml` | GCRA (default / 默认) | 1 word | Virtual-scheduling TAT policer; same verdicts as a token bucket with equal `burst`. 虚调度 TAT 策略器，与同 `burst` 的令牌桶判定一致 |
 | `token_bucket.toml` | Token Bucket | 1 word | Classic refill/spend policer. 经典令牌桶 |
 | `leaky_bucket.toml` | Leaky Bucket | 1 word | Dual view of token bucket. 令牌桶对偶视角 |
 | `fixed_window.toml` | Fixed Window | 2 counters | Hard byte budget per window; up to 2× at boundaries. 固定窗口硬预算，边界处可达 2 倍 |

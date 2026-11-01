@@ -96,7 +96,8 @@ bridge = "br0"
 [collector]
 refresh_interval_ms = 1000        # 采样周期，也是窗口的采样粒度
 interface_scan_interval_secs = 5  # TAP 重扫周期
-map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / LIMIT_STATE / SWL_LOG 容量
+map_max_entries = 8192            # TRAFFIC / TRAFFIC6 / LIMIT_POLICIES / LIMIT_STATE / POLICER_STATS 容量
+swl_map_max_entries = 256         # 仅 SWL_LOG：每条启动即预分配约 16.4 KiB 内核内存
 
 [display]
 default_sort = "ip"               # --ui 详情页初始排序: ip | rx | tx | total
@@ -131,11 +132,15 @@ range = "10.30.8.1-10.30.8.16"
 规则：
 
 - 段只支持 `开始IP-结束IP`（不支持 CIDR、通配符、反向范围），段之间不允许重叠。
+  段名 `IPv6` 保留给 IPv6 聚合伪段。
 - `policy` 可选：不写即只监控。`rx_threshold/tx_threshold`、`rx_limit/tx_limit`
   按方向独立；`window`、`trigger_ratio`、`limit_duration`、`burst` 两方向共用。
   某方向只配置部分字段（不完整）会被拒绝。
-- 单位：速率 `100Mbps`/`1Gbps`（1000 进制）；时长 `5m`/`30m`/`1h`；百分比 `80%`；
-  突发 `4MiB`（二进制）。一律整数，不接受浮点。
+- 单位：速率 `100Mbps`/`1Gbps`（1000 进制，单位是比特——`MBps` 这类字节写法会被
+  拒绝）；时长 `5m`/`30m`/`1h`；百分比 `80%`；突发 `4MiB`（二进制）。一律整数，
+  不接受浮点。
+- `collector.refresh_interval_ms`（整秒）与 `interface_scan_interval_secs` 上限为
+  1 小时。
 - override 的 IP 必须落在所属段内且同一段内不可重复；未写字段继承段策略。
 - `[metrics]`（可选，默认关闭）：每 `push_interval_secs`（5–3600）秒推送一次累计
   计数器。本机回环可用 `http://`；远程必须 `https://`，除非显式
@@ -171,11 +176,15 @@ range = "10.30.8.1-10.30.8.16"
 | 滑动窗口日志 Sliding Window Log | `sliding_window_log` | `limit_window` | 精确窗口字节数；需显式开启，每包扫描 1024 条日志环 | 高 |
 | GCRA（默认） | `gcra` | `burst` | 突发容忍以时间容忍度表达 | 极低 |
 
-选型建议：拿不准就用默认的 `gcra` 或 `token_bucket`；要最平滑的输出选
-`leaky_bucket`；要窗口配额语义（且无边界突发）选 `sliding_window_counter`；
-接受边界突发换最简实现选 `fixed_window`；`sliding_window_log` 只建议用于低包率的
-精确管控（必须先开 `[experimental] enable_sliding_window_log = true`，并按
-`swl_map_max_entries` × 约 16.4 KiB 预分配内核内存）。
+选型建议：`token_bucket`、`leaky_bucket` 与 `gcra`（默认）是同一种限速器的三种
+记账方式——`burst` 与限速值相同时判定结果一致（仅有整数取整差异）——按哪套参数
+更直观选择即可，三者都不会整形或平滑流量。要窗口配额语义（且无边界突发）选
+`sliding_window_counter`；接受边界突发换最简实现选 `fixed_window`；
+`sliding_window_log` 只建议用于低包率的精确管控（必须先开
+`[experimental] enable_sliding_window_log = true`，并按 `swl_map_max_entries` ×
+约 16.4 KiB 预分配内核内存）。它的日志环只记最近放行的 1024 个包，因此只能执行
+低于约 1024 个包字节量的窗口配额（满长帧约 1.5 MB，如 `limit_window` 为 1s 时
+约 12 Mbps 以内）；配额更大时它会放行一切。
 
 ### 策略字段
 
@@ -186,9 +195,14 @@ range = "10.30.8.1-10.30.8.16"
 | `window` | 共用 | 滚动观察窗口 | > 0（超 3600 个采样截断） |
 | `trigger_ratio` | 共用 | 触发线占阈值的百分比 | 1% – 100% |
 | `limit_duration` | 共用 | 限速持续时长，到期自动恢复 | > 0 |
-| `burst` | 共用 | 桶容量 / GCRA 容忍量（仅桶类与 GCRA） | ≤ 1GiB |
+| `burst` | 共用 | 桶容量 / GCRA 容忍量（仅桶类与 GCRA） | ≤ 1GiB；建议 ≥ 64KiB（见下） |
 | `algorithm` | 共用 | 限速算法，缺省 `gcra` | 六选一 |
 | `limit_window` | 共用 | 窗口长度（仅窗口类算法） | 1s – 60s |
+
+不超过 65535 字节的帧（含 GSO/TSO 聚合帧）按整帧限速，因此比 `burst`（桶类、
+GCRA）或窗口配额 `limit × limit_window ÷ 8`（窗口类）更大的帧在 LIMITED 期间
+永远无法通过——这样的策略会把大帧直接丢弃而不是限速。daemon 在启动与每次热加载时
+对低于 64 KiB 的策略逐条记录告警。
 
 不适用于所选算法的字段会被忽略（因此 override 可以自由继承）。未知算法名在加载期
 即被拒绝；数据面遇到未知算法标签一律放行。速率与突发的上下界保证 eBPF 整数运算
@@ -256,10 +270,13 @@ cd dist && docker compose up -d     # 单节点，127.0.0.1:8428，保留 35 天
 ## 实现要点
 
 - **单一 eBPF 对象，挂载到所有 TAP**：对象只加载一次（验证器只跑一遍），同一对
-  程序经 TCX（≥6.6）或 netlink clsact 挂到每个 TAP；七份 map（LPM 白名单、
-  IPv4/IPv6 计数、策略、状态、SWL 日志、裁决统计）天然共享。
+  程序经 TCX（≥6.6）或 netlink clsact 挂到每个 TAP；八份 map（LPM 白名单、
+  IPv4/IPv6 计数、策略、状态、SWL 日志、裁决统计、超大帧计数）天然共享。
+- 放行的包返回 `TC_ACT_UNSPEC`（即 `TCX_NEXT`），同一 TAP 上之后挂载的其他 TCX
+  程序仍会处理它们。
 - **VLAN/QinQ**：最多两层 802.1Q/802.1ad 标签（编译期上限）被剥离后按内层
-  IPv4/IPv6 进入同一套计数与限速；更深层标签、截断标签与非 IP 载荷一律放行。
+  IPv4/IPv6 进入同一套计数与限速；更深层标签、截断标签与非 IP 载荷一律放行。（TC
+  ingress 时内核已把最外层标签移入 skb 元数据，因此该方向还能多处理一层。）
 - **IPv6 按 TAP 聚合**（key 是 ifindex 而非地址）——隐私地址轮换不会耗尽计数 map。
 - 挂载归属精确：只移除本程序创建的 TC filter；共享 qdisc 永不删除；挂载失败按
   指数退避重试。
@@ -280,6 +297,15 @@ cd dist && docker compose up -d     # 单节点，127.0.0.1:8428，保留 35 天
   记日志）。
 - 累计流量自本次启动起计（每次启动重建 map）。
 - 限速是 policing：超限直接丢包，不做缓冲/整形。
+- **源地址信任**：TX 按报文源地址、RX 按目的地址计数和限速，与 TAP 无关。VM
+  冒用其他 VM 的地址发包会计入该地址并消耗它的限速额度；TC ingress 在网桥之前
+  执行，网桥层面的防欺骗无法阻止这一点（只有排在本程序之前的 TC 过滤可以）。
+  网桥泛洪的帧（未知单播，例如静默 VM 的 MAC 在转发表中老化之后）会从每个 TAP
+  发出，按目的地址在每个 TAP 上各计数、各限速一次。
+- 指标序列不带主机标签：每台主机应使用独立的 VictoriaMetrics，否则多台主机的
+  序列会互相覆盖。
+- 内核 < 6.6（netlink TC）：TAP 上已存在的旧式 `ingress` qdisc 会把 egress 过滤器
+  挂到它的 ingress 钩子上；启动 daemon 前先删除它（`tc qdisc del dev <tap> ingress`）。
 
 ## 许可证
 

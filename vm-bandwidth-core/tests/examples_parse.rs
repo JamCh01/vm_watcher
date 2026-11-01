@@ -18,6 +18,10 @@ fn all_example_configs_load() {
         let cfg = vm_bandwidth_core::config::parse(&text)
             .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
         assert!(!cfg.ranges.is_empty(), "{}: no ranges", path.display());
+        // Examples are copied as-is: none may demonstrate a policy that can never
+        // admit a policed frame.
+        let warnings = cfg.small_burst_warnings();
+        assert!(warnings.is_empty(), "{}: {warnings:?}", path.display());
         count += 1;
     }
     assert_eq!(count, 6, "expected six algorithm example configs");
