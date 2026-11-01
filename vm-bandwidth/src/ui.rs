@@ -1,8 +1,9 @@
 //! `--ui` client: connects to the daemon's Unix socket and renders a read-only TUI.
 //!
 //! Deliberately never loads eBPF, creates maps or attaches TC — the daemon is the only
-//! owner of the data plane. All data arrives over the IPC socket as [`Status`] /
-//! [`RangeDetail`] frames.
+//! owner of the data plane. All data arrives over the IPC socket as
+//! [`Status`](vm_bandwidth_core::ipc::Status) /
+//! [`RangeDetail`](vm_bandwidth_core::ipc::RangeDetail) frames.
 
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -490,7 +491,6 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
     UiAction::Nothing
 }
 
-/// Fetch the trend for `app.trend`'s IP/window/kind straight from VictoriaMetrics.
 /// Kick off an async fetch of the trend for `app.trend`'s IP/window/kind from
 /// VictoriaMetrics. The result arrives on the trend channel; the screen shows
 /// "Loading…" while the fetch is in flight.

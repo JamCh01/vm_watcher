@@ -98,8 +98,9 @@ pub struct RangeStats {
     pub tx_dropped_bytes: u64,
     pub rx_dropped_packets: u64,
     pub tx_dropped_packets: u64,
-    /// IPs of this range observed since daemon start (the LPM-trie whitelist makes
-    /// ranges arbitrarily large, so idle addresses are never enumerated).
+    /// IPs of this range that currently own counter keys (idle-evicted addresses drop
+    /// out). Ranges can be arbitrarily large, so never-seen addresses are listed only
+    /// with `show_idle_ips`, for ranges up to [`IDLE_ENUM_CAP`] addresses.
     pub ips: Vec<(u32, IpStats)>,
 }
 
@@ -445,9 +446,9 @@ impl Collector {
         }
         self.prev_policer = cur_policer;
 
-        // Per-range aggregation over OBSERVED IPs only (the LPM-trie whitelist makes
-        // ranges arbitrarily large, so enumerating them is impossible by design).
-        // Idle addresses contribute zero anyway; `ips` is now "seen since daemon start".
+        // Per-range aggregation over the IPs that own counter keys (ranges can be
+        // arbitrarily large, so they are not enumerated here). Idle addresses
+        // contribute zero anyway; `show_idle_ips` lists them below for small ranges.
         let mut snap_ranges: Vec<RangeStats> = ranges
             .iter()
             .map(|range| RangeStats {

@@ -157,11 +157,10 @@ impl Limiter {
         Ok((ranges, overrides))
     }
 
-    /// Apply a (new) configuration, reconciling limiter state. Used at startup and on every
-    /// successful reload. Returns the map actions needed to converge (§18, §22–§27).
     /// Compute the reload change plan against the NEW config without touching any mutable
     /// state. The runtime executes `plan.actions` against the eBPF maps first; only after
-    /// every map operation succeeds does [`commit_reload`] apply the internal transitions.
+    /// every map operation succeeds does [`Limiter::commit_reload`] apply the internal
+    /// transitions.
     /// A rejected plan leaves the limiter (and the dataplane) exactly as they were.
     pub fn plan_reload(&self, cfg: &ValidatedConfig, now: u64) -> Result<ReloadPlan, String> {
         let (new_ranges, new_overrides) = Self::build_index(cfg)?;

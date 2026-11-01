@@ -112,13 +112,11 @@ struct Engine {
     config_watcher_errors_total: u64,
     config_watcher_last_error: String,
 
-    /// Dataplane health: set when a rollback could not fully restore the maps.
-    /// The dataplane may then differ from the active configuration; each affected
-    /// flow's exact state is carried by the per-step `RollbackFailure` logs. The
-    /// flag stays on so operators can see the degradation instead of it being
-    /// swallowed.
-    /// Dataplane rollback health (degraded flag + cumulative failure counter);
-    /// surfaced verbatim into IPC `Status`.
+    /// Dataplane rollback health (degraded flag + cumulative failure counter),
+    /// surfaced verbatim into IPC `Status`. The degraded flag is set when a rollback
+    /// could not fully restore the maps and stays on, so operators see the
+    /// degradation instead of it being swallowed; each affected flow's exact state is
+    /// carried by the per-step `RollbackFailure` logs.
     rollback_health: RollbackHealth,
 
     bridge: String,
@@ -802,8 +800,6 @@ fn state_label(limited: bool) -> String {
     }
 }
 
-/// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
-/// Ranges are validated disjoint, so their prefix sets never overlap.
 /// Process-health view of dataplane rollbacks: the degraded flag and the
 /// cumulative rollback-failure counter that IPC `Status` exposes.
 #[derive(Default)]
@@ -1198,6 +1194,8 @@ fn whitelist_peak(old: &HashSet<Cidr>, new: &HashSet<Cidr>) -> usize {
     old.union(new).count()
 }
 
+/// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
+/// Ranges are validated disjoint, so their prefix sets never overlap.
 fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
     cfg.ranges.iter().flat_map(|r| r.inner.cidrs()).collect()
 }

@@ -173,8 +173,10 @@ impl Default for MetricsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisplayConfig {
+    /// Accepted so older config files keep loading; no screen uses it.
     #[serde(default)]
     pub show_interface: bool,
+    /// Accepted so older config files keep loading; no screen uses it.
     #[serde(default)]
     pub show_packets: bool,
     /// Enumerate EVERY address of every configured range in IPC/UI, including
@@ -387,9 +389,6 @@ fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// URL policy for the metrics endpoint, enforced with a real URL parser (no string
-/// prefix guessing): https anywhere; http only for loopback hosts unless the operator
-/// explicitly accepts insecure remote transport.
 /// Log/error-safe display of a metrics endpoint URL: scheme + host (+ explicit
 /// port) only. Userinfo, path, query and fragment may carry credentials or
 /// tokens and must never reach diagnostics. IPv6 hosts keep their bracketed
@@ -409,6 +408,9 @@ pub fn safe_endpoint_display(raw: &str) -> String {
     }
 }
 
+/// URL policy for the metrics endpoint, enforced with a real URL parser (no string
+/// prefix guessing): https anywhere; http only for loopback hosts unless the operator
+/// explicitly accepts insecure remote transport.
 fn validate_metrics_url(raw: &str, allow_insecure_http: bool) -> Result<(), String> {
     use url::Host;
     let url = url::Url::parse(raw).map_err(|e| format!("metrics.url is not a valid URL: {e}"))?;

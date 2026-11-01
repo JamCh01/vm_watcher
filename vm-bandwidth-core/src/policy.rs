@@ -120,8 +120,9 @@ impl EffectivePolicy {
 ///
 /// A direction is policed only when its threshold, its limit and all shared parameters
 /// are present after the merge. Which shared parameters are required depends on the
-/// algorithm: bucket/GCRA algorithms need `burst`, window algorithms need `limit_window`,
-/// and a field that does not apply to the selected algorithm is a configuration error.
+/// algorithm: bucket/GCRA algorithms need `burst`, window algorithms need `limit_window`.
+/// A field that does not apply to the selected algorithm is ignored (an override that
+/// switches algorithm cannot unset what it inherits) and zeroed in the result.
 /// `algorithm` itself defaults to GCRA. Errors name the offending range or IP via `what`.
 pub fn resolve(
     range: &PolicyFields,

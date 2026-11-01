@@ -61,10 +61,10 @@ fn run() -> Result<()> {
     runtime.block_on(daemon::run_daemon(cli.config, object))
 }
 
-/// aya keeps roughly a dozen file descriptors open per attached TAP (program, map and
-/// link fds), so a bridge with many VMs easily exceeds the default 1024 soft limit.
-/// When the limit runs out the daemon cannot open new fds and misbehaves. Claim the hard
-/// limit up front so large hosts work.
+/// Every attached TAP holds two TC link fds on top of the shared program and map fds, and
+/// IPC clients, the watcher and metrics pushes need more, so a bridge with many VMs can
+/// approach the default 1024 soft limit. When the limit runs out the daemon cannot open
+/// new fds and misbehaves. Claim the hard limit up front so large hosts work.
 fn raise_fd_limit() -> u64 {
     let mut rlim = libc::rlimit {
         rlim_cur: 0,
