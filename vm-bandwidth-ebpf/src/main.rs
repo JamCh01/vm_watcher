@@ -486,9 +486,14 @@ unsafe fn token_bucket(
     if conform {
         tokens -= cost;
     }
-    // Always advance the refill timestamp so partial credit survives a drop.
     state.a = tokens;
-    state.b = now;
+    // Advance the refill timestamp even on a drop so partial credit survives it, but
+    // never move it backwards: `now` is read before the lock, so a CPU that lost the
+    // race holds an older reading than the one stored, and rewinding `b` would credit
+    // that interval a second time.
+    if now > state.b {
+        state.b = now;
+    }
     conform
 }
 
@@ -520,7 +525,11 @@ unsafe fn leaky_bucket(
         level += cost;
     }
     state.a = level;
-    state.b = now;
+    // Same monotonic rule as the token bucket: a stale `now` must not rewind the
+    // drain timestamp and drain that interval twice.
+    if now > state.b {
+        state.b = now;
+    }
     conform
 }
 
