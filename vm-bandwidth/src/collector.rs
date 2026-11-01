@@ -215,10 +215,15 @@ impl Collector {
 
     /// Drop previous-sample entries for TAPs that no longer exist (pairs that can never
     /// produce a delta again).
+    ///
+    /// Only the IPv4 samples: the rescan that calls this also deletes the dead TAPs'
+    /// TRAFFIC keys. TRAFFIC6 keys of dead TAPs stay in the map until idle eviction
+    /// reclaims them, and that needs their previous sample: without it every poll after
+    /// a TAP-set change would see them as changed and restart their idle count, so on a
+    /// host whose TAPs change more often than the idle threshold they never left the
+    /// map. `prev6` is replaced by the map's contents on every poll anyway.
     pub fn prune_ifindexes(&mut self, live: &HashSet<u32>) {
         self.prev.retain(|key, _| live.contains(&key.ifindex));
-        // TRAFFIC6 keys ARE the ifindex (per-TAP aggregation).
-        self.prev6.retain(|key, _| live.contains(key));
     }
 
     pub fn poll(
@@ -691,6 +696,40 @@ mod tests {
     }
 
     // Idle eviction tracks the ifindex aggregate and is rebaselined on return.
+    #[test]
+    fn dead_tap_ipv6_counters_age_out_despite_tap_churn() {
+        // TAP 5 is gone; its TRAFFIC6 entry stays frozen in the map. Another TAP changes
+        // before every poll, so the rescan prunes per-ifindex state each time.
+        let dead = 5u32;
+        let frozen = HashMap::from([(
+            dead,
+            TrafficValue {
+                rx_bytes: 1000,
+                ..Default::default()
+            },
+        )]);
+        let mut c = Collector::new();
+        let mut evicted = false;
+        for _ in 0..=IDLE_EVICT_POLLS {
+            c.prune_ifindexes(&HashSet::from([6, 7]));
+            let r = c.apply_poll(
+                PollInputs {
+                    cur: HashMap::new(),
+                    cur6: frozen.clone(),
+                    cur_policer: HashMap::new(),
+                },
+                1.0,
+                &[],
+                false,
+            );
+            if r.stale_traffic6.contains(&dead) {
+                evicted = true;
+                break;
+            }
+        }
+        assert!(evicted, "the dead TAP's IPv6 counters were never evicted");
+    }
+
     #[test]
     fn ipv6_idle_eviction_and_reappearance() {
         let mut c = Collector::new();
