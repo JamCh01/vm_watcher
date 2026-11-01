@@ -161,57 +161,63 @@ fn build_dir(
         return Ok(None);
     }
 
-    let missing = |name: &str, present: bool| -> Option<String> {
-        if present {
-            None
-        } else {
-            Some(name.to_string())
-        }
-    };
-    let mut missing_fields: Vec<String> = Vec::new();
-    if let Some(m) = missing("threshold", threshold.is_some()) {
-        missing_fields.push(format!("{dir}_{m}"));
-    }
-    if let Some(m) = missing("limit", limit.is_some()) {
-        missing_fields.push(format!("{dir}_{m}"));
-    }
-    if merged.window_secs.is_none() {
-        missing_fields.push("window".to_string());
-    }
-    if merged.trigger_ratio_pct.is_none() {
-        missing_fields.push("trigger_ratio".to_string());
-    }
-    if merged.limit_duration_secs.is_none() {
-        missing_fields.push("limit_duration".to_string());
-    }
     // Fields that do not apply to the selected algorithm are ignored rather than
     // rejected: an IP override switching algorithms inherits the range's fields and
     // has no way to "unset" them.
     let algorithm = merged.algorithm.unwrap_or(ALGO_GCRA);
-    if is_bucket_algo(algorithm) {
-        if merged.burst_bytes.is_none() {
-            missing_fields.push("burst".to_string());
-        }
+    let (algorithm_field, algorithm_field_present) = if is_bucket_algo(algorithm) {
+        ("burst", merged.burst_bytes.is_some())
     } else if is_window_algo(algorithm) {
-        if merged.limit_window_secs.is_none() {
-            missing_fields.push("limit_window".to_string());
-        }
+        ("limit_window", merged.limit_window_secs.is_some())
     } else {
         return Err(format!("policy for {what}: unknown algorithm {algorithm}"));
-    }
-    if !missing_fields.is_empty() {
+    };
+
+    let (
+        Some(threshold_bps),
+        Some(limit_bps),
+        Some(window_secs),
+        Some(trigger_ratio_pct),
+        Some(limit_duration_secs),
+        true,
+    ) = (
+        threshold,
+        limit,
+        merged.window_secs,
+        merged.trigger_ratio_pct,
+        merged.limit_duration_secs,
+        algorithm_field_present,
+    )
+    else {
+        let missing_fields: Vec<String> = [
+            (format!("{dir}_threshold"), threshold.is_none()),
+            (format!("{dir}_limit"), limit.is_none()),
+            ("window".to_string(), merged.window_secs.is_none()),
+            (
+                "trigger_ratio".to_string(),
+                merged.trigger_ratio_pct.is_none(),
+            ),
+            (
+                "limit_duration".to_string(),
+                merged.limit_duration_secs.is_none(),
+            ),
+            (algorithm_field.to_string(), !algorithm_field_present),
+        ]
+        .into_iter()
+        .filter_map(|(name, missing)| missing.then_some(name))
+        .collect();
         return Err(format!(
             "policy for {what}: {dir} direction is incomplete; missing {}",
             missing_fields.join(", ")
         ));
-    }
+    };
 
     Ok(Some(DirPolicy {
-        threshold_bps: threshold.unwrap(),
-        limit_bps: limit.unwrap(),
-        window_secs: merged.window_secs.unwrap(),
-        trigger_ratio_pct: merged.trigger_ratio_pct.unwrap(),
-        limit_duration_secs: merged.limit_duration_secs.unwrap(),
+        threshold_bps,
+        limit_bps,
+        window_secs,
+        trigger_ratio_pct,
+        limit_duration_secs,
         // Fields that do not apply to the selected algorithm are zeroed here so they
         // can never leak into an installed eBPF policy.
         burst_bytes: if is_window_algo(algorithm) {

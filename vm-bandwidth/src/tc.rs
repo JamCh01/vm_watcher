@@ -56,6 +56,10 @@ fn may_delete_qdisc(origin: QdiscOrigin, emptiness_proven: bool) -> bool {
     matches!(origin, QdiscOrigin::CreatedByUs) && emptiness_proven
 }
 
+/// Whether a qdisc's emptiness (no foreign filters) can be proven: never with aya 0.14,
+/// which exposes no filter enumeration.
+const QDISC_EMPTINESS_PROVABLE: bool = false;
+
 /// Coarse classification of a `SchedClassifier` attach failure. Drives the single
 /// clsact-fallback decision; deliberately typed, never string-matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,7 +518,7 @@ impl AttachManager {
         // a shared mount point another tool is using. If a safe qdisc query/delete API
         // ever becomes available, deletion belongs here behind may_delete_qdisc.
         if att.qdisc_origin == QdiscOrigin::CreatedByUs
-            && !may_delete_qdisc(att.qdisc_origin, false)
+            && !may_delete_qdisc(att.qdisc_origin, QDISC_EMPTINESS_PROVABLE)
         {
             log::info!(
                 "TAP {name}: retained created clsact because ownership/emptiness could not be proven"

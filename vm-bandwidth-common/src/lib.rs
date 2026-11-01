@@ -139,21 +139,31 @@ pub struct LimitState {
     pub _pad: u32,
 }
 
+// SAFETY: `repr(C)` with two `u32` fields and no padding: every bit pattern is a
+// valid value, so aya may copy it to and from kernel map memory.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficKey {}
 
+// SAFETY: `repr(C)` with only `u64` fields and no padding; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficValue {}
 
+// SAFETY: `repr(C)` with only `u64` fields and no padding; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PolicerStats {}
 
+// SAFETY: `repr(C)` integers whose padding is an explicit, zeroed `_pad` field; any bit
+// pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LimitKey {}
 
+// SAFETY: `repr(C)` integers whose padding is an explicit `_pad0` field; any bit pattern
+// is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LimitPolicy {}
 
+// SAFETY: `repr(C)` integers with explicit padding (`lock` is carried as raw bytes);
+// any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LimitState {}
 
@@ -201,6 +211,8 @@ impl Default for SwlRing {
     }
 }
 
+// SAFETY: `repr(C)` integers and arrays of `repr(C)` integer structs, all padding
+// explicit; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SwlRing {}
 
@@ -215,6 +227,7 @@ pub struct OversizedStats {
     pub bytes: u64,
 }
 
+// SAFETY: `repr(C)` with two `u64` fields and no padding; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for OversizedStats {}
 

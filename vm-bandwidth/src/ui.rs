@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
 
-use vm_bandwidth_core::config::{self};
+use vm_bandwidth_core::config;
 use vm_bandwidth_core::ipc::{self, Request, Response};
 
 use crate::daemon::SOCK_PATH;

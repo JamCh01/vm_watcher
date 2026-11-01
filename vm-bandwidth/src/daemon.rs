@@ -16,9 +16,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use aya::maps::{
-    lpm_trie::Key as TrieKey, HashMap as AyaHashMap, LpmTrie, MapData, MapError, PerCpuHashMap,
-};
+use aya::maps::lpm_trie::Key as TrieKey;
+use aya::maps::{HashMap as AyaHashMap, LpmTrie, MapData, MapError, PerCpuHashMap};
 use futures::{SinkExt, StreamExt};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::RecursiveMode;
@@ -1010,7 +1009,10 @@ fn key_already_absent(e: &MapError) -> bool {
 
 /// Human-readable algorithm name for log lines.
 fn algorithm_name(algorithm: u32) -> &'static str {
-    use vm_bandwidth_common::*;
+    use vm_bandwidth_common::{
+        ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
+        ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET,
+    };
     match algorithm {
         ALGO_TOKEN_BUCKET => "token_bucket",
         ALGO_LEAKY_BUCKET => "leaky_bucket",

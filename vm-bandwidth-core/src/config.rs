@@ -286,7 +286,10 @@ impl PolicyEntry {
 
 /// Map a config string to one of the `ALGO_*` constants.
 fn parse_algorithm(s: &str) -> Result<u32, String> {
-    use vm_bandwidth_common::*;
+    use vm_bandwidth_common::{
+        ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
+        ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET,
+    };
     Ok(match s {
         "token_bucket" => ALGO_TOKEN_BUCKET,
         "leaky_bucket" => ALGO_LEAKY_BUCKET,

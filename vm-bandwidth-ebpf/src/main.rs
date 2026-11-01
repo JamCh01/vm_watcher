@@ -37,18 +37,15 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{
-    bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_SHOT, TC_ACT_UNSPEC},
-    btf_maps::{HashMap, PerCpuHashMap},
-    helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
-    macros::{btf_map, classifier, map},
-    maps::{lpm_trie::Key as TrieKey, LpmTrie},
-    programs::TcContext,
-};
-use network_types::{
-    eth::EthHdr,
-    ip::{Ipv4Hdr, Ipv6Hdr},
-};
+use aya_ebpf::bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_SHOT, TC_ACT_UNSPEC};
+use aya_ebpf::btf_maps::{HashMap, PerCpuHashMap};
+use aya_ebpf::helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock};
+use aya_ebpf::macros::{btf_map, classifier, map};
+use aya_ebpf::maps::lpm_trie::Key as TrieKey;
+use aya_ebpf::maps::LpmTrie;
+use aya_ebpf::programs::TcContext;
+use network_types::eth::EthHdr;
+use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
 use vm_bandwidth_common::{
     is_vlan_tag, swc_carried_bytes, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats,
     SwlEntry, TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
