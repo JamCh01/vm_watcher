@@ -320,8 +320,10 @@ semantics.
   removed; shared qdiscs are never deleted. Attach failures retry with
   exponential backoff.
 - Counters are monotonic; userspace computes rates from adjacent-sample
-  deltas. Wrap/reset/TAP-rebuild periods read as zero — never negative
-  bandwidth, never false triggers.
+  deltas. A counter that goes backwards (wrap/reset) reads as zero for that
+  interval — never negative bandwidth, never false triggers — and an entry
+  created since the last poll (new flow, rebuilt TAP, evicted key coming back)
+  counts from zero.
 - Idle counter reclamation: keys unchanged for ~5 minutes are evicted and
   rebuilt by the data plane on the next packet.
 - A single engine task owns all mutable state; IPC/watchers/signals talk to it

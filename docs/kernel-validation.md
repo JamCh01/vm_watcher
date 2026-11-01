@@ -14,37 +14,55 @@ BIN=./vm-bandwidth-monitor      # 与生产同版本构建（release，含 eBPF 
 
 ## 1. VLAN / QinQ 解析验证（用户态向量测试已通过，此处验证真实内核路径）
 
-用户态已用帧向量钉死判定逻辑（`vm-bandwidth-common` 的 `vlan_walk` 测试）；
-真实内核验证走 netns + veth + VLAN 子接口：
+用户态已用帧向量钉死判定逻辑（`vm-bandwidth-common` 的 `vlan_walk` 测试）。真实内核
+验证必须让帧经过 **TAP**——daemon 只挂载 `tun_flags` 为 TAP 的网桥端口，veth 不会被
+挂载：
 
 ```bash
-# 准备：一对 veth，一端模拟 "VM"，另一端挂本程序
-ip netns add vmtest
-ip link add veth0 type veth peer name veth1
-ip link set veth1 netns vmtest
-ip link add br-test type bridge
-ip link set veth0 master br-test
-ip link set br-test up
-
-# VM 侧打单层 802.1Q 标签
-ip netns exec vmtest ip link add link veth1 name veth1.100 type vlan id 100
-ip netns exec vmtest ip addr add 10.99.0.2/24 dev veth1.100
-ip netns exec vmtest ip link set veth1 up
-ip netns exec vmtest ip link set veth1.100 up
-
-# 配置：把 10.99.0.0 段加入白名单，bridge = br-test
-# 启动 daemon（前台，RUST_LOG=debug），然后：
-ip netns exec vmtest ping -c 5 10.99.0.1 || true     # 产生带标签的 ICMP
+ip link add br-test type bridge && ip link set br-test up
+for t in tapvm tapx; do
+  ip tuntap add dev "$t" mode tap
+  ip link set "$t" master br-test && ip link set "$t" up
+done
+# 配置：bridge = "br-test"，白名单段包含 10.99.0.0/27 内的测试地址；前台启动 daemon
 ```
 
-判定：
+TAP 的"VM 侧"是 `/dev/net/tun` 上 `TUNSETIFF` 到该设备的 fd：写入的完整以太帧就是
+VM 发出的帧（经 TAP ingress，按源地址记 TX）。最小注入脚本：
 
-- [ ] `--ui` / IPC 中该段出现 10.99.0.2 且计数随流量增长（单层 802.1Q 进入计数与限速）；
-- [ ] 同法用 `type vlan` 之上再套一层验证 QinQ（内层计数正确）；
-- [ ] 三层标签：计数不增长且不崩溃（fail-open 放弃）；
-- [ ] 截断帧：`scapy`/`mausezahn` 发送短于 4 字节标签的帧，程序不退出、不误计。
+```python
+import fcntl, os, socket, struct
+def tap_fd(name):
+    fd = os.open("/dev/net/tun", os.O_RDWR)
+    fcntl.ioctl(fd, 0x400454CA, struct.pack("16sH", name.encode(), 0x0002 | 0x1000))
+    return fd                                   # TUNSETIFF, IFF_TAP | IFF_NO_PI
+def frame(src, dst, vlans=()):
+    eth = bytes.fromhex("020000000001020000000002")
+    for vid in vlans:
+        eth += struct.pack("!HH", 0x8100, vid)
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 1500, 0, 0, 64, 17, 0,
+                     socket.inet_aton(src), socket.inet_aton(dst))  # 校验和非必需
+    return eth + struct.pack("!H", 0x0800) + ip + b"\0" * 1480
+fd = tap_fd("tapvm")
+for _ in range(10):
+    os.write(fd, frame("10.99.0.18", "10.99.0.1", vlans=(100,)))
+```
 
-清理：`ip netns del vmtest; ip link del br-test`。
+判定（读 `--ui` 详情页或 IPC `RangeDetail` 的 `tx_packets`）：
+
+- [ ] 无标签、单层 802.1Q、QinQ 帧逐一计数（每批 10 帧即得 10 个包，单个短突发也计入）；
+- [ ] 三层标签**仍计数**：TAP ingress 时内核已把最外层标签移入 skb 元数据，数据面只看到
+      两层；四层标签才 fail-open（不计数、不崩溃）；
+- [ ] 截断帧：发送短于 4 字节标签的帧，程序不退出、不误计；
+- [ ] egress（RX）：同时持有 `tapvm`、`tapx` 两个 fd 至少 1–2 秒（载波事件经 linkwatch
+      生效后网桥端口才转发），再从 `tapx` 发往未知 MAC 的帧，网桥泛洪到 `tapvm`，
+      目的地址按 RX 计数。
+
+清理：`ip link del br-test; ip link del tapvm; ip link del tapx`。
+
+已于 2026-11-02 在 Docker Desktop 的 linuxkit 内核 7.0.14（aarch64，TCX）上按此流程
+实测：验证器接受对象并以 TCX 挂载；以上计数判定全部通过；1 Mbps 限速下 4.8 Mbps 需求
+时六种算法（经热加载逐个切换）的实际放行均在 0.99–1.00 Mbps。
 
 ## 2. GSO/TSO/超大 skb 判定（oversized 观测项）
 
@@ -83,9 +101,11 @@ ip link set dev "$TAP" gso_max_size 196608     # 仅测试机！
       （不是 TCX）；
 - [ ] `tc filter show dev $TAP ingress`/`egress` 能看到本程序 filter；
 - [ ] 停止后：本程序创建的 clsact 按设计**保留**（日志有说明），根 qdisc 未动；
-- [ ] 预先 `tc qdisc add dev $TAP ingress`（legacy 独占 qdisc）再启动：
-      日志应诊断 "legacy ingress qdisc conflicts"，且该 TAP 无半挂载
-      （没有只挂 ingress 不挂 egress 的状态）。
+- [ ] TAP 上没有任何 qdisc 时：首次挂载得到 EINVAL（"Parent Qdisc doesn't exists"），
+      日志为 "created clsact for legacy TC attach"，随后两个挂钩都挂上；
+- [ ] 预先 `tc qdisc add dev $TAP ingress`（legacy 独占 qdisc）再启动：该 qdisc 接受任意
+      子类，egress filter 会被**静默**挂到它唯一的 ingress block 上（`tc filter show dev
+      $TAP ingress` 可见两条），本程序无法探测——这是已知限制，部署前先删除该 qdisc。
 
 ## 4. SWL 性能/语义基准（仅在显式启用后）
 
