@@ -571,7 +571,8 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     }
     if config.collector.swl_map_max_entries > MAX_SWL_MAP_ENTRIES {
         return Err(format!(
-            "collector.swl_map_max_entries must be at most {MAX_SWL_MAP_ENTRIES}              (each entry preallocates ~16.4 KiB of kernel memory)"
+            "collector.swl_map_max_entries must be at most {MAX_SWL_MAP_ENTRIES} \
+             (each entry preallocates ~16.4 KiB of kernel memory)"
         ));
     }
     let default_sort = match config.display.default_sort.as_str() {
@@ -778,6 +779,15 @@ range = "10.30.9.1-10.30.9.16"
 
         // Monitoring-only configs have nothing to warn about.
         assert!(load_str(EXAMPLE).unwrap().small_burst_warnings().is_empty());
+    }
+
+    #[test]
+    fn swl_capacity_error_reads_as_one_sentence() {
+        let text = "[network]\nbridge = \"br0\"\n[collector]\nswl_map_max_entries = 70000\n\
+                    [[ip_ranges]]\nname = \"A\"\nrange = \"10.0.0.1-10.0.0.2\"\n";
+        let err = load_str(text).unwrap_err();
+        assert!(err.contains("at most 65536 (each entry"), "{err}");
+        assert!(!err.contains("  "), "stray whitespace: {err:?}");
     }
 
     #[test]

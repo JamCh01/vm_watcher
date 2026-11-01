@@ -86,7 +86,8 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             eprintln!(
-                "warning: cannot load {config_path:?}: {e};                  continuing without the trend screen"
+                "warning: cannot load {config_path:?}: {e}; \
+                 continuing without the trend screen"
             );
             None
         }
