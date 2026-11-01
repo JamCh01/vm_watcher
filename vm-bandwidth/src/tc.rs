@@ -11,8 +11,12 @@
 //!   qdisc. We attach directly first and create nothing, so no stray `clsact` is left
 //!   behind to fight other tools over the `ffff:` slot.
 //! * Older kernels: legacy netlink TC needs a `clsact` qdisc. It is created only when
-//!   the first attach proves the hook's qdisc missing (netlink ENOENT), and an
-//!   existing qdisc is reused (netlink EEXIST) — never replaced, never deleted.
+//!   the first attach proves the hook's qdisc missing (netlink EINVAL, or ENOENT for a
+//!   missing class), and an existing qdisc is reused (netlink EEXIST) — never replaced,
+//!   never deleted. Caveat: a legacy `ingress` qdisc (not `clsact`) already holding the
+//!   `ffff:` slot accepts the egress parent too and runs that filter on its single
+//!   ingress block, and aya 0.14 cannot query a qdisc's kind to detect it; remove such
+//!   a qdisc (`tc qdisc del dev <tap> ingress`) before starting the daemon.
 //! * A `clsact` created by this program is NOT deleted on detach: aya 0.14 exposes no
 //!   safe way to prove that no other tool added filters to it meanwhile, so it is
 //!   retained and logged. Stale clsacts left by older versions need the one-time
@@ -56,8 +60,8 @@ fn may_delete_qdisc(origin: QdiscOrigin, emptiness_proven: bool) -> bool {
 /// clsact-fallback decision; deliberately typed, never string-matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachFailure {
-    /// Legacy netlink attach got ENOENT: the hook's parent qdisc is absent. Creating
-    /// (or reusing) clsact and retrying once may succeed.
+    /// Legacy netlink attach found no usable parent qdisc for the hook (EINVAL or
+    /// ENOENT). Creating (or reusing) clsact and retrying once may succeed.
     QdiscMissing,
     /// Anything else: TCX syscall failures, permissions, vanished interface, ...
     /// Never treated as "already present".
@@ -67,15 +71,17 @@ enum AttachFailure {
 /// The errno-based core of [`classify_attach_failure`], split out so it is unit
 /// testable (`NetlinkError` cannot be constructed outside aya).
 ///
-/// Why ENOENT: on kernels < 6.6 aya attaches via netlink `RTM_NEWTFILTER` against the
-/// hook's parent qdisc (`ffff:fff1` ingress / `ffff:fff3` egress). When no qdisc owns
-/// that slot the kernel answers ENOENT; with a qdisc present the same call succeeds or
-/// fails with a different errno.
+/// On kernels < 6.6 aya attaches via netlink `RTM_NEWTFILTER` against the hook's
+/// parent (`ffff:fff2` ingress / `ffff:fff3` egress). With no qdisc in the `ffff:` slot
+/// the kernel answers EINVAL ("Parent Qdisc doesn't exists", `__tcf_qdisc_find` in
+/// net/sched/cls_api.c); with a qdisc that lacks the hook's class it answers ENOENT
+/// ("Specified class doesn't exist", `__tcf_qdisc_cl_find`). Both earn exactly one
+/// clsact ensure + retry. EINVAL also has other causes; the bounded retry then simply
+/// fails and is reported.
 fn classify_netlink_errno(errno: Option<i32>) -> AttachFailure {
-    if errno == Some(libc::ENOENT) {
-        AttachFailure::QdiscMissing
-    } else {
-        AttachFailure::Other
+    match errno {
+        Some(libc::EINVAL | libc::ENOENT) => AttachFailure::QdiscMissing,
+        _ => AttachFailure::Other,
     }
 }
 
@@ -698,9 +704,11 @@ mod tests {
         assert!(may_delete_qdisc(QdiscOrigin::CreatedByUs, true));
     }
 
-    // 8. Legacy ingress-only qdisc: ingress attaches on it, egress cannot; ensuring
-    //    clsact reports the slot taken (EEXIST) and the retried egress still fails ->
-    //    diagnosed conflict, ingress rolled back.
+    // 8. A qdisc holding the ffff: slot without an egress class: ingress attaches,
+    //    egress cannot; ensuring clsact reports the slot taken (EEXIST) and the
+    //    retried egress still fails -> diagnosed conflict, ingress rolled back. (A
+    //    legacy `ingress` qdisc never gets here: it accepts every class, see the
+    //    module docs.)
     #[test]
     fn legacy_ingress_only_qdisc_conflict_is_diagnosed() {
         let mut b = FakeBackend::fresh();
@@ -800,7 +808,13 @@ mod tests {
 
     // Error classification: typed, errno-based, no string matching.
     #[test]
-    fn classifies_enoent_as_missing_qdisc() {
+    fn classifies_missing_parent_qdisc_or_class_as_missing_qdisc() {
+        // EINVAL is what the kernel answers when no qdisc holds the ffff: slot at all
+        // (the common legacy case); ENOENT when the qdisc there lacks the hook's class.
+        assert_eq!(
+            classify_netlink_errno(Some(libc::EINVAL)),
+            AttachFailure::QdiscMissing
+        );
         assert_eq!(
             classify_netlink_errno(Some(libc::ENOENT)),
             AttachFailure::QdiscMissing
@@ -814,7 +828,7 @@ mod tests {
             AttachFailure::Other
         );
         assert_eq!(
-            classify_netlink_errno(Some(libc::EINVAL)),
+            classify_netlink_errno(Some(libc::EPERM)),
             AttachFailure::Other
         );
         assert_eq!(classify_netlink_errno(None), AttachFailure::Other);
