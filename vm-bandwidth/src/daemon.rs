@@ -372,10 +372,8 @@ impl Engine {
                         |k| self.traffic.remove(k),
                     );
                     // Keys whose removal failed stay pending and are retried next
-                    // scan; userspace tracking follows ifindex liveness regardless
-                    // (a re-baseline is safe: deltas are saturating and an absent
-                    // prev starts the next poll at zero delta).
-                    self.collector.prune_ifindexes(&new_ifindexes);
+                    // scan. The collector needs no pruning: its previous samples
+                    // mirror the map and drop out once the keys are gone.
                     if !pruned.failed_keys.is_empty() {
                         self.pending_removes.traffic.extend(pruned.failed_keys);
                     }
