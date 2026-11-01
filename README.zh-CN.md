@@ -305,6 +305,8 @@ cd dist && docker compose up -d     # 单节点，127.0.0.1:8428，保留 35 天
   发出，按目的地址在每个 TAP 上各计数、各限速一次。
 - 指标序列不带主机标签：每台主机应使用独立的 VictoriaMetrics，否则多台主机的
   序列会互相覆盖。
+- HTTPS 指标端点按内置的公共 CA 根证书（webpki-roots）校验，私有 CA 签发的证书会被
+  拒绝。
 - 内核 < 6.6（netlink TC）：TAP 上已存在的旧式 `ingress` qdisc 会把 egress 过滤器
   挂到它的 ingress 钩子上；启动 daemon 前先删除它（`tc qdisc del dev <tap> ingress`）。
 

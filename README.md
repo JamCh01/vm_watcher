@@ -351,6 +351,8 @@ semantics.
   counted and policed once per TAP for their destination address.
 - Metric series carry no host label: give every host its own VictoriaMetrics,
   or several hosts' series overwrite each other.
+- HTTPS metrics endpoints are verified against the bundled public CA roots
+  (webpki-roots); a certificate from a private CA is rejected.
 - Kernels < 6.6 (netlink TC): a legacy `ingress` qdisc already present on a TAP
   takes the egress filter onto its ingress hook; remove it
   (`tc qdisc del dev <tap> ingress`) before starting the daemon.

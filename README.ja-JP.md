@@ -339,6 +339,8 @@ cd dist && docker compose up -d     # シングルノード、127.0.0.1:8428、3
   制限されます。
 - メトリクス系列にはホストラベルがありません。ホストごとに専用の VictoriaMetrics
   を使ってください。共有すると複数ホストの系列が互いを上書きします。
+- HTTPS のメトリクスエンドポイントは同梱の公開 CA ルート（webpki-roots）で検証され、
+  プライベート CA が発行した証明書は拒否されます。
 - カーネル < 6.6（netlink TC）：TAP に既存の旧式 `ingress` qdisc があると、egress
   フィルタがその ingress フックに装着されます。デーモン起動前に削除してください
   （`tc qdisc del dev <tap> ingress`）。
