@@ -101,7 +101,18 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // Trend queries run on a one-worker tokio runtime with async reqwest, so the
+    // TUI keeps rendering while a fetch is in flight; results arrive on a channel.
+    // Built before the terminal switches modes: a failure here prints normally.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .context("starting the trend fetch runtime")?;
+
     let mut terminal = ratatui::init();
+    // Every exit from here on, `?` included, must hand the shell back intact.
+    let _restore = TerminalGuard;
     let default_sort = metrics_cfg
         .as_ref()
         .map(|c| c.default_sort)
@@ -128,13 +139,6 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         }
     });
 
-    // Trend queries run on a one-worker tokio runtime with async reqwest, so the
-    // TUI keeps rendering while a fetch is in flight; results arrive on a channel.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .context("starting the trend fetch runtime")?;
     let (trend_tx, mut trend_rx) =
         tokio::sync::mpsc::unbounded_channel::<(u64, Result<tui::TrendData, String>)>();
     app.trend_tx = Some(trend_tx);
@@ -190,8 +194,16 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         }
     };
 
-    ratatui::restore();
     result
+}
+
+/// Restores the terminal (raw mode, alternate screen) when dropped.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
 }
 
 /// Fetch overview (and detail, when on the detail screen) from the daemon.
