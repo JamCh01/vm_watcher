@@ -442,11 +442,7 @@ impl Engine {
             return;
         }
 
-        let new_cfg = match String::from_utf8(bytes.clone())
-            .map_err(|e| format!("config is not valid UTF-8: {e}"))
-            .and_then(|text| {
-                config::parse(&text).map_err(|e| format!("{e} (in {})", path.display()))
-            }) {
+        let new_cfg = match parse_config(&bytes, path) {
             Ok(cfg) => cfg,
             Err(e) => {
                 self.last_reload_ok = false;
@@ -1192,11 +1188,29 @@ fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
     cfg.ranges.iter().flat_map(|r| r.inner.cidrs()).collect()
 }
 
+/// Validate a config file's raw bytes (startup and every reload); errors name the file.
+fn parse_config(bytes: &[u8], path: &Path) -> Result<ValidatedConfig, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("config is not valid UTF-8: {e}"))?;
+    config::parse(text).map_err(|e| format!("{e} (in {})", path.display()))
+}
+
 /// Entry point for daemon mode.
 pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<()> {
-    // 1. Load and validate the initial config. Refuse to start on any problem.
-    let cfg = config::load(&config_path).map_err(anyhow::Error::msg)?;
-    let initial_config_bytes = std::fs::read(&config_path)?;
+    // 0. Signals first. Until a handler exists SIGHUP's default action terminates the
+    //    process, and systemd's Restart=on-failure counts that as a clean exit — so a
+    //    `systemctl reload` landing during the multi-second startup (eBPF load, TAP
+    //    attach) would leave the host unmonitored. Registered handlers queue the
+    //    signal for the engine loop instead.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
+    // 1. Load and validate the initial config. Refuse to start on any problem. The
+    //    bytes are read once so the reload dedup baseline is exactly what was parsed.
+    let initial_config_bytes = std::fs::read(&config_path)
+        .with_context(|| format!("cannot read config file {}", config_path.display()))?;
+    let cfg = parse_config(&initial_config_bytes, &config_path).map_err(anyhow::Error::msg)?;
     log::info!(
         "loaded {} IP range(s) for bridge {}",
         cfg.ranges.len(),
@@ -1387,17 +1401,17 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     });
     log::info!("IPC listening on {SOCK_PATH}");
 
-    // 6. File watcher (hot reload) + SIGHUP.
+    // 6. File watcher (hot reload) + SIGHUP (the signal streams were registered first
+    //    thing at startup).
     let (reload_tx, mut reload_rx) = mpsc::channel::<WatchMsg>(8);
     let _watcher = spawn_watcher(config_path.clone(), reload_tx.clone())?;
+    // Edits saved while the daemon was starting predate the watch: compare once now
+    // that it is live and reload if the file has moved on since it was parsed.
+    if std::fs::read(&config_path).is_ok_and(|bytes| bytes != engine.last_config_bytes) {
+        let _ = reload_tx.try_send(WatchMsg::Reload);
+    }
 
-    // 7. Signals.
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
-
-    // 8. Engine loop. A config change reschedules all three timers immediately
+    // 7. Engine loop. A config change reschedules all three timers immediately
     //    (the scheduler is the component that rebuilds on the watch signal).
     let mut config_rx = config_watch.subscribe();
     let (mut next_collect, mut next_scan, mut next_push) = schedules_from(&engine.config.load());
