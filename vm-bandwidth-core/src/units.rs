@@ -7,9 +7,17 @@
 /// Parse a bit rate such as `100Mbps`, `500Mbps`, `1Gbps` into bits per second.
 ///
 /// Accepted suffixes (case-insensitive): `bps`/`bit/s`, `Kbps`/`Kbit/s`,
-/// `Mbps`/`Mbit/s`, `Gbps`/`Gbit/s`. Multipliers are 1000-based.
+/// `Mbps`/`Mbit/s`, `Gbps`/`Gbit/s`. Multipliers are 1000-based. The one case-sensitive
+/// rule: the `b` of the `…bps` forms must be lower-case, because `MBps` conventionally
+/// means megabytes per second and reading it as megabits would set a rate 8x lower.
 pub fn parse_rate_bps(raw: &str) -> Result<u64, String> {
     let (num, unit) = split_unit(raw, "bit rate")?;
+    if unit.ends_with("bps") && raw.trim_end().chars().rev().nth(2) == Some('B') {
+        return Err(format!(
+            "bit rate {raw:?}: an upper-case B means bytes, but rates are in bits \
+             (bps, Kbps, Mbps or Gbps; e.g. 100MB/s = 800Mbps)"
+        ));
+    }
     let mult: u64 = match unit.as_str() {
         "bps" | "bit/s" => 1,
         "kbps" | "kbit/s" => 1_000,
@@ -137,6 +145,19 @@ mod tests {
         ] {
             assert!(parse_rate_bps(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn byte_style_rates_are_rejected_not_read_as_bits() {
+        // "100MBps" used to parse as 100 megabits: 8x below 100 megabytes per second.
+        for bad in ["100MBps", "1GBps", "512KBps", "100Bps", "1 GBPS"] {
+            let err = parse_rate_bps(bad).expect_err(bad);
+            assert!(err.contains("upper-case B means bytes"), "{bad}: {err}");
+        }
+        // Bit units in any other casing are unaffected.
+        assert_eq!(parse_rate_bps("100MBIT/S").unwrap(), 100_000_000);
+        assert_eq!(parse_rate_bps("1GBit/s").unwrap(), 1_000_000_000);
+        assert_eq!(parse_rate_bps("100mbps").unwrap(), 100_000_000);
     }
 
     #[test]
