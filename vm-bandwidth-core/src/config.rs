@@ -353,6 +353,9 @@ const MAX_LIMIT_WINDOW_SECS: u64 = 60;
 /// Sanity cap on the SWL map: 65536 rings ≈ 1 GiB of kernel memory. The value exists
 /// to catch unit typos (e.g. 256000); any real deployment needs far fewer SWL flows.
 const MAX_SWL_MAP_ENTRIES: u32 = 65536;
+/// Upper bound on the collector's tick and TAP-scan periods. Far beyond any useful
+/// value; it exists so a typo cannot overflow the engine's timer arithmetic.
+const MAX_COLLECTOR_INTERVAL_SECS: u64 = 3600;
 
 fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> {
     for (name, value) in [
@@ -499,15 +502,22 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     // The rate limiter's rolling windows are calibrated in WHOLE tick seconds, so the
     // interval must be second-aligned (a 1500 ms interval used to silently truncate to
     // 1 s ticks and mis-measure bandwidth by 1.5x).
-    if config.collector.refresh_interval_ms < 1000
-        || !config.collector.refresh_interval_ms.is_multiple_of(1000)
+    let refresh_ms = config.collector.refresh_interval_ms;
+    if !(1000..=MAX_COLLECTOR_INTERVAL_SECS * 1000).contains(&refresh_ms)
+        || !refresh_ms.is_multiple_of(1000)
     {
-        return Err(
-            "collector.refresh_interval_ms must be a whole number of seconds (>= 1000)".to_string(),
-        );
+        return Err(format!(
+            "collector.refresh_interval_ms must be a whole number of seconds within \
+             1000..={}; got {refresh_ms}",
+            MAX_COLLECTOR_INTERVAL_SECS * 1000
+        ));
     }
-    if config.collector.interface_scan_interval_secs == 0 {
-        return Err("collector.interface_scan_interval_secs must be > 0".to_string());
+    let scan_secs = config.collector.interface_scan_interval_secs;
+    if !(1..=MAX_COLLECTOR_INTERVAL_SECS).contains(&scan_secs) {
+        return Err(format!(
+            "collector.interface_scan_interval_secs must be within \
+             1..={MAX_COLLECTOR_INTERVAL_SECS}; got {scan_secs}"
+        ));
     }
     if config.collector.map_max_entries == 0 {
         return Err("collector.map_max_entries must be > 0".to_string());
@@ -659,6 +669,31 @@ range = "10.30.9.1-10.30.9.16"
 
     fn load_str(text: &str) -> Result<ValidatedConfig, String> {
         parse(text)
+    }
+
+    #[test]
+    fn collector_intervals_are_bounded() {
+        let with = |collector: &str| {
+            format!(
+                "[network]\nbridge = \"br0\"\n[collector]\n{collector}\n\
+                 [[ip_ranges]]\nname = \"A\"\nrange = \"10.0.0.1-10.0.0.2\"\n"
+            )
+        };
+        assert!(load_str(&with("refresh_interval_ms = 3600000")).is_ok());
+        assert!(load_str(&with("interface_scan_interval_secs = 3600")).is_ok());
+        // Absurd values used to pass and then overflow `Instant + Duration` (a panic
+        // at startup, or inside the engine loop on hot reload).
+        for bad in [
+            "refresh_interval_ms = 3601000",
+            "refresh_interval_ms = 1500",
+            "refresh_interval_ms = 0",
+            "interface_scan_interval_secs = 3601",
+            "interface_scan_interval_secs = 9223372036854775807",
+            "interface_scan_interval_secs = 0",
+        ] {
+            let err = load_str(&with(bad)).expect_err(bad);
+            assert!(err.starts_with("collector."), "{bad}: {err}");
+        }
     }
 
     #[test]
