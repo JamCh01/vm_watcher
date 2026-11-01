@@ -1413,7 +1413,17 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     // 6. File watcher (hot reload) + SIGHUP (the signal streams were registered first
     //    thing at startup).
     let (reload_tx, mut reload_rx) = mpsc::channel::<WatchMsg>(8);
-    let _watcher = spawn_watcher(config_path.clone(), reload_tx.clone())?;
+    // A watcher that cannot start (e.g. inotify instances exhausted) costs hot reload
+    // on save, not monitoring: SIGHUP still reloads, and the status reports the
+    // watcher unhealthy. Exiting here instead would crash-loop under systemd,
+    // detaching and re-attaching every TAP on each attempt.
+    let _watcher = match spawn_watcher(config_path.clone(), reload_tx.clone()) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            engine.record_watcher_error(format!("cannot watch the config file: {e:#}"));
+            None
+        }
+    };
     // Edits saved while the daemon was starting predate the watch: compare once now
     // that it is live and reload if the file has moved on since it was parsed.
     if std::fs::read(&config_path).is_ok_and(|bytes| bytes != engine.last_config_bytes) {
