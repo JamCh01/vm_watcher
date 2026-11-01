@@ -230,40 +230,22 @@ impl Engine {
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         if !actions.is_empty() {
-            let mut journal = crate::txmaps::TxJournal::default();
-            let applied = {
+            let failures = {
                 let mut maps = EngineMaps {
                     policies: &mut self.limit_policies,
                     state: &mut self.limit_state,
                     swl: &mut self.swl_log,
                     policer: &mut self.policer_stats,
                 };
-                run_limit_actions(&mut maps, &actions, &mut journal)
+                let mut wl = EngineWhitelist(&mut self.monitored);
+                apply_tick_actions(&mut maps, &mut wl, &mut self.limiter, &actions)
             };
-            if let Err(e) = applied {
-                // A half-applied batch is worse than none: roll the dataplane back and
-                // let the flows re-evaluate from NORMAL on their next threshold cross.
-                let report = {
-                    let mut maps = EngineMaps {
-                        policies: &mut self.limit_policies,
-                        state: &mut self.limit_state,
-                        swl: &mut self.swl_log,
-                        policer: &mut self.policer_stats,
-                    };
-                    let mut wl = EngineWhitelist(&mut self.monitored);
-                    crate::txmaps::rollback_journal(&mut maps, &mut wl, &journal)
-                };
-                self.surface_rollback_report(&report);
-                for action in &actions {
-                    let (ipv4, direction) = match action {
-                        LimitAction::Install {
-                            ipv4, direction, ..
-                        }
-                        | LimitAction::Remove { ipv4, direction } => (*ipv4, *direction),
-                    };
-                    self.limiter.reset_flow(ipv4, direction);
-                }
-                log::error!("runtime limit actions failed and were rolled back: {e:#}");
+            for failure in &failures {
+                self.surface_rollback_report(&failure.report);
+                log::error!(
+                    "limit action failed and was rolled back: {:#}",
+                    failure.error
+                );
             }
         }
         self.last_totals = totals;
@@ -1116,6 +1098,44 @@ fn run_limit_actions<M: crate::txmaps::LimitMaps>(
         );
     }
     Ok(())
+}
+
+/// One tick action that could not be applied: the error plus the report of the
+/// rollback that undid its partial map writes.
+#[derive(Debug)]
+struct TickActionFailure {
+    error: anyhow::Error,
+    report: crate::txmaps::RollbackReport,
+}
+
+/// Apply the limit actions of one limiter tick, each in its own map transaction.
+///
+/// Tick actions belong to independent flows, so a failure stays contained to its
+/// flow: only that action's partial writes are rolled back, and the limiter is told
+/// so its phase matches the dataplane again ([`Limiter::revert_failed_action`]).
+/// Every other flow's action still takes effect — one flow that cannot be armed
+/// (e.g. a full SWL_LOG map) neither blocks the rest nor re-arms policies whose
+/// expiry was applied in the same tick. Removes run before installs so they free
+/// map capacity first.
+fn apply_tick_actions<M: crate::txmaps::LimitMaps, W: crate::txmaps::WhitelistOps>(
+    maps: &mut M,
+    wl: &mut W,
+    limiter: &mut Limiter,
+    actions: &[LimitAction],
+) -> Vec<TickActionFailure> {
+    let (removes, installs): (Vec<&LimitAction>, Vec<&LimitAction>) = actions
+        .iter()
+        .partition(|action| matches!(action, LimitAction::Remove { .. }));
+    let mut failures = Vec::new();
+    for action in removes.into_iter().chain(installs) {
+        let mut journal = crate::txmaps::TxJournal::default();
+        if let Err(error) = run_limit_actions(maps, std::slice::from_ref(action), &mut journal) {
+            let report = crate::txmaps::rollback_journal(maps, wl, &journal);
+            limiter.revert_failed_action(action);
+            failures.push(TickActionFailure { error, report });
+        }
+    }
+    failures
 }
 
 /// Error payload of a reload whose dataplane apply failed: the original error
@@ -2323,6 +2343,157 @@ burst = "1MiB"
             assert_eq!(p.rate_bps, rate);
         }
         maps.assert_invariants();
+        maps.assert_no_orphans();
+    }
+}
+
+#[cfg(test)]
+mod tick_apply_tests {
+    //! The production `apply_tick_actions` driven with scripted maps: tick actions
+    //! of independent flows must never share a fate.
+
+    use super::apply_tick_actions;
+    use crate::txmaps::testmaps::{FakeMaps, FakeWhitelist};
+    use std::collections::HashMap;
+    use vm_bandwidth_common::{LimitKey, DIR_RX};
+    use vm_bandwidth_core::config::{self, ValidatedConfig};
+    use vm_bandwidth_core::limiter::{IpTotals, LimitAction, Limiter};
+
+    const IP_A: u32 = u32::from_be_bytes([10, 0, 0, 1]);
+    const IP_B: u32 = u32::from_be_bytes([10, 0, 0, 2]);
+    /// Enough bytes per one-second tick to exceed the 100Kbps trigger line.
+    const BURST: u64 = 200_000;
+
+    /// Two-sample window, 100% trigger ratio, 5s enforcement.
+    fn cfg() -> ValidatedConfig {
+        config::parse(
+            r#"
+[network]
+bridge = "br0"
+[[ip_ranges]]
+name = "r1"
+range = "10.0.0.1-10.0.0.4"
+[ip_ranges.policy]
+rx_threshold = "100Kbps"
+tx_threshold = "100Kbps"
+window = "2s"
+trigger_ratio = "100%"
+rx_limit = "100Kbps"
+tx_limit = "100Kbps"
+limit_duration = "5s"
+burst = "1MiB"
+"#,
+        )
+        .expect("test config must parse")
+    }
+
+    fn totals(rx: &[(u32, u64)]) -> HashMap<u32, IpTotals> {
+        rx.iter()
+            .map(|&(ip, rx_bytes)| {
+                (
+                    ip,
+                    IpTotals {
+                        rx_bytes,
+                        ..IpTotals::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn key(ip: u32) -> LimitKey {
+        LimitKey::new(ip, DIR_RX)
+    }
+
+    /// Limiter + maps with flow A LIMITED (armed at t=2, removal due at t=7), the
+    /// way earlier successful ticks left them.
+    fn limited_a() -> (Limiter, FakeMaps, FakeWhitelist) {
+        let mut limiter = Limiter::new(1);
+        let plan = limiter.plan_reload(&cfg(), 0).expect("initial plan");
+        limiter.commit_reload(plan);
+        let (mut maps, mut wl) = (FakeMaps::default(), FakeWhitelist::default());
+        assert!(limiter.tick(1, &totals(&[(IP_A, 0)])).is_empty());
+        let actions = limiter.tick(2, &totals(&[(IP_A, BURST)]));
+        assert!(
+            matches!(actions.as_slice(), [LimitAction::Install { ipv4, .. }] if *ipv4 == IP_A),
+            "{actions:?}"
+        );
+        assert!(apply_tick_actions(&mut maps, &mut wl, &mut limiter, &actions).is_empty());
+        assert!(maps.policies.contains_key(&key(IP_A)));
+        for t in 3..=6 {
+            assert!(limiter.tick(t, &totals(&[(IP_A, BURST)])).is_empty());
+        }
+        (limiter, maps, wl)
+    }
+
+    #[test]
+    fn failed_install_leaves_other_flows_actions_applied() {
+        let (mut limiter, mut maps, mut wl) = limited_a();
+        // t=7: A's limit expires while B triggers in the same tick.
+        assert!(limiter
+            .tick(6, &totals(&[(IP_A, BURST), (IP_B, 0)]))
+            .is_empty());
+        let actions = limiter.tick(7, &totals(&[(IP_A, BURST), (IP_B, BURST)]));
+        assert_eq!(actions.len(), 2, "{actions:?}");
+
+        // B cannot be armed (e.g. its state map is full).
+        maps.fail_next("write_fresh_state", key(IP_B));
+        let failures = apply_tick_actions(&mut maps, &mut wl, &mut limiter, &actions);
+        assert_eq!(failures.len(), 1);
+        assert!(format!("{:#}", failures[0].error).contains("10.0.0.2"));
+        assert!(failures[0].report.dataplane_consistent);
+
+        // A's removal stands: unarmed in the dataplane and NORMAL in the limiter. The
+        // old whole-batch rollback re-armed it while the limiter forgot it.
+        assert!(!maps.policies.contains_key(&key(IP_A)));
+        assert!(!limiter.is_limited(IP_A, DIR_RX));
+        // B is unarmed and NORMAL, exactly as before the failed attempt.
+        assert!(!maps.policies.contains_key(&key(IP_B)));
+        assert!(!limiter.is_limited(IP_B, DIR_RX));
+        maps.assert_invariants();
+        maps.assert_no_orphans();
+
+        // B's window survived the failure, so the next tick retries and succeeds.
+        let retry = limiter.tick(8, &totals(&[(IP_A, BURST), (IP_B, 2 * BURST)]));
+        assert!(
+            matches!(retry.as_slice(), [LimitAction::Install { ipv4, .. }] if *ipv4 == IP_B),
+            "{retry:?}"
+        );
+        assert!(apply_tick_actions(&mut maps, &mut wl, &mut limiter, &retry).is_empty());
+        assert!(maps.policies.contains_key(&key(IP_B)));
+        assert!(limiter.is_limited(IP_B, DIR_RX));
+        maps.assert_invariants();
+        maps.assert_no_orphans();
+    }
+
+    #[test]
+    fn failed_removal_keeps_flow_limited_until_retry_succeeds() {
+        let (mut limiter, mut maps, mut wl) = limited_a();
+        let actions = limiter.tick(7, &totals(&[(IP_A, BURST)]));
+        assert!(
+            matches!(actions.as_slice(), [LimitAction::Remove { ipv4, .. }] if *ipv4 == IP_A),
+            "{actions:?}"
+        );
+
+        // The policy is disarmed but its state cannot be cleared: the rollback
+        // re-arms it, so the limiter must keep owning the flow.
+        maps.fail_next("clear_state", key(IP_A));
+        let failures = apply_tick_actions(&mut maps, &mut wl, &mut limiter, &actions);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].report.dataplane_consistent);
+        assert!(maps.policies.contains_key(&key(IP_A)));
+        assert!(limiter.is_limited(IP_A, DIR_RX));
+        maps.assert_invariants();
+
+        // The next tick retries the removal, which now succeeds.
+        let retry = limiter.tick(8, &totals(&[(IP_A, BURST)]));
+        assert!(
+            matches!(retry.as_slice(), [LimitAction::Remove { ipv4, .. }] if *ipv4 == IP_A),
+            "{retry:?}"
+        );
+        assert!(apply_tick_actions(&mut maps, &mut wl, &mut limiter, &retry).is_empty());
+        assert!(!maps.policies.contains_key(&key(IP_A)));
+        assert!(!limiter.is_limited(IP_A, DIR_RX));
         maps.assert_no_orphans();
     }
 }
