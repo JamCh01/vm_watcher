@@ -343,8 +343,8 @@ impl Deref for ValidatedRange {
 /// The eBPF GCRA data path computes `burst_bytes * 8 * 1e9` in `u64`, so `burst` is
 /// capped so that product cannot wrap; rates are bounded to keep every derived number
 /// (increment, tolerance, deadline) provably inside `u64` for any packet length.
-/// The window algorithms compute in MiB and are bounded to a 60s window so their
-/// weighted estimates also stay inside `u64`.
+/// The window algorithms are bounded to a 60s window so their millisecond-weighted
+/// estimates also stay inside `u64`.
 const MIN_RATE_BPS: u64 = 100_000; // 100 Kbps
 const MAX_RATE_BPS: u64 = 1_000_000_000_000; // 1 Tbps
 const MAX_BURST_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB

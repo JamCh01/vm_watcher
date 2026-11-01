@@ -25,7 +25,7 @@
 //! * token bucket — refill at the limit rate, spend per packet, bounded by `burst`
 //! * leaky bucket — queue level drains at the limit rate, bounded by `burst`
 //! * fixed window — byte allowance per window, anchored at the flow's first packet
-//! * sliding window counter — weighted two-window approximation (MiB granularity)
+//! * sliding window counter — weighted two-window approximation (millisecond weights)
 //! * sliding window log — exact window bytes over a bounded per-flow log ring
 //! * GCRA — virtual-scheduling Theoretical Arrival Time
 //!
@@ -50,8 +50,8 @@ use network_types::{
     ip::{Ipv4Hdr, Ipv6Hdr},
 };
 use vm_bandwidth_common::{
-    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats, SwlEntry,
-    TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
+    is_vlan_tag, swc_carried_bytes, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats,
+    SwlEntry, TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
     ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, ETHERTYPE_IPV4,
     ETHERTYPE_IPV6, SWL_LOG_CAP, VLAN_HDR_LEN,
 };
@@ -564,10 +564,10 @@ unsafe fn fixed_window(
 }
 
 /// Sliding window counter: weighted estimate `prev × (1 − elapsed/window) + curr`.
-/// Window accounting is in MiB so the weighted product stays inside `u64` under the
-/// config bounds (allowance ≤ 7.5e12 B, window ≤ 60s); that granularity can make very
-/// small allowances behave like a fixed window. State: `a` = previous window bytes,
-/// `b` = current window bytes, `c` = window start.
+/// The previous window is counted in exact bytes and weighted in whole milliseconds
+/// (see `vm_bandwidth_common::swc_carried_bytes`), which keeps the product inside `u64`
+/// under the config bounds (allowance ≤ 7.5e12 B, window ≤ 60s). State: `a` = previous
+/// window bytes, `b` = current window bytes, `c` = window start.
 #[inline(always)]
 unsafe fn sliding_window_counter(
     policy: &LimitPolicy,
@@ -594,9 +594,8 @@ unsafe fn sliding_window_counter(
     }
 
     let elapsed = now.saturating_sub(state.c).min(w);
-    let prev_mib = state.a >> 20;
-    let carried = prev_mib.wrapping_mul(w - elapsed) / w;
-    let est_bytes = (carried << 20).saturating_add(state.b);
+    let carried = swc_carried_bytes(state.a, w, elapsed);
+    let est_bytes = carried.saturating_add(state.b);
 
     let conform = est_bytes.saturating_add(len_bytes) <= window_allowance(policy);
     if conform {
