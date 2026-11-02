@@ -2,7 +2,10 @@
 //!
 //! Counters in the kernel are monotonic; userspace keeps the previous sample to compute
 //! deltas over the actual sampling interval. A key whose counter went backwards (reset)
-//! contributes a zero delta for that interval — bandwidth is never negative.
+//! contributes a zero delta for that interval — bandwidth is never negative. A key that
+//! appears without a previous sample was created by the data path since the last poll
+//! (the maps start empty and every entry starts at zero), so its whole value counts;
+//! only the very first poll after start is a pure baseline.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -98,8 +101,9 @@ pub struct RangeStats {
     pub tx_dropped_bytes: u64,
     pub rx_dropped_packets: u64,
     pub tx_dropped_packets: u64,
-    /// IPs of this range observed since daemon start (the LPM-trie whitelist makes
-    /// ranges arbitrarily large, so idle addresses are never enumerated).
+    /// IPs of this range that currently own counter keys (idle-evicted addresses drop
+    /// out). Ranges can be arbitrarily large, so never-seen addresses are listed only
+    /// with `show_idle_ips`, for ranges up to [`IDLE_ENUM_CAP`] addresses.
     pub ips: Vec<(u32, IpStats)>,
 }
 
@@ -115,6 +119,9 @@ pub struct PollInputs {
     pub cur: HashMap<TrafficKey, TrafficValue>,
     pub cur6: HashMap<u32, TrafficValue>,
     pub cur_policer: HashMap<LimitKey, PolicerStats>,
+    /// True when a map read failed this poll, so keys may be missing from the maps
+    /// above although they still exist in the kernel.
+    pub incomplete: bool,
 }
 
 /// One collector poll: the TUI-facing snapshot plus per-IP cumulative totals
@@ -181,6 +188,8 @@ pub struct Collector {
     idle4: IdleTracker<TrafficKey>,
     idle6: IdleTracker<u32>,
     last_poll: Option<Instant>,
+    /// Set once the first poll has recorded its baseline samples.
+    primed: bool,
 }
 
 impl Collector {
@@ -194,31 +203,25 @@ impl Collector {
             idle4: IdleTracker::default(),
             idle6: IdleTracker::default(),
             last_poll: None,
+            primed: false,
         }
     }
 
-    /// Drop state for IPs that are no longer configured (§33: no stale entries linger
-    /// after a range is removed by a hot reload). Membership is a range-containment
-    /// test over the observed IPs — the ranges themselves are never enumerated.
+    /// Drop the totals of IPs that are no longer configured (§33: no stale entries
+    /// linger after a range is removed by a hot reload). Membership is a
+    /// range-containment test over the observed IPs — the ranges themselves are never
+    /// enumerated. Previous samples are kept: they mirror the kernel maps (replaced on
+    /// every poll), and dropping the sample of a key that is still in a map would make
+    /// the next poll count that key's whole history as new traffic.
     pub fn prune_ips(&mut self, ranges: &[IpRange]) {
         let kept = |ip: &u32| ranges.iter().any(|r| r.contains(*ip));
         self.totals.retain(|ip, _| kept(ip));
-        self.prev.retain(|key, _| kept(&key.ipv4));
-        self.prev_policer.retain(|key, _| kept(&key.ipv4));
     }
 
     /// Running IPv6 aggregate (test/inspection accessor).
     #[cfg(test)]
     fn ipv6_total(&self) -> u64 {
         self.ipv6.rx_bytes + self.ipv6.tx_bytes
-    }
-
-    /// Drop previous-sample entries for TAPs that no longer exist (pairs that can never
-    /// produce a delta again).
-    pub fn prune_ifindexes(&mut self, live: &HashSet<u32>) {
-        self.prev.retain(|key, _| live.contains(&key.ifindex));
-        // TRAFFIC6 keys ARE the ifindex (per-TAP aggregation).
-        self.prev6.retain(|key, _| live.contains(key));
     }
 
     pub fn poll(
@@ -238,6 +241,7 @@ impl Collector {
         self.last_poll = Some(now);
 
         // Sum every CPU's counters per key.
+        let mut incomplete = false;
         let mut cur: HashMap<TrafficKey, TrafficValue> = HashMap::new();
         for item in traffic.iter() {
             match item {
@@ -251,7 +255,10 @@ impl Collector {
                     }
                     cur.insert(key, acc);
                 }
-                Err(e) => log::warn!("reading TRAFFIC map: {e}"),
+                Err(e) => {
+                    incomplete = true;
+                    log::warn!("reading TRAFFIC map: {e}");
+                }
             }
         }
 
@@ -268,7 +275,10 @@ impl Collector {
                     }
                     cur6.insert(key, acc);
                 }
-                Err(e) => log::warn!("reading TRAFFIC6 map: {e}"),
+                Err(e) => {
+                    incomplete = true;
+                    log::warn!("reading TRAFFIC6 map: {e}");
+                }
             }
         }
         let mut cur_policer: HashMap<LimitKey, PolicerStats> = HashMap::new();
@@ -284,7 +294,10 @@ impl Collector {
                     }
                     cur_policer.insert(key, acc);
                 }
-                Err(e) => log::warn!("reading POLICER_STATS map: {e}"),
+                Err(e) => {
+                    incomplete = true;
+                    log::warn!("reading POLICER_STATS map: {e}");
+                }
             }
         }
 
@@ -292,6 +305,7 @@ impl Collector {
             cur,
             cur6,
             cur_policer,
+            incomplete,
         };
         self.apply_poll(inputs, elapsed_secs, ranges, show_idle_ips)
     }
@@ -310,15 +324,23 @@ impl Collector {
             cur,
             cur6,
             cur_policer,
+            incomplete,
         } = inputs;
+        // Before the first poll there is nothing to compare against: every key is a
+        // baseline. After it, a key without a previous sample was created by the data
+        // path since the last poll and starts at zero (see the module docs).
+        let primed = self.primed;
+        self.primed = true;
 
-        // Per-IP deltas. New keys (first observation) get no delta: their rate starts at 0.
-        // saturating_sub turns counter resets into zero deltas, never negative rates.
+        // Per-IP deltas. saturating_sub turns counter resets into zero deltas, never
+        // negative rates.
         let mut deltas: HashMap<u32, Delta> = HashMap::new();
         if elapsed_secs > 0.0 {
             for (key, value) in &cur {
-                let Some(prev) = self.prev.get(key) else {
-                    continue;
+                let prev = match self.prev.get(key) {
+                    Some(prev) => *prev,
+                    None if primed => TrafficValue::default(),
+                    None => continue,
                 };
                 let d = Delta {
                     rx_bytes: value.rx_bytes.saturating_sub(prev.rx_bytes),
@@ -342,18 +364,23 @@ impl Collector {
             .map(|(k, _)| *k)
             .collect();
         let stale_traffic = self.idle4.observe(&present4, &changed4);
-        let live_ips: HashSet<u32> = present4.iter().map(|k| k.ipv4).collect();
-        self.totals.retain(|ip, _| live_ips.contains(ip));
-
-        self.prev = cur;
+        // After a failed read, keys absent from `cur` may still exist: keep their totals
+        // and previous samples, or a key that reappears would count its whole history.
+        if !incomplete {
+            let live_ips: HashSet<u32> = present4.iter().map(|k| k.ipv4).collect();
+            self.totals.retain(|ip, _| live_ips.contains(ip));
+        }
+        self.prev = carry_forward(cur, std::mem::take(&mut self.prev), incomplete);
 
         // IPv6: identical delta logic, collapsed into one grand total — there is no
         // per-address breakdown and no IPv6 limit policy to feed.
         let mut d6 = Delta::default();
         if elapsed_secs > 0.0 {
             for (key, value) in &cur6 {
-                let Some(prev) = self.prev6.get(key) else {
-                    continue;
+                let prev = match self.prev6.get(key) {
+                    Some(prev) => *prev,
+                    None if primed => TrafficValue::default(),
+                    None => continue,
                 };
                 let d = Delta {
                     rx_bytes: value.rx_bytes.saturating_sub(prev.rx_bytes),
@@ -374,7 +401,7 @@ impl Collector {
             .collect();
         let stale_traffic6 = self.idle6.observe(&present6, &changed6);
 
-        self.prev6 = cur6;
+        self.prev6 = carry_forward(cur6, std::mem::take(&mut self.prev6), incomplete);
         self.ipv6.rx_bytes += d6.rx_bytes;
         self.ipv6.tx_bytes += d6.tx_bytes;
         self.ipv6.rx_packets += d6.rx_packets;
@@ -412,8 +439,10 @@ impl Collector {
         // so the entry exists; or_default keeps this safe either way.
         if elapsed_secs > 0.0 {
             for (key, value) in &cur_policer {
-                let Some(prev) = self.prev_policer.get(key) else {
-                    continue;
+                let prev = match self.prev_policer.get(key) {
+                    Some(prev) => *prev,
+                    None if primed => PolicerStats::default(),
+                    None => continue,
                 };
                 let d_passed_bytes = value.passed_bytes.saturating_sub(prev.passed_bytes);
                 let d_passed_packets = value.passed_packets.saturating_sub(prev.passed_packets);
@@ -438,11 +467,15 @@ impl Collector {
                 }
             }
         }
-        self.prev_policer = cur_policer;
+        self.prev_policer = carry_forward(
+            cur_policer,
+            std::mem::take(&mut self.prev_policer),
+            incomplete,
+        );
 
-        // Per-range aggregation over OBSERVED IPs only (the LPM-trie whitelist makes
-        // ranges arbitrarily large, so enumerating them is impossible by design).
-        // Idle addresses contribute zero anyway; `ips` is now "seen since daemon start".
+        // Per-range aggregation over the IPs that own counter keys (ranges can be
+        // arbitrarily large, so they are not enumerated here). Idle addresses
+        // contribute zero anyway; `show_idle_ips` lists them below for small ranges.
         let mut snap_ranges: Vec<RangeStats> = ranges
             .iter()
             .map(|range| RangeStats {
@@ -540,6 +573,21 @@ impl Collector {
     }
 }
 
+/// The previous samples for the next poll: this poll's values plus, after a failed
+/// read, the old samples of the keys this poll could not see.
+fn carry_forward<K: Eq + std::hash::Hash, V>(
+    mut cur: HashMap<K, V>,
+    old: HashMap<K, V>,
+    incomplete: bool,
+) -> HashMap<K, V> {
+    if incomplete {
+        for (key, value) in old {
+            cur.entry(key).or_insert(value);
+        }
+    }
+    cur
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +630,7 @@ mod tests {
             )]),
             cur6: HashMap::new(),
             cur_policer: HashMap::new(),
+            incomplete: false,
         }
     }
 
@@ -651,6 +700,7 @@ mod tests {
             cur: HashMap::new(),
             cur6: HashMap::new(),
             cur_policer: HashMap::new(),
+            incomplete: false,
         };
         let mut c = Collector::new();
         let r = c.apply_poll(inputs, 1.0, std::slice::from_ref(&big), true);
@@ -665,6 +715,7 @@ mod tests {
             cur: HashMap::new(),
             cur6: cur6.iter().copied().collect(),
             cur_policer: HashMap::new(),
+            incomplete: false,
         };
         c.apply_poll(inputs, 1.0, &[], false)
     }
@@ -682,15 +733,15 @@ mod tests {
         let r = round6(&mut c, &[(7, tval(1000 + 64_000, 0))]);
         assert_eq!(r.ipv6.rx_bytes, 64_000);
         assert!((r.ipv6.rx_bps - 64_000.0 * 8.0).abs() < 1e-9);
-        // A second TAP adds exactly one more key; its first round is the baseline,
-        // so only the first TAP's fresh delta lands this round.
+        // A second TAP adds exactly one more key. Its entry was created since the last
+        // poll and started at zero, so all of it is this round's traffic.
         let r = round6(&mut c, &[(7, tval(65_000 + 100, 0)), (8, tval(50, 0))]);
-        assert_eq!(r.ipv6.rx_bytes, 64_000 + 100);
+        assert_eq!(r.ipv6.rx_bytes, 64_000 + 100 + 50);
         let r = round6(&mut c, &[(7, tval(65_100, 0)), (8, tval(50 + 25, 0))]);
-        assert_eq!(r.ipv6.rx_bytes, 64_000 + 100 + 25);
+        assert_eq!(r.ipv6.rx_bytes, 64_000 + 100 + 50 + 25);
     }
 
-    // Idle eviction tracks the ifindex aggregate and is rebaselined on return.
+    // Idle eviction tracks the ifindex aggregate; a recreated entry counts from zero.
     #[test]
     fn ipv6_idle_eviction_and_reappearance() {
         let mut c = Collector::new();
@@ -705,8 +756,11 @@ mod tests {
         let total_before = c.ipv6_total();
         round6(&mut c, &[]);
         assert_eq!(c.ipv6_total(), total_before);
-        // Traffic returns: rebaselined, no spike.
-        round6(&mut c, &[(7, tval(100, 0))]);
+        // Traffic returns on a recreated entry, which starts at zero: counted from
+        // its first packet, no spike.
+        let r = round6(&mut c, &[(7, tval(100, 0))]);
+        assert_eq!(c.ipv6_total(), total_before + 100);
+        assert!((r.ipv6.rx_bps - 100.0 * 8.0).abs() < 1e-9);
         let r = round6(&mut c, &[(7, tval(160, 0))]);
         assert!((r.ipv6.rx_bps - 60.0 * 8.0).abs() < 1e-9);
     }
@@ -751,6 +805,7 @@ mod tests {
             cur: traffic.iter().copied().collect(),
             cur6: HashMap::new(),
             cur_policer: policer.iter().copied().collect(),
+            incomplete: false,
         };
         let all = IpRange {
             name: "all".to_string(),
@@ -882,25 +937,67 @@ mod tests {
         assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 0);
     }
 
-    // 7. TAP rebuild (new ifindex for the same IP): no phantom deltas, counting
-    //    resumes from the new baseline.
+    // 7. TAP rebuild (new ifindex for the same IP): no phantom deltas; the recreated
+    //    TAP's fresh entry starts at zero and is counted from its first packet.
     #[test]
-    fn ifindex_rebuild_rebaselines() {
+    fn ifindex_rebuild_counts_the_fresh_entry() {
         let mut c = Collector::new();
         let ip = ip4(10, 0, 0, 7);
         round(&mut c, &[(tkey(5, ip), tval(1000, 0))], &[]);
         let r = round(&mut c, &[(tkey(5, ip), tval(2000, 0))], &[]);
         assert_eq!(ip_stats(&r, ip).rx_bytes, 1000);
-        // TAP gone: prune like rescan does.
-        c.prune_ifindexes(&HashSet::new());
+        // TAP gone: the rescan removed its key from the map.
         round(&mut c, &[], &[]);
         // Recreated TAP, fresh counters.
-        round(&mut c, &[(tkey(9, ip), tval(500, 0))], &[]);
+        let r = round(&mut c, &[(tkey(9, ip), tval(500, 0))], &[]);
+        assert_eq!(ip_stats(&r, ip).rx_bytes, 500);
         let r = round(&mut c, &[(tkey(9, ip), tval(800, 0))], &[]);
-        assert!(
-            (ip_stats(&r, ip).rx_bps - 2400.0).abs() < 1e-9,
-            "new baseline counted"
+        assert!((ip_stats(&r, ip).rx_bps - 2400.0).abs() < 1e-9);
+    }
+
+    // 7b. A burst that starts and ends inside one poll interval on a fresh entry
+    //     (new flow, or a key idle-evicted earlier) is counted. It used to serve as
+    //     the entry's baseline and vanish from every total.
+    #[test]
+    fn burst_on_a_fresh_entry_is_counted() {
+        let mut c = Collector::new();
+        let busy = ip4(10, 0, 0, 70);
+        let quiet = ip4(10, 0, 0, 71);
+        round(&mut c, &[(tkey(5, busy), tval(1000, 0))], &[]);
+        let r = round(
+            &mut c,
+            &[
+                (tkey(5, busy), tval(1000, 0)),
+                (tkey(5, quiet), tval(0, 3000)),
+            ],
+            &[],
         );
+        assert_eq!(ip_stats(&r, quiet).tx_bytes, 3000);
+        assert_eq!(r.totals[&quiet].tx_bytes, 3000);
+    }
+
+    // 7c. After a failed map read, keys missing from that poll keep their previous
+    //     samples: when they are read again they contribute their real delta, not
+    //     their whole history.
+    #[test]
+    fn keys_missing_after_a_failed_read_are_not_counted_twice() {
+        let mut c = Collector::new();
+        let ip = ip4(10, 0, 0, 72);
+        let key = tkey(5, ip);
+        round(&mut c, &[(key, tval(1000, 0))], &[]);
+        round(&mut c, &[(key, tval(5000, 0))], &[]);
+        let all = IpRange {
+            name: "all".to_string(),
+            start: 0,
+            end: u32::MAX,
+        };
+        let failed = PollInputs {
+            incomplete: true,
+            ..PollInputs::default()
+        };
+        c.apply_poll(failed, 1.0, std::slice::from_ref(&all), false);
+        let r = round(&mut c, &[(key, tval(5200, 0))], &[]);
+        assert_eq!(ip_stats(&r, ip).rx_bytes, 4200);
     }
 
     // 8. Idle eviction: a frozen key is reported after the threshold; when the daemon
@@ -921,8 +1018,10 @@ mod tests {
         // Daemon removed the key; the IP's totals are gone with it.
         let r = round(&mut c, &[], &[]);
         assert!(!r.totals.contains_key(&ip));
-        // Traffic returns on a recreated entry: rebaselined, no spike.
-        round(&mut c, &[(key, tval(100, 0))], &[]);
+        // Traffic returns on a recreated entry, which starts at zero: counted from its
+        // first packet, no spike.
+        let r = round(&mut c, &[(key, tval(100, 0))], &[]);
+        assert_eq!(ip_stats(&r, ip).rx_bytes, 100);
         let r = round(&mut c, &[(key, tval(160, 0))], &[]);
         assert!((ip_stats(&r, ip).rx_bps - 480.0).abs() < 1e-9);
     }
@@ -946,18 +1045,20 @@ mod tests {
         assert!((ip_stats(&r, ip).rx_bps - (1400.0 * 8.0)).abs() < 1e-9);
     }
 
-    // 10. Traffic and policer counters first appear in different rounds: each gets its
-    //     own baseline when it appears.
+    // 10. Traffic and policer counters first appear in different rounds: the policer
+    //     entry the data path creates (at zero) when a policy arms is counted from
+    //     its first verdict.
     #[test]
     fn traffic_and_policer_appear_in_different_rounds() {
         let mut c = Collector::new();
         let ip = ip4(10, 0, 0, 10);
         let k = LimitKey::new(ip, vm_bandwidth_common::DIR_RX);
         round(&mut c, &[(tkey(3, ip), tval(1000, 0))], &[]);
-        // Policer entry appears one round late: baseline round for it.
-        round(&mut c, &[(tkey(3, ip), tval(2000, 0))], &[(k, pstats(100))]);
+        // Policer entry appears one round late, already holding this round's verdicts.
+        let r = round(&mut c, &[(tkey(3, ip), tval(2000, 0))], &[(k, pstats(100))]);
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 100);
         let r = round(&mut c, &[(tkey(3, ip), tval(3000, 0))], &[(k, pstats(350))]);
-        assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 250);
+        assert_eq!(ip_stats(&r, ip).rx_dropped_bytes, 350);
         assert!((ip_stats(&r, ip).rx_dropped_bps - 2000.0).abs() < 1e-9);
     }
 

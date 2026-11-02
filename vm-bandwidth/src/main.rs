@@ -61,19 +61,20 @@ fn run() -> Result<()> {
     runtime.block_on(daemon::run_daemon(cli.config, object))
 }
 
-/// aya keeps roughly a dozen file descriptors open per attached TAP (program, map and
-/// link fds), so a bridge with many VMs easily exceeds the default 1024 soft limit.
-/// When the limit runs out the daemon cannot open new fds and misbehaves. Claim the hard
-/// limit up front so large hosts work.
+/// Every attached TAP holds two TC link fds on top of the shared program and map fds, and
+/// IPC clients, the watcher and metrics pushes need more, so a bridge with many VMs can
+/// approach the default 1024 soft limit. When the limit runs out the daemon cannot open
+/// new fds and misbehaves. Claim the hard limit up front so large hosts work.
 fn raise_fd_limit() -> u64 {
-    let mut rlim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    let (cur, max) = unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) != 0 {
-            return 0;
-        }
-        let r = rlim.assume_init();
-        (r.rlim_cur, r.rlim_max)
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
+    // SAFETY: getrlimit only writes the struct behind the valid, exclusive pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+        return 0;
+    }
+    let (cur, max) = (rlim.rlim_cur, rlim.rlim_max);
     let want = max.min(1 << 20);
     if cur >= want {
         return cur;
@@ -82,6 +83,7 @@ fn raise_fd_limit() -> u64 {
         rlim_cur: want,
         rlim_max: max,
     };
+    // SAFETY: setrlimit only reads the struct behind the valid pointer.
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
         log::info!("raised open-file limit from {cur} to {want}");
         want

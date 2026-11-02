@@ -1,8 +1,9 @@
 //! `--ui` client: connects to the daemon's Unix socket and renders a read-only TUI.
 //!
 //! Deliberately never loads eBPF, creates maps or attaches TC — the daemon is the only
-//! owner of the data plane. All data arrives over the IPC socket as [`Status`] /
-//! [`RangeDetail`] frames.
+//! owner of the data plane. All data arrives over the IPC socket as
+//! [`Status`](vm_bandwidth_core::ipc::Status) /
+//! [`RangeDetail`](vm_bandwidth_core::ipc::RangeDetail) frames.
 
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -12,7 +13,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
 
-use vm_bandwidth_core::config::{self};
+use vm_bandwidth_core::config;
 use vm_bandwidth_core::ipc::{self, Request, Response};
 
 use crate::daemon::SOCK_PATH;
@@ -86,7 +87,8 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             eprintln!(
-                "warning: cannot load {config_path:?}: {e};                  continuing without the trend screen"
+                "warning: cannot load {config_path:?}: {e}; \
+                 continuing without the trend screen"
             );
             None
         }
@@ -101,7 +103,18 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // Trend queries run on a one-worker tokio runtime with async reqwest, so the
+    // TUI keeps rendering while a fetch is in flight; results arrive on a channel.
+    // Built before the terminal switches modes: a failure here prints normally.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .context("starting the trend fetch runtime")?;
+
     let mut terminal = ratatui::init();
+    // Every exit from here on, `?` included, must hand the shell back intact.
+    let _restore = TerminalGuard;
     let default_sort = metrics_cfg
         .as_ref()
         .map(|c| c.default_sort)
@@ -128,13 +141,6 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         }
     });
 
-    // Trend queries run on a one-worker tokio runtime with async reqwest, so the
-    // TUI keeps rendering while a fetch is in flight; results arrive on a channel.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .context("starting the trend fetch runtime")?;
     let (trend_tx, mut trend_rx) =
         tokio::sync::mpsc::unbounded_channel::<(u64, Result<tui::TrendData, String>)>();
     app.trend_tx = Some(trend_tx);
@@ -190,12 +196,34 @@ pub fn run_ui(config_path: std::path::PathBuf) -> Result<()> {
         }
     };
 
-    ratatui::restore();
     result
+}
+
+/// Restores the terminal (raw mode, alternate screen) when dropped.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
 }
 
 /// Fetch overview (and detail, when on the detail screen) from the daemon.
 fn poll(client: &mut Option<Client>, app: &mut UiState) {
+    // Trends come straight from VictoriaMetrics, not from the daemon: keep them fresh
+    // even while the daemon is unreachable (the early returns below).
+    if matches!(app.screen, Screen::Trend) {
+        let stale = app
+            .trend
+            .as_ref()
+            .and_then(|t| t.fetched_at)
+            .map(|t| t.elapsed() > Duration::from_secs(30))
+            .unwrap_or(true);
+        if stale {
+            fetch_trend(app);
+        }
+    }
+
     if client.is_none() {
         *client = Client::connect().ok();
         if client.is_some() {
@@ -224,7 +252,14 @@ fn poll(client: &mut Option<Client>, app: &mut UiState) {
             app.status = Some(*s);
             app.error = None;
         }
-        Ok(_) => app.error = Some("unexpected reply to Overview".to_string()),
+        Ok(_) => {
+            // A reply of the wrong type means the stream is out of step (e.g. a late
+            // reply to a request that timed out): reconnect instead of reading every
+            // later reply one request behind.
+            app.error = Some("unexpected reply to Overview; reconnecting".to_string());
+            *client = None;
+            return;
+        }
         Err(e) => {
             app.error = Some(format!("{e:#}"));
             *client = None;
@@ -232,29 +267,34 @@ fn poll(client: &mut Option<Client>, app: &mut UiState) {
         }
     }
 
-    if matches!(app.screen, Screen::Trend) {
-        let stale = app
-            .trend
-            .as_ref()
-            .and_then(|t| t.fetched_at)
-            .map(|t| t.elapsed() > Duration::from_secs(30))
-            .unwrap_or(true);
-        if stale {
-            fetch_trend(app);
-        }
-    }
-
     if matches!(app.screen, Screen::Detail) {
         let idx = app.detail_index.or_else(|| app.overview.selected());
-        if let (Some(c), Some(idx)) = (client.as_mut(), idx) {
-            match c.request(&Request::RangeDetail { index: idx }) {
-                Ok(Response::RangeDetail(d)) => {
-                    app.detail = Some(*d);
-                    app.detail_index = Some(idx);
-                }
-                Ok(Response::Error { .. }) => app.detail = None,
-                Ok(_) => app.detail = None,
-                Err(_) => app.detail = None,
+        let reply = match (client.as_mut(), idx) {
+            (Some(c), Some(idx)) => Some((idx, c.request(&Request::RangeDetail { index: idx }))),
+            _ => None,
+        };
+        match reply {
+            None => {}
+            Some((idx, Ok(Response::RangeDetail(d)))) => {
+                app.detail = Some(*d);
+                app.detail_index = Some(idx);
+            }
+            // The daemon says why (range gone after a reload, reply over the frame
+            // limit, ...): show it instead of an endless "Waiting for daemon data…".
+            Some((_, Ok(Response::Error { message }))) => {
+                app.detail = None;
+                app.error = Some(message);
+            }
+            // Out of step or broken: reconnect, as for the overview request.
+            Some((_, Ok(_))) => {
+                app.detail = None;
+                app.error = Some("unexpected reply to RangeDetail; reconnecting".to_string());
+                *client = None;
+            }
+            Some((_, Err(e))) => {
+                app.detail = None;
+                app.error = Some(format!("{e:#}"));
+                *client = None;
             }
         }
     }
@@ -283,7 +323,13 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
     }
     match key.code {
         KeyCode::Char('q') => return UiAction::Quit,
-        KeyCode::Char('r') => return UiAction::Refresh,
+        KeyCode::Char('r') => {
+            // On the trend screen, "refresh now" includes the VictoriaMetrics query.
+            if let Some(trend) = app.trend.as_mut().filter(|_| app.screen == Screen::Trend) {
+                trend.fetched_at = None;
+            }
+            return UiAction::Refresh;
+        }
         KeyCode::Char('h') if matches!(app.screen, Screen::Overview) => app.show_help = true,
         KeyCode::Up => match app.screen {
             Screen::Overview => {
@@ -321,7 +367,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
                 };
                 if next != trend.win {
                     trend.win = next;
-                    trend.fetched_at = None;
+                    trend.clear_for_new_selection();
                     return UiAction::Refresh;
                 }
             }
@@ -329,7 +375,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
         KeyCode::Right if matches!(app.screen, Screen::Trend) => {
             if let Some(trend) = app.trend.as_mut() {
                 trend.win = (trend.win + 1) % TREND_WINDOWS.len();
-                trend.fetched_at = None;
+                trend.clear_for_new_selection();
                 return UiAction::Refresh;
             }
         }
@@ -337,7 +383,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
             if let Some(trend) = app.trend.as_mut() {
                 if trend.kind != TrendKind::Bandwidth {
                     trend.kind = TrendKind::Bandwidth;
-                    trend.fetched_at = None;
+                    trend.clear_for_new_selection();
                     return UiAction::Refresh;
                 }
             }
@@ -346,7 +392,7 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
             if let Some(trend) = app.trend.as_mut() {
                 if trend.kind != TrendKind::Packets {
                     trend.kind = TrendKind::Packets;
-                    trend.fetched_at = None;
+                    trend.clear_for_new_selection();
                     return UiAction::Refresh;
                 }
             }
@@ -445,7 +491,6 @@ fn handle_key(app: &mut UiState, key: KeyEvent) -> UiAction {
     UiAction::Nothing
 }
 
-/// Fetch the trend for `app.trend`'s IP/window/kind straight from VictoriaMetrics.
 /// Kick off an async fetch of the trend for `app.trend`'s IP/window/kind from
 /// VictoriaMetrics. The result arrives on the trend channel; the screen shows
 /// "Loading…" while the fetch is in flight.
@@ -454,7 +499,8 @@ fn fetch_trend(app: &mut UiState) {
         return;
     };
     trend.fetched_at = Some(std::time::Instant::now());
-    trend.data = None;
+    // Keep showing the current chart until the new data arrives (no "Loading…" flash
+    // on every periodic refresh); a new window or metric already cleared it.
     trend.error = None;
 
     if !app.metrics_enabled {
@@ -486,7 +532,7 @@ fn fetch_trend(app: &mut UiState) {
         TrendKind::Bandwidth => " * 8",
         TrendKind::Packets => "",
     };
-    let rate_window = app.rate_window_secs;
+    let rate_window = trend_rate_window(app.rate_window_secs, step);
     let rx_query = trend_query(&trend.target, rx_metric, rate_window, scale);
     let tx_query = trend_query(&trend.target, tx_metric, rate_window, scale);
     let base = app.metrics_url.clone();
@@ -500,16 +546,26 @@ fn fetch_trend(app: &mut UiState) {
     });
 }
 
+/// The `rate()` window for a trend sampled every `step_secs`: at least the base
+/// window (two push intervals, never below two minutes) and at least one step, so
+/// each point summarizes the whole step before it. A window shorter than the step
+/// (2 minutes against the 15-minute to 3-hour steps of the long views) turns the
+/// chart into spot samples that miss everything in between.
+fn trend_rate_window(base_secs: u64, step_secs: u64) -> u64 {
+    base_secs.max(step_secs)
+}
+
 /// Build one PromQL expression for a trend series.
 ///
 /// The shape is load-bearing: `rate()` drops the metric name, so mixing both
 /// directions in one `{__name__=~...}` selector yields duplicate label sets that
-/// VictoriaMetrics rejects; and range trends must wrap the rate in `sum()` or each
-/// IP comes back as its own series.
+/// VictoriaMetrics rejects; and the rate is always wrapped in `sum()` so one series
+/// comes back — a range has a series per IP, and even one IP's series splits by its
+/// `range` label when a reload renames its range.
 fn trend_query(target: &TrendTarget, metric: &str, rate_window: u64, scale: &str) -> String {
     match target {
         TrendTarget::Ip(ipv4) => format!(
-            "rate({metric}{{ip=\"{}\"}}[{rate_window}s]){scale}",
+            "sum(rate({metric}{{ip=\"{}\"}}[{rate_window}s])){scale}",
             std::net::Ipv4Addr::from(*ipv4)
         ),
         TrendTarget::Range(name) => format!(
@@ -535,7 +591,11 @@ async fn fetch_pair(
         fetch_series(client, base, rx_query, start, end, step),
         fetch_series(client, base, tx_query, start, end, step),
     )?;
-    Ok(tui::TrendData { rx, tx })
+    Ok(tui::TrendData {
+        rx,
+        tx,
+        axis: tui::TrendAxis { start, end, step },
+    })
 }
 
 /// One VictoriaMetrics `query_range` request, with a capped response body.
@@ -602,19 +662,153 @@ mod tests {
         TrendTarget::Ip(u32::from_be_bytes(addr))
     }
 
+    /// A UI client wired to a scripted daemon end over a socketpair.
+    fn scripted_client() -> (Option<Client>, UnixStream) {
+        let (ui_end, daemon_end) = UnixStream::pair().expect("socketpair");
+        ui_end
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("read timeout");
+        (Some(Client { stream: ui_end }), daemon_end)
+    }
+
+    fn send(daemon_end: &mut UnixStream, resp: &Response) {
+        let frame = ipc::encode(resp).expect("encode");
+        daemon_end.write_all(&frame).expect("write reply");
+    }
+
+    fn app() -> UiState {
+        UiState::new(
+            "br0".to_string(),
+            REFRESH,
+            vm_bandwidth_core::config::SortMode::Ip,
+        )
+    }
+
+    fn trend_screen_app() -> UiState {
+        let mut app = app();
+        app.screen = Screen::Trend;
+        app.trend = Some(TrendView {
+            target: ip([10, 0, 0, 1]),
+            from: Screen::Detail,
+            win: 0,
+            kind: TrendKind::Bandwidth,
+            data: Some(tui::TrendData::default()),
+            fetched_at: Some(std::time::Instant::now()),
+            error: None,
+        });
+        app
+    }
+
+    #[test]
+    fn trend_refresh_does_not_wait_for_the_daemon() {
+        let mut app = trend_screen_app();
+        app.trend.as_mut().unwrap().fetched_at = None; // due for a refresh
+                                                       // No daemon socket in the test environment: poll() reports it unreachable,
+                                                       // yet the trend (served by VictoriaMetrics) must still have been refreshed.
+        let mut client = None;
+        poll(&mut client, &mut app);
+        assert!(app.trend.as_ref().unwrap().fetched_at.is_some());
+    }
+
+    #[test]
+    fn switching_the_metric_drops_the_previous_selections_data() {
+        let mut app = trend_screen_app();
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(matches!(handle_key(&mut app, key), UiAction::Refresh));
+        let trend = app.trend.as_ref().unwrap();
+        assert!(trend.kind == TrendKind::Packets);
+        assert!(
+            trend.data.is_none(),
+            "bandwidth data must not be shown as pps"
+        );
+        assert!(trend.fetched_at.is_none());
+    }
+
+    #[test]
+    fn refresh_key_refetches_the_trend() {
+        let mut app = trend_screen_app();
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(matches!(handle_key(&mut app, key), UiAction::Refresh));
+        let trend = app.trend.as_ref().unwrap();
+        assert!(trend.fetched_at.is_none());
+        assert!(
+            trend.data.is_some(),
+            "the chart stays up until new data arrives"
+        );
+    }
+
+    #[test]
+    fn out_of_step_reply_drops_the_connection() {
+        // A late reply to an earlier (timed-out) RangeDetail request is still queued
+        // when the next Overview request goes out.
+        let (mut client, mut daemon_end) = scripted_client();
+        send(&mut daemon_end, &Response::RangeDetail(Box::default()));
+        let mut app = app();
+        poll(&mut client, &mut app);
+        assert!(
+            client.is_none(),
+            "an out-of-step stream must be reconnected"
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("unexpected reply")),
+            "{:?}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn daemon_error_reply_to_detail_is_shown() {
+        let (mut client, mut daemon_end) = scripted_client();
+        send(&mut daemon_end, &Response::Status(Box::default()));
+        send(
+            &mut daemon_end,
+            &Response::Error {
+                message: "range index 3 out of bounds".to_string(),
+            },
+        );
+        let mut app = app();
+        app.screen = Screen::Detail;
+        app.detail_index = Some(3);
+        poll(&mut client, &mut app);
+        assert!(
+            client.is_some(),
+            "a well-formed error reply keeps the stream"
+        );
+        assert!(app.detail.is_none());
+        assert_eq!(app.error.as_deref(), Some("range index 3 out of bounds"));
+    }
+
     #[test]
     fn ip_bandwidth_query_is_a_per_ip_rate_scaled_to_bits() {
+        // sum(): an IP whose range was renamed by a reload has one series per
+        // `range` label value; unsummed they came back as two interleaved series.
         let q = trend_query(&ip([10, 30, 10, 121]), "vmbw_rx_bytes_total", 120, " * 8");
         assert_eq!(
             q,
-            "rate(vmbw_rx_bytes_total{ip=\"10.30.10.121\"}[120s]) * 8"
+            "sum(rate(vmbw_rx_bytes_total{ip=\"10.30.10.121\"}[120s])) * 8"
         );
     }
 
     #[test]
     fn ip_packets_query_carries_no_scale() {
         let q = trend_query(&ip([10, 30, 10, 121]), "vmbw_rx_packets_total", 120, "");
-        assert_eq!(q, "rate(vmbw_rx_packets_total{ip=\"10.30.10.121\"}[120s])");
+        assert_eq!(
+            q,
+            "sum(rate(vmbw_rx_packets_total{ip=\"10.30.10.121\"}[120s]))"
+        );
+    }
+
+    #[test]
+    fn rate_window_covers_at_least_one_step() {
+        for (label, _, step) in TREND_WINDOWS {
+            let w = trend_rate_window(120, step);
+            assert!(w >= step, "{label}: window {w}s shorter than step {step}s");
+            assert!(w >= 120, "{label}: window {w}s below the base window");
+        }
+        assert_eq!(trend_rate_window(120, 60), 120);
+        assert_eq!(trend_rate_window(120, 10_800), 10_800);
     }
 
     #[test]

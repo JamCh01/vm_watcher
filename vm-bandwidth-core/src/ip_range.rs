@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use crate::config::IpRangeEntry;
+use crate::ipc::IPV6_RANGE_NAME;
 
 /// One CIDR prefix: `network` with its top `prefix_len` bits fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,6 +134,14 @@ pub fn validate_ranges(entries: &[IpRangeEntry]) -> Result<Vec<IpRange>, String>
                 entry.range
             ));
         }
+        // The aggregate IPv6 pseudo-range is identified by this name in the UI and in
+        // the metrics `range` label; an IPv4 range sharing it would be mixed into it.
+        if entry.name == IPV6_RANGE_NAME {
+            return Err(format!(
+                "ip range name {IPV6_RANGE_NAME:?} is reserved for the aggregate IPv6 \
+                 counters; choose another name"
+            ));
+        }
         if !names.insert(entry.name.as_str()) {
             return Err(format!(
                 "ip range name {:?} is used more than once",
@@ -177,6 +186,14 @@ mod tests {
             policy: None,
             overrides: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ipv6_pseudo_range_name_is_reserved() {
+        let err = validate_ranges(&[entry("IPv6", "10.0.0.1-10.0.0.2")]).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        // Only the exact label collides; other spellings are distinct names.
+        assert!(validate_ranges(&[entry("ipv6-hosts", "10.0.0.1-10.0.0.2")]).is_ok());
     }
 
     #[test]

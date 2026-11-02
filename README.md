@@ -108,7 +108,8 @@ bridge = "br0"
 [collector]
 refresh_interval_ms = 1000        # sampling period (also the window tick)
 interface_scan_interval_secs = 5  # TAP rescan period
-map_max_entries = 8192            # TRAFFIC / LIMIT_POLICIES / LIMIT_STATE / SWL_LOG capacity
+map_max_entries = 8192            # TRAFFIC / TRAFFIC6 / LIMIT_POLICIES / LIMIT_STATE / POLICER_STATS capacity
+swl_map_max_entries = 256         # SWL_LOG only: each entry preallocates ~16.4 KiB of kernel memory
 
 [display]
 default_sort = "ip"               # initial sort in the --ui detail page: ip | rx | tx | total
@@ -144,13 +145,17 @@ range = "10.30.8.1-10.30.8.16"
 Rules:
 
 - Ranges are `START-END` only (no CIDR, wildcards, or reversed ranges) and
-  must not overlap.
+  must not overlap. The range name `IPv6` is reserved for the aggregate IPv6
+  pseudo-range.
 - `policy` is optional; omitting it leaves the range monitor-only.
   `rx_threshold`/`tx_threshold` and `rx_limit`/`tx_limit` are per-direction;
   `window`, `trigger_ratio`, `limit_duration`, `burst` are shared. A
   partially filled direction is rejected.
-- Units: rates `100Mbps`/`1Gbps` (decimal), durations `5m`/`30m`/`1h`,
-  percentages `80%`, bursts `4MiB` (binary). Integers only.
+- Units: rates `100Mbps`/`1Gbps` (decimal, in bits — byte-style units such as
+  `MBps` are rejected), durations `5m`/`30m`/`1h`, percentages `80%`, bursts
+  `4MiB` (binary). Integers only.
+- `collector.refresh_interval_ms` (whole seconds) and
+  `interface_scan_interval_secs` are limited to one hour.
 - Overrides must target an IP inside their range and be unique per range;
   unset fields inherit the range policy.
 - `[metrics]` (optional, default off): pushes cumulative counters every
@@ -195,13 +200,18 @@ Runnable per-algorithm configs live in [examples/](examples/).
 | Sliding Window Log | `sliding_window_log` | `limit_window` | Exact window bytes; opt-in, scans a 1024-entry ring per packet | High |
 | GCRA (default) | `gcra` | `burst` | Burst tolerance expressed as time tolerance | Very low |
 
-Selection guidance: default to `gcra` or `token_bucket`; `leaky_bucket` for
-the smoothest output; `sliding_window_counter` for window-quota semantics
-without boundary bursts; `fixed_window` when you accept boundary bursts for
-maximum simplicity; `sliding_window_log` only for low packet rates needing
-exact window semantics (it requires
-`[experimental] enable_sliding_window_log = true` and preallocates
-`swl_map_max_entries` × ≈16.4 KiB of kernel memory).
+Selection guidance: `token_bucket`, `leaky_bucket` and `gcra` (the default) are
+three bookkeeping forms of the same policer — for equal `burst` and limit they
+make the same decisions (up to integer rounding) — so pick the one whose
+parameters read most naturally to you; none of them shapes or smooths traffic.
+`sliding_window_counter` for window-quota semantics without boundary bursts;
+`fixed_window` when you accept boundary bursts for maximum simplicity;
+`sliding_window_log` only for low packet rates needing exact window semantics
+(it requires `[experimental] enable_sliding_window_log = true` and preallocates
+`swl_map_max_entries` × ≈16.4 KiB of kernel memory). Its log remembers the last
+1024 admitted packets, so it can only enforce window allowances below about 1024
+packets' worth of bytes (≈1.5 MB of full-size frames, e.g. up to ~12 Mbps with a
+1 s `limit_window`); above that it admits everything.
 
 ### Policy fields
 
@@ -212,9 +222,15 @@ exact window semantics (it requires
 | `window` | shared | rolling observation window | > 0 (truncated at 3600 samples) |
 | `trigger_ratio` | shared | trigger line as % of threshold | 1% – 100% |
 | `limit_duration` | shared | enforcement duration, auto-recover after | > 0 |
-| `burst` | shared | bucket capacity / GCRA tolerance (bucket algos + GCRA only) | ≤ 1GiB |
+| `burst` | shared | bucket capacity / GCRA tolerance (bucket algos + GCRA only) | ≤ 1GiB; keep ≥ 64KiB (see below) |
 | `algorithm` | shared | policing algorithm, default `gcra` | one of six |
 | `limit_window` | shared | window length (window algos only) | 1s – 60s |
+
+Frames up to 65 535 bytes — GSO/TSO aggregates included — are policed whole, so
+a frame larger than `burst` (bucket algorithms, GCRA) or than the window
+allowance `limit × limit_window ÷ 8` (window algorithms) can never pass while a
+flow is LIMITED: such policies drop large frames instead of rate-limiting them.
+The daemon logs a warning for every policy below 64 KiB at startup and on reload.
 
 Fields not applicable to the selected algorithm are ignored (so overrides can
 inherit freely). Unknown algorithm names are rejected at load time; the data
@@ -290,18 +306,24 @@ semantics.
 
 - **One eBPF object, attached to every TAP**: loaded once (verifier runs
   once); the same programs attach per TAP via TCX (≥ 6.6) or netlink clsact.
-  Seven maps (LPM whitelist, IPv4/IPv6 counters, policies, states, SWL log,
-  policer stats) are shared by construction.
+  Eight maps (LPM whitelist, IPv4/IPv6 counters, policies, states, SWL log,
+  policer stats, oversized-frame counters) are shared by construction.
+- Packets the classifier lets through return `TC_ACT_UNSPEC` (`TCX_NEXT`), so
+  other TCX programs attached to the same TAP still see them.
 - **VLAN/QinQ**: up to two 802.1Q/802.1ad tags (compile-time bound) are
-  stripped; deeper tags, truncated tags and non-IP payloads fail open.
+  stripped; deeper tags, truncated tags and non-IP payloads fail open. (At TC
+  ingress the kernel has already moved the outer tag into the skb metadata, so
+  one more tag is handled there.)
 - **IPv6 is keyed by TAP**, not address — privacy-address rotation cannot
   exhaust the counter map.
 - Attachments are owned precisely: only this program's TC filters are ever
   removed; shared qdiscs are never deleted. Attach failures retry with
   exponential backoff.
 - Counters are monotonic; userspace computes rates from adjacent-sample
-  deltas. Wrap/reset/TAP-rebuild periods read as zero — never negative
-  bandwidth, never false triggers.
+  deltas. A counter that goes backwards (wrap/reset) reads as zero for that
+  interval — never negative bandwidth, never false triggers — and an entry
+  created since the last poll (new flow, rebuilt TAP, evicted key coming back)
+  counts from zero.
 - Idle counter reclamation: keys unchanged for ~5 minutes are evicted and
   rebuilt by the data plane on the next packet.
 - A single engine task owns all mutable state; IPC/watchers/signals talk to it
@@ -319,6 +341,16 @@ semantics.
 - Cumulative traffic counts from daemon start (maps rebuild on restart).
 - Enforcement is policing: excess packets are dropped, never buffered or
   shaped.
+- Frames the bridge floods (unknown unicast, e.g. once a silent VM's MAC ages
+  out of the forwarding table) leave through every TAP and are counted and
+  policed once per TAP for their destination address.
+- Metric series carry no host label: give every host its own VictoriaMetrics,
+  or several hosts' series overwrite each other.
+- HTTPS metrics endpoints are verified against the bundled public CA roots
+  (webpki-roots); a certificate from a private CA is rejected.
+- Kernels < 6.6 (netlink TC): a legacy `ingress` qdisc already present on a TAP
+  takes the egress filter onto its ingress hook; remove it
+  (`tc qdisc del dev <tap> ingress`) before starting the daemon.
 
 ## License
 

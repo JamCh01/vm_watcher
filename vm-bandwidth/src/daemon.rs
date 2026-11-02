@@ -16,9 +16,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use aya::maps::{
-    lpm_trie::Key as TrieKey, HashMap as AyaHashMap, LpmTrie, MapData, MapError, PerCpuHashMap,
-};
+use aya::maps::lpm_trie::Key as TrieKey;
+use aya::maps::{HashMap as AyaHashMap, LpmTrie, MapData, MapError, PerCpuHashMap};
 use futures::{SinkExt, StreamExt};
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::RecursiveMode;
@@ -26,6 +25,7 @@ use notify_debouncer_full::Debouncer;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::bytes::Bytes;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use vm_bandwidth_common::{
     LimitKey, LimitPolicy, LimitState, OversizedStats, PolicerStats, SwlRing, TrafficKey,
@@ -113,13 +113,11 @@ struct Engine {
     config_watcher_errors_total: u64,
     config_watcher_last_error: String,
 
-    /// Dataplane health: set when a rollback could not fully restore the maps.
-    /// The dataplane may then differ from the active configuration; each affected
-    /// flow's exact state is carried by the per-step `RollbackFailure` logs. The
-    /// flag stays on so operators can see the degradation instead of it being
-    /// swallowed.
-    /// Dataplane rollback health (degraded flag + cumulative failure counter);
-    /// surfaced verbatim into IPC `Status`.
+    /// Dataplane rollback health (degraded flag + cumulative failure counter),
+    /// surfaced verbatim into IPC `Status`. The degraded flag is set when a rollback
+    /// could not fully restore the maps and stays on, so operators see the
+    /// degradation instead of it being swallowed; each affected flow's exact state is
+    /// carried by the per-step `RollbackFailure` logs.
     rollback_health: RollbackHealth,
 
     bridge: String,
@@ -230,40 +228,22 @@ impl Engine {
         let now = self.now_secs();
         let actions = self.limiter.tick(now, &totals);
         if !actions.is_empty() {
-            let mut journal = crate::txmaps::TxJournal::default();
-            let applied = {
+            let failures = {
                 let mut maps = EngineMaps {
                     policies: &mut self.limit_policies,
                     state: &mut self.limit_state,
                     swl: &mut self.swl_log,
                     policer: &mut self.policer_stats,
                 };
-                run_limit_actions(&mut maps, &actions, &mut journal)
+                let mut wl = EngineWhitelist(&mut self.monitored);
+                apply_tick_actions(&mut maps, &mut wl, &mut self.limiter, &actions)
             };
-            if let Err(e) = applied {
-                // A half-applied batch is worse than none: roll the dataplane back and
-                // let the flows re-evaluate from NORMAL on their next threshold cross.
-                let report = {
-                    let mut maps = EngineMaps {
-                        policies: &mut self.limit_policies,
-                        state: &mut self.limit_state,
-                        swl: &mut self.swl_log,
-                        policer: &mut self.policer_stats,
-                    };
-                    let mut wl = EngineWhitelist(&mut self.monitored);
-                    crate::txmaps::rollback_journal(&mut maps, &mut wl, &journal)
-                };
-                self.surface_rollback_report(&report);
-                for action in &actions {
-                    let (ipv4, direction) = match action {
-                        LimitAction::Install {
-                            ipv4, direction, ..
-                        }
-                        | LimitAction::Remove { ipv4, direction } => (*ipv4, *direction),
-                    };
-                    self.limiter.reset_flow(ipv4, direction);
-                }
-                log::error!("runtime limit actions failed and were rolled back: {e:#}");
+            for failure in &failures {
+                self.surface_rollback_report(&failure.report);
+                log::error!(
+                    "limit action failed and was rolled back: {:#}",
+                    failure.error
+                );
             }
         }
         self.last_totals = totals;
@@ -377,7 +357,7 @@ impl Engine {
                     // with dead (ifindex, IP) keys as VMs churn (§33). Keys already
                     // pending were retried above; skip them this pass.
                     let mut stale = Vec::new();
-                    for (key, _) in self.traffic.iter().flatten() {
+                    for key in self.traffic.keys().flatten() {
                         if !new_ifindexes.contains(&key.ifindex)
                             && !self.pending_removes.traffic.contains(&key)
                         {
@@ -392,10 +372,8 @@ impl Engine {
                         |k| self.traffic.remove(k),
                     );
                     // Keys whose removal failed stay pending and are retried next
-                    // scan; userspace tracking follows ifindex liveness regardless
-                    // (a re-baseline is safe: deltas are saturating and an absent
-                    // prev starts the next poll at zero delta).
-                    self.collector.prune_ifindexes(&new_ifindexes);
+                    // scan. The collector needs no pruning: its previous samples
+                    // mirror the map and drop out once the keys are gone.
                     if !pruned.failed_keys.is_empty() {
                         self.pending_removes.traffic.extend(pruned.failed_keys);
                     }
@@ -460,11 +438,7 @@ impl Engine {
             return;
         }
 
-        let new_cfg = match String::from_utf8(bytes.clone())
-            .map_err(|e| format!("config is not valid UTF-8: {e}"))
-            .and_then(|text| {
-                config::parse(&text).map_err(|e| format!("{e} (in {})", path.display()))
-            }) {
+        let new_cfg = match parse_config(&bytes, path) {
             Ok(cfg) => cfg,
             Err(e) => {
                 self.last_reload_ok = false;
@@ -491,6 +465,9 @@ impl Engine {
         self.config_loaded_at = stamp;
         self.last_config_bytes = bytes;
         log::info!("config reload succeeded; generation {}", self.generation);
+        for warning in self.config.load().small_burst_warnings() {
+            log::warn!("{warning}");
+        }
 
         // Rebuild the IPC snapshot immediately under the NEW config: build_status pairs
         // snapshot ranges with config ranges by index, so serving the old snapshot
@@ -542,11 +519,13 @@ impl Engine {
 
         // The trie capacity is fixed at startup; refuse a reload that would overflow it
         // before touching any map, instead of failing halfway through the install phase.
-        let new_count = u32::try_from(new_prefixes.len()).unwrap_or(u32::MAX);
-        if new_count > self.whitelist_capacity {
+        let peak = whitelist_peak(&old_prefixes, &new_prefixes);
+        if peak > self.whitelist_capacity as usize {
             anyhow::bail!(
-                "new config needs {new_count} whitelist prefixes but MONITORED_IPS capacity \
-                 is {} (sized at startup); restart the daemon to resize it",
+                "new config needs {} whitelist prefixes ({peak} while the reload swaps them \
+                 in) but MONITORED_IPS capacity is {} (sized at startup); restart the daemon \
+                 to resize it",
+                new_prefixes.len(),
                 self.whitelist_capacity
             );
         }
@@ -654,7 +633,8 @@ impl Engine {
             oversized_tx_packets: self.oversized.1.packets,
             oversized_tx_bytes: self.oversized.1.bytes,
             swl_map_capacity: self.config.load().swl_map_max_entries,
-            swl_map_used: self.swl_log.iter().filter_map(|i| i.ok()).count() as u32,
+            // Keys only: iterating values would copy every ~16.4 KiB ring per poll.
+            swl_map_used: self.swl_log.keys().filter_map(Result::ok).count() as u32,
             ranges,
         }
     }
@@ -819,8 +799,6 @@ fn state_label(limited: bool) -> String {
     }
 }
 
-/// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
-/// Ranges are validated disjoint, so their prefix sets never overlap.
 /// Process-health view of dataplane rollbacks: the degraded flag and the
 /// cumulative rollback-failure counter that IPC `Status` exposes.
 #[derive(Default)]
@@ -841,7 +819,7 @@ impl RollbackHealth {
             log::error!(
                 "rollback failed at '{}' for {}: {}",
                 f.op,
-                std::net::Ipv4Addr::from(f.key.ipv4),
+                f.target,
                 f.error
             );
         }
@@ -1026,7 +1004,10 @@ fn key_already_absent(e: &MapError) -> bool {
 
 /// Human-readable algorithm name for log lines.
 fn algorithm_name(algorithm: u32) -> &'static str {
-    use vm_bandwidth_common::*;
+    use vm_bandwidth_common::{
+        ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
+        ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET,
+    };
     match algorithm {
         ALGO_TOKEN_BUCKET => "token_bucket",
         ALGO_LEAKY_BUCKET => "leaky_bucket",
@@ -1118,6 +1099,44 @@ fn run_limit_actions<M: crate::txmaps::LimitMaps>(
     Ok(())
 }
 
+/// One tick action that could not be applied: the error plus the report of the
+/// rollback that undid its partial map writes.
+#[derive(Debug)]
+struct TickActionFailure {
+    error: anyhow::Error,
+    report: crate::txmaps::RollbackReport,
+}
+
+/// Apply the limit actions of one limiter tick, each in its own map transaction.
+///
+/// Tick actions belong to independent flows, so a failure stays contained to its
+/// flow: only that action's partial writes are rolled back, and the limiter is told
+/// so its phase matches the dataplane again ([`Limiter::revert_failed_action`]).
+/// Every other flow's action still takes effect — one flow that cannot be armed
+/// (e.g. a full SWL_LOG map) neither blocks the rest nor re-arms policies whose
+/// expiry was applied in the same tick. Removes run before installs so they free
+/// map capacity first.
+fn apply_tick_actions<M: crate::txmaps::LimitMaps, W: crate::txmaps::WhitelistOps>(
+    maps: &mut M,
+    wl: &mut W,
+    limiter: &mut Limiter,
+    actions: &[LimitAction],
+) -> Vec<TickActionFailure> {
+    let (removes, installs): (Vec<&LimitAction>, Vec<&LimitAction>) = actions
+        .iter()
+        .partition(|action| matches!(action, LimitAction::Remove { .. }));
+    let mut failures = Vec::new();
+    for action in removes.into_iter().chain(installs) {
+        let mut journal = crate::txmaps::TxJournal::default();
+        if let Err(error) = run_limit_actions(maps, std::slice::from_ref(action), &mut journal) {
+            let report = crate::txmaps::rollback_journal(maps, wl, &journal);
+            limiter.revert_failed_action(action);
+            failures.push(TickActionFailure { error, report });
+        }
+    }
+    failures
+}
+
 /// Error payload of a reload whose dataplane apply failed: the original error
 /// plus the rollback report for surfacing.
 #[derive(Debug)]
@@ -1168,20 +1187,49 @@ fn apply_and_commit<M: crate::txmaps::LimitMaps, W: crate::txmaps::WhitelistOps>
     Ok(())
 }
 
+/// Whitelist entries the trie holds at the peak of a reload: additions are inserted
+/// before removals are deleted (§27), so old and new prefixes briefly coexist.
+fn whitelist_peak(old: &HashSet<Cidr>, new: &HashSet<Cidr>) -> usize {
+    old.union(new).count()
+}
+
+/// CIDR prefixes of all configured ranges — the whitelist's unit of install/removal.
+/// Ranges are validated disjoint, so their prefix sets never overlap.
 fn prefix_set(cfg: &ValidatedConfig) -> HashSet<Cidr> {
     cfg.ranges.iter().flat_map(|r| r.inner.cidrs()).collect()
 }
 
+/// Validate a config file's raw bytes (startup and every reload); errors name the file.
+fn parse_config(bytes: &[u8], path: &Path) -> Result<ValidatedConfig, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("config is not valid UTF-8: {e}"))?;
+    config::parse(text).map_err(|e| format!("{e} (in {})", path.display()))
+}
+
 /// Entry point for daemon mode.
 pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<()> {
-    // 1. Load and validate the initial config. Refuse to start on any problem.
-    let cfg = config::load(&config_path).map_err(anyhow::Error::msg)?;
-    let initial_config_bytes = std::fs::read(&config_path)?;
+    // 0. Signals first. Until a handler exists SIGHUP's default action terminates the
+    //    process, and systemd's Restart=on-failure counts that as a clean exit — so a
+    //    `systemctl reload` landing during the multi-second startup (eBPF load, TAP
+    //    attach) would leave the host unmonitored. Registered handlers queue the
+    //    signal for the engine loop instead.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
+    // 1. Load and validate the initial config. Refuse to start on any problem. The
+    //    bytes are read once so the reload dedup baseline is exactly what was parsed.
+    let initial_config_bytes = std::fs::read(&config_path)
+        .with_context(|| format!("cannot read config file {}", config_path.display()))?;
+    let cfg = parse_config(&initial_config_bytes, &config_path).map_err(anyhow::Error::msg)?;
     log::info!(
         "loaded {} IP range(s) for bridge {}",
         cfg.ranges.len(),
         cfg.bridge
     );
+    for warning in cfg.small_burst_warnings() {
+        log::warn!("{warning}");
+    }
 
     // 2. Single-instance lock. The file is created once and NEVER deleted: deleting
     //    it on shutdown opens an inode race (another process locks the old inode
@@ -1367,20 +1415,34 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
     });
     log::info!("IPC listening on {SOCK_PATH}");
 
-    // 6. File watcher (hot reload) + SIGHUP.
+    // 6. File watcher (hot reload) + SIGHUP (the signal streams were registered first
+    //    thing at startup).
     let (reload_tx, mut reload_rx) = mpsc::channel::<WatchMsg>(8);
-    let _watcher = spawn_watcher(config_path.clone(), reload_tx.clone())?;
+    // A watcher that cannot start (e.g. inotify instances exhausted) costs hot reload
+    // on save, not monitoring: SIGHUP still reloads, and the status reports the
+    // watcher unhealthy. Exiting here instead would crash-loop under systemd,
+    // detaching and re-attaching every TAP on each attempt.
+    let _watcher = match spawn_watcher(config_path.clone(), reload_tx.clone()) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            engine.record_watcher_error(format!("cannot watch the config file: {e:#}"));
+            None
+        }
+    };
+    // Edits saved while the daemon was starting predate the watch: compare once now
+    // that it is live and reload if the file has moved on since it was parsed.
+    if std::fs::read(&config_path).is_ok_and(|bytes| bytes != engine.last_config_bytes) {
+        let _ = reload_tx.try_send(WatchMsg::Reload);
+    }
 
-    // 7. Signals.
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
-
-    // 8. Engine loop. A config change reschedules all three timers immediately
-    //    (the scheduler is the component that rebuilds on the watch signal).
+    // 7. Engine loop. Timers run on fixed deadlines; a config change pulls a deadline
+    //    in when its interval got shorter but never pushes one out.
     let mut config_rx = config_watch.subscribe();
-    let (mut next_collect, mut next_scan, mut next_push) = schedules_from(&engine.config.load());
+    let start = tokio::time::Instant::now();
+    let intervals = TimerIntervals::of(&engine.config.load());
+    let mut next_collect = start + intervals.collect;
+    let mut next_scan = start + intervals.scan;
+    let mut next_push = start + intervals.push;
 
     log::info!("daemon running (generation {})", engine.generation);
     loop {
@@ -1410,9 +1472,14 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
             }
             r = config_rx.changed() => {
                 if r.is_ok() {
-                    // The reload applied above changed intervals; rebuild the
-                    // schedule now rather than one stale cycle later.
-                    (next_collect, next_scan, next_push) = schedules_from(&engine.config.load());
+                    // Apply new intervals now rather than one stale cycle later, but
+                    // only ever pull deadlines in: a config rewritten more often than
+                    // the push or scan interval must not postpone those forever.
+                    let now = tokio::time::Instant::now();
+                    let intervals = TimerIntervals::of(&engine.config.load());
+                    next_collect = rescheduled(next_collect, intervals.collect, now);
+                    next_scan = rescheduled(next_scan, intervals.scan, now);
+                    next_push = rescheduled(next_push, intervals.push, now);
                     log::info!(
                         "config generation {}: timers rescheduled",
                         *config_rx.borrow_and_update()
@@ -1428,18 +1495,18 @@ pub async fn run_daemon(config_path: PathBuf, object: &'static [u8]) -> Result<(
             _ = tokio::time::sleep_until(next_collect) => {
                 // Map iteration is a burst of syscalls; same reasoning as above.
                 tokio::task::block_in_place(|| engine.collect_tick());
-                next_collect = tokio::time::Instant::now()
-                    + Duration::from_millis(engine.config.load().refresh_interval_ms.max(1));
+                let interval = TimerIntervals::of(&engine.config.load()).collect;
+                next_collect = next_deadline(next_collect, interval, tokio::time::Instant::now());
             }
             _ = tokio::time::sleep_until(next_scan) => {
                 tokio::task::block_in_place(|| engine.rescan_taps());
-                next_scan = tokio::time::Instant::now()
-                    + Duration::from_secs(engine.config.load().interface_scan_interval_secs.max(1));
+                let interval = TimerIntervals::of(&engine.config.load()).scan;
+                next_scan = next_deadline(next_scan, interval, tokio::time::Instant::now());
             }
             _ = tokio::time::sleep_until(next_push) => {
                 engine.push_metrics();
-                next_push = tokio::time::Instant::now()
-                    + Duration::from_secs(engine.config.load().metrics_push_interval_secs.max(5));
+                let interval = TimerIntervals::of(&engine.config.load()).push;
+                next_push = next_deadline(next_push, interval, tokio::time::Instant::now());
             }
         }
     }
@@ -1688,7 +1755,7 @@ async fn send_response(
         let err_resp = Response::Error { message };
         let err_body =
             serde_json::to_vec(&err_resp).map_err(|e| SendFailure::Encode(e.to_string()))?;
-        if let Err(e) = sink.send(err_body.into()).await {
+        if let Err(e) = sink.send(Bytes::from(err_body)).await {
             return Err(SendFailure::Write(e.to_string()));
         }
         return Err(SendFailure::TooLarge {
@@ -1696,25 +1763,56 @@ async fn send_response(
             max: ipc::MAX_RESPONSE_FRAME,
         });
     }
-    sink.send(body.into())
+    sink.send(Bytes::from(body))
         .await
         .map_err(|e| SendFailure::Write(e.to_string()))
 }
 
 /// (Re)build the three engine timers from a config snapshot.
-fn schedules_from(
-    cfg: &ValidatedConfig,
-) -> (
-    tokio::time::Instant,
-    tokio::time::Instant,
-    tokio::time::Instant,
-) {
-    let now = tokio::time::Instant::now();
-    (
-        now + Duration::from_millis(cfg.refresh_interval_ms.max(1)),
-        now + Duration::from_secs(cfg.interface_scan_interval_secs.max(1)),
-        now + Duration::from_secs(cfg.metrics_push_interval_secs.max(5)),
-    )
+/// The engine's three timer periods, taken from a config snapshot.
+struct TimerIntervals {
+    collect: Duration,
+    scan: Duration,
+    push: Duration,
+}
+
+impl TimerIntervals {
+    fn of(cfg: &ValidatedConfig) -> Self {
+        Self {
+            collect: Duration::from_millis(cfg.refresh_interval_ms.max(1)),
+            scan: Duration::from_secs(cfg.interface_scan_interval_secs.max(1)),
+            push: Duration::from_secs(cfg.metrics_push_interval_secs.max(5)),
+        }
+    }
+}
+
+/// The deadline after `prev` on a fixed cadence of `period`. Anchoring on the previous
+/// deadline instead of on `now` keeps the time spent handling a tick from stretching
+/// every period — the limiter counts each collection tick as exactly one
+/// `refresh_interval`, so a drifting cadence would inflate its window averages. A loop
+/// that fell a whole period behind re-anchors on `now` instead of firing a burst of
+/// catch-up ticks.
+fn next_deadline(
+    prev: tokio::time::Instant,
+    period: Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let next = prev + period;
+    if next > now {
+        next
+    } else {
+        now + period
+    }
+}
+
+/// Apply a (possibly) changed `period` to a pending deadline without ever postponing
+/// it: the earlier of the current deadline and one new period from `now`.
+fn rescheduled(
+    current: tokio::time::Instant,
+    period: Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    current.min(now + period)
 }
 
 /// Watch the config file's parent directory; debounce bursts and trigger one reload (§29).
@@ -1975,6 +2073,7 @@ mod reload_commit_tests {
     use super::{apply_and_commit, ConfigArc};
     use crate::collector::{Collector, IpStats};
     use crate::txmaps::testmaps::{policy, FakeMaps, FakeWhitelist};
+    use crate::txmaps::RollbackTarget;
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2125,7 +2224,10 @@ burst = "1MiB"
         // are derived from exactly this report.
         assert!(!rb.report.dataplane_consistent);
         assert_eq!(rb.report.failures.len(), 1);
-        assert_eq!(rb.report.failures[0].key, LimitKey::new(IP1, DIR_RX));
+        assert_eq!(
+            rb.report.failures[0].target,
+            RollbackTarget::Flow(LimitKey::new(IP1, DIR_RX))
+        );
         assert_eq!(rb.report.failures[0].op, "re-arm removed policy");
         // Everything else rolled back cleanly on top of that one failure:
         // IP1/TX re-armed, both IP2 directions restored to the old policy.
@@ -2237,7 +2339,15 @@ burst = "1MiB"
         for f in &rb.report.failures {
             assert_eq!(f.op, "re-arm removed policy");
         }
-        let mut failed_keys: Vec<_> = rb.report.failures.iter().map(|f| f.key).collect();
+        let mut failed_keys: Vec<_> = rb
+            .report
+            .failures
+            .iter()
+            .map(|f| match f.target {
+                RollbackTarget::Flow(key) => key,
+                other => panic!("unexpected rollback target {other}"),
+            })
+            .collect();
         failed_keys.sort_by_key(|k| (k.ipv4, k.direction));
         assert_eq!(
             failed_keys,
@@ -2324,6 +2434,228 @@ burst = "1MiB"
         }
         maps.assert_invariants();
         maps.assert_no_orphans();
+    }
+}
+
+#[cfg(test)]
+mod tick_apply_tests {
+    //! The production `apply_tick_actions` driven with scripted maps: tick actions
+    //! of independent flows must never share a fate.
+
+    use super::apply_tick_actions;
+    use crate::txmaps::testmaps::{FakeMaps, FakeWhitelist};
+    use std::collections::HashMap;
+    use vm_bandwidth_common::{LimitKey, DIR_RX};
+    use vm_bandwidth_core::config::{self, ValidatedConfig};
+    use vm_bandwidth_core::limiter::{IpTotals, LimitAction, Limiter};
+
+    const IP_A: u32 = u32::from_be_bytes([10, 0, 0, 1]);
+    const IP_B: u32 = u32::from_be_bytes([10, 0, 0, 2]);
+    /// Enough bytes per one-second tick to exceed the 100Kbps trigger line.
+    const BURST: u64 = 200_000;
+
+    /// Two-sample window, 100% trigger ratio, 5s enforcement.
+    fn cfg() -> ValidatedConfig {
+        config::parse(
+            r#"
+[network]
+bridge = "br0"
+[[ip_ranges]]
+name = "r1"
+range = "10.0.0.1-10.0.0.4"
+[ip_ranges.policy]
+rx_threshold = "100Kbps"
+tx_threshold = "100Kbps"
+window = "2s"
+trigger_ratio = "100%"
+rx_limit = "100Kbps"
+tx_limit = "100Kbps"
+limit_duration = "5s"
+burst = "1MiB"
+"#,
+        )
+        .expect("test config must parse")
+    }
+
+    fn totals(rx: &[(u32, u64)]) -> HashMap<u32, IpTotals> {
+        rx.iter()
+            .map(|&(ip, rx_bytes)| {
+                (
+                    ip,
+                    IpTotals {
+                        rx_bytes,
+                        ..IpTotals::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn key(ip: u32) -> LimitKey {
+        LimitKey::new(ip, DIR_RX)
+    }
+
+    /// Limiter + maps with flow A LIMITED (armed at t=2, removal due at t=7), the
+    /// way earlier successful ticks left them.
+    fn limited_a() -> (Limiter, FakeMaps, FakeWhitelist) {
+        let mut limiter = Limiter::new(1);
+        let plan = limiter.plan_reload(&cfg(), 0).expect("initial plan");
+        limiter.commit_reload(plan);
+        let (mut maps, mut wl) = (FakeMaps::default(), FakeWhitelist::default());
+        assert!(limiter.tick(1, &totals(&[(IP_A, 0)])).is_empty());
+        let actions = limiter.tick(2, &totals(&[(IP_A, BURST)]));
+        assert!(
+            matches!(actions.as_slice(), [LimitAction::Install { ipv4, .. }] if *ipv4 == IP_A),
+            "{actions:?}"
+        );
+        assert!(apply_tick_actions(&mut maps, &mut wl, &mut limiter, &actions).is_empty());
+        assert!(maps.policies.contains_key(&key(IP_A)));
+        for t in 3..=6 {
+            assert!(limiter.tick(t, &totals(&[(IP_A, BURST)])).is_empty());
+        }
+        (limiter, maps, wl)
+    }
+
+    #[test]
+    fn failed_install_leaves_other_flows_actions_applied() {
+        let (mut limiter, mut maps, mut wl) = limited_a();
+        // t=7: A's limit expires while B triggers in the same tick.
+        assert!(limiter
+            .tick(6, &totals(&[(IP_A, BURST), (IP_B, 0)]))
+            .is_empty());
+        let actions = limiter.tick(7, &totals(&[(IP_A, BURST), (IP_B, BURST)]));
+        assert_eq!(actions.len(), 2, "{actions:?}");
+
+        // B cannot be armed (e.g. its state map is full).
+        maps.fail_next("write_fresh_state", key(IP_B));
+        let failures = apply_tick_actions(&mut maps, &mut wl, &mut limiter, &actions);
+        assert_eq!(failures.len(), 1);
+        assert!(format!("{:#}", failures[0].error).contains("10.0.0.2"));
+        assert!(failures[0].report.dataplane_consistent);
+
+        // A's removal stands: unarmed in the dataplane and NORMAL in the limiter. The
+        // old whole-batch rollback re-armed it while the limiter forgot it.
+        assert!(!maps.policies.contains_key(&key(IP_A)));
+        assert!(!limiter.is_limited(IP_A, DIR_RX));
+        // B is unarmed and NORMAL, exactly as before the failed attempt.
+        assert!(!maps.policies.contains_key(&key(IP_B)));
+        assert!(!limiter.is_limited(IP_B, DIR_RX));
+        maps.assert_invariants();
+        maps.assert_no_orphans();
+
+        // B's window survived the failure, so the next tick retries and succeeds.
+        let retry = limiter.tick(8, &totals(&[(IP_A, BURST), (IP_B, 2 * BURST)]));
+        assert!(
+            matches!(retry.as_slice(), [LimitAction::Install { ipv4, .. }] if *ipv4 == IP_B),
+            "{retry:?}"
+        );
+        assert!(apply_tick_actions(&mut maps, &mut wl, &mut limiter, &retry).is_empty());
+        assert!(maps.policies.contains_key(&key(IP_B)));
+        assert!(limiter.is_limited(IP_B, DIR_RX));
+        maps.assert_invariants();
+        maps.assert_no_orphans();
+    }
+
+    #[test]
+    fn failed_removal_keeps_flow_limited_until_retry_succeeds() {
+        let (mut limiter, mut maps, mut wl) = limited_a();
+        let actions = limiter.tick(7, &totals(&[(IP_A, BURST)]));
+        assert!(
+            matches!(actions.as_slice(), [LimitAction::Remove { ipv4, .. }] if *ipv4 == IP_A),
+            "{actions:?}"
+        );
+
+        // The policy is disarmed but its state cannot be cleared: the rollback
+        // re-arms it, so the limiter must keep owning the flow.
+        maps.fail_next("clear_state", key(IP_A));
+        let failures = apply_tick_actions(&mut maps, &mut wl, &mut limiter, &actions);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].report.dataplane_consistent);
+        assert!(maps.policies.contains_key(&key(IP_A)));
+        assert!(limiter.is_limited(IP_A, DIR_RX));
+        maps.assert_invariants();
+
+        // The next tick retries the removal, which now succeeds.
+        let retry = limiter.tick(8, &totals(&[(IP_A, BURST)]));
+        assert!(
+            matches!(retry.as_slice(), [LimitAction::Remove { ipv4, .. }] if *ipv4 == IP_A),
+            "{retry:?}"
+        );
+        assert!(apply_tick_actions(&mut maps, &mut wl, &mut limiter, &retry).is_empty());
+        assert!(!maps.policies.contains_key(&key(IP_A)));
+        assert!(!limiter.is_limited(IP_A, DIR_RX));
+        maps.assert_no_orphans();
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::{next_deadline, rescheduled};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn cadence_is_anchored_on_the_previous_deadline() {
+        let t0 = Instant::now();
+        // The tick due at t0+1s was handled 300 ms late: the next one is still due at
+        // t0+2s, not 1s after the handler finished.
+        let late = t0 + SEC + Duration::from_millis(300);
+        assert_eq!(next_deadline(t0 + SEC, SEC, late), t0 + 2 * SEC);
+    }
+
+    #[test]
+    fn a_loop_a_whole_period_behind_reanchors_instead_of_bursting() {
+        let t0 = Instant::now();
+        let very_late = t0 + 5 * SEC;
+        assert_eq!(next_deadline(t0 + SEC, SEC, very_late), very_late + SEC);
+    }
+
+    #[test]
+    fn reload_never_postpones_a_pending_deadline() {
+        let t0 = Instant::now();
+        let push_due = t0 + 60 * SEC;
+        // A rewrite at t0+50s with the interval unchanged used to move the push to
+        // t0+110s; a config rewritten every 50s then never pushed at all.
+        assert_eq!(rescheduled(push_due, 60 * SEC, t0 + 50 * SEC), push_due);
+        // A shorter interval pulls the deadline in.
+        assert_eq!(rescheduled(push_due, 2 * SEC, t0 + 50 * SEC), t0 + 52 * SEC);
+    }
+}
+
+#[cfg(test)]
+mod whitelist_capacity_tests {
+    use super::whitelist_peak;
+    use std::collections::HashSet;
+    use vm_bandwidth_core::ip_range::Cidr;
+
+    fn cidrs(networks: &[[u8; 4]]) -> HashSet<Cidr> {
+        networks
+            .iter()
+            .map(|n| Cidr {
+                prefix_len: 24,
+                network: u32::from_be_bytes(*n),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn peak_counts_old_and_new_prefixes_together() {
+        // One /24 at startup sizes the trie at 2. Swapping it for two other /24s ends
+        // at 2 entries but holds 3 mid-reload: the reload must be refused up front.
+        let old = cidrs(&[[10, 0, 0, 0]]);
+        let new = cidrs(&[[10, 0, 1, 0], [10, 0, 2, 0]]);
+        assert_eq!(new.len(), 2);
+        assert_eq!(whitelist_peak(&old, &new), 3);
+    }
+
+    #[test]
+    fn kept_prefixes_count_once() {
+        let old = cidrs(&[[10, 0, 0, 0], [10, 0, 1, 0]]);
+        let new = cidrs(&[[10, 0, 1, 0], [10, 0, 2, 0]]);
+        assert_eq!(whitelist_peak(&old, &new), 3);
+        assert_eq!(whitelist_peak(&old, &old), 2);
     }
 }
 

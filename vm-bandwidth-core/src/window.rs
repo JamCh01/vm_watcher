@@ -22,6 +22,10 @@ pub struct RollingWindow {
     observed: u64,
     /// Seconds represented by one tick.
     tick_secs: u64,
+    /// The window length this ring was built for, as configured. It can differ from
+    /// [`RollingWindow::capacity_secs`] (truncation, capping), so "did the configured
+    /// window change?" must compare against this, not against the capacity.
+    window_secs: u64,
 }
 
 impl RollingWindow {
@@ -40,7 +44,13 @@ impl RollingWindow {
             total: 0,
             observed: 0,
             tick_secs,
+            window_secs,
         }
+    }
+
+    /// The configured window length this ring was built for.
+    pub fn window_secs(&self) -> u64 {
+        self.window_secs
     }
 
     /// Number of samples the ring holds.

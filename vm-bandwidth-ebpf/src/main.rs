@@ -14,15 +14,18 @@
 //! and non-IP payloads fail open like every other unhandled frame.
 //!
 //! Every path — parse failure, IP not whitelisted, map pressure, missing or invalid
-//! policy, arithmetic anomaly — ends in `TC_ACT_PIPE`: traffic is never dropped unless
-//! a policer explicitly classifies a packet as non-conforming while a valid limit is
-//! active.
+//! policy, arithmetic anomaly — ends in `TC_ACT_UNSPEC` ("no verdict"): traffic is never
+//! dropped unless a policer explicitly classifies a packet as non-conforming while a
+//! valid limit is active. `TC_ACT_UNSPEC` is `TCX_NEXT` under TCX, so programs attached
+//! after this one on the same hook still run (any other pass code, `TC_ACT_PIPE`
+//! included, ends the TCX chain early); legacy cls_bpf treats it exactly like
+//! `TC_ACT_PIPE` and continues with the next filter.
 //!
 //! Policing algorithms (selected per flow via `LimitPolicy.algorithm`):
 //! * token bucket — refill at the limit rate, spend per packet, bounded by `burst`
 //! * leaky bucket — queue level drains at the limit rate, bounded by `burst`
 //! * fixed window — byte allowance per window, anchored at the flow's first packet
-//! * sliding window counter — weighted two-window approximation (MiB granularity)
+//! * sliding window counter — weighted two-window approximation (millisecond weights)
 //! * sliding window log — exact window bytes over a bounded per-flow log ring
 //! * GCRA — virtual-scheduling Theoretical Arrival Time
 //!
@@ -34,32 +37,25 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{
-    bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_PIPE, TC_ACT_SHOT},
-    btf_maps::{HashMap, PerCpuHashMap},
-    helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
-    macros::{btf_map, classifier, map},
-    maps::{lpm_trie::Key as TrieKey, LpmTrie},
-    programs::TcContext,
-};
-use network_types::{
-    eth::EthHdr,
-    ip::{Ipv4Hdr, Ipv6Hdr},
-};
+use aya_ebpf::bindings::{bpf_spin_lock as SpinLockTy, TC_ACT_SHOT, TC_ACT_UNSPEC};
+use aya_ebpf::btf_maps::{HashMap, PerCpuHashMap};
+use aya_ebpf::helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock};
+use aya_ebpf::macros::{btf_map, classifier, map};
+use aya_ebpf::maps::lpm_trie::Key as TrieKey;
+use aya_ebpf::maps::LpmTrie;
+use aya_ebpf::programs::TcContext;
+use network_types::eth::EthHdr;
+use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
 use vm_bandwidth_common::{
-    is_vlan_tag, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats, SwlEntry,
-    TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
+    is_vlan_tag, swc_carried_bytes, vlan_walk, LimitKey, LimitPolicy, OversizedStats, PolicerStats,
+    SwlEntry, TrafficKey, TrafficValue, VlanHdr, ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET,
     ALGO_SLIDING_WINDOW_COUNTER, ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET, ETHERTYPE_IPV4,
-    ETHERTYPE_IPV6, SWL_LOG_CAP, VLAN_HDR_LEN,
+    ETHERTYPE_IPV6, MAX_POLICED_LEN, SWL_LOG_CAP, VLAN_HDR_LEN,
 };
 
 /// Compile-time default; userspace overrides `max_entries` at load time
 /// (`EbpfLoader::map_max_entries`) before the maps are created.
 const MAP_CAPACITY: usize = 8192;
-
-/// Packets larger than this are never policed (fail open); it also keeps the
-/// time-increment arithmetic provably inside `u64`.
-const MAX_POLICED_LEN: u64 = 65535;
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 const BITS_PER_BYTE: u64 = 8;
@@ -160,7 +156,7 @@ pub fn tc_egress(ctx: TcContext) -> i32 {
 fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     let eth: EthHdr = match ctx.load(0) {
         Ok(e) => e,
-        Err(_) => return TC_ACT_PIPE,
+        Err(_) => return TC_ACT_UNSPEC,
     };
 
     // Walk the VLAN stack (bounded by common::MAX_VLAN_TAGS: one load per level, no
@@ -171,20 +167,20 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
     if is_vlan_tag(et0) {
         let v: VlanHdr = match ctx.load(EthHdr::LEN) {
             Ok(v) => v,
-            Err(_) => return TC_ACT_PIPE,
+            Err(_) => return TC_ACT_UNSPEC,
         };
         et1 = u16::from_be(v.ether_type);
         if is_vlan_tag(et1) {
             let v: VlanHdr = match ctx.load(EthHdr::LEN + VLAN_HDR_LEN) {
                 Ok(v) => v,
-                Err(_) => return TC_ACT_PIPE,
+                Err(_) => return TC_ACT_UNSPEC,
             };
             et2 = u16::from_be(v.ether_type);
         }
     }
     let (tags, ether_type) = match vlan_walk(et0, et1, et2) {
         // Deeper stack than supported: give up (fail open).
-        None => return TC_ACT_PIPE,
+        None => return TC_ACT_UNSPEC,
         Some(t) => t,
     };
     let l3_off = EthHdr::LEN + tags * VLAN_HDR_LEN;
@@ -193,44 +189,49 @@ fn handle(ctx: &TcContext, is_tx: bool) -> i32 {
         ETHERTYPE_IPV4 => {}
         ETHERTYPE_IPV6 => return handle_v6(ctx, is_tx, l3_off),
         // ARP, LLDP, STP and other non-IP payloads are not counted.
-        _ => return TC_ACT_PIPE,
+        _ => return TC_ACT_UNSPEC,
     }
     let ip: Ipv4Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
-        Err(_) => return TC_ACT_PIPE,
+        Err(_) => return TC_ACT_UNSPEC,
     };
     let ipv4 = u32::from_be_bytes(if is_tx { ip.src_addr } else { ip.dst_addr });
 
-    // The TAP's ifindex, read from the skb context (valid for TC programs).
-    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    let ifindex = tap_ifindex(ctx);
 
-    unsafe {
-        // The trie stores addresses in network byte order (see userspace trie_key).
-        if MONITORED_IPS.get(TrieKey::new(32, ipv4.to_be())).is_none() {
-            return TC_ACT_PIPE;
-        }
-
-        count(ctx, ipv4, ifindex, is_tx);
-
-        let direction = if is_tx {
-            vm_bandwidth_common::DIR_TX
-        } else {
-            vm_bandwidth_common::DIR_RX
-        };
-        // Police this flow. `police` returns `true` only to DROP a non-conforming packet.
-        if police(ipv4, direction, ctx.len() as u64) {
-            return TC_ACT_SHOT;
-        }
+    // The trie stores addresses in network byte order (see userspace trie_key).
+    if MONITORED_IPS.get(TrieKey::new(32, ipv4.to_be())).is_none() {
+        return TC_ACT_UNSPEC;
     }
-    TC_ACT_PIPE
+
+    count(ctx, ipv4, ifindex, is_tx);
+
+    let direction = if is_tx {
+        vm_bandwidth_common::DIR_TX
+    } else {
+        vm_bandwidth_common::DIR_RX
+    };
+    // Police this flow. `police` returns `true` only to DROP a non-conforming packet.
+    if police(ipv4, direction, ctx.len() as u64) {
+        return TC_ACT_SHOT;
+    }
+    TC_ACT_UNSPEC
+}
+
+/// The ifindex of the TAP this program is attached to, read from the skb context.
+#[inline(always)]
+fn tap_ifindex(ctx: &TcContext) -> u32 {
+    // SAFETY: `ctx.skb.skb` is the `__sk_buff` context the kernel hands a TC program;
+    // it is valid and readable for the whole invocation.
+    unsafe { (*ctx.skb.skb).ifindex }
 }
 
 /// Accumulate byte/packet counters for a whitelisted flow. Never fails the packet.
 #[inline(always)]
-unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
+fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
     let key = TrafficKey { ifindex, ipv4 };
-    let value = match TRAFFIC.get_ptr_mut(key) {
-        Some(ptr) => &mut *ptr,
+    let ptr = match TRAFFIC.get_ptr_mut(key) {
+        Some(ptr) => ptr,
         None => {
             // Map full (E2BIG) or transient failure: pass the packet without counting.
             // `&` is load-bearing: passing the 32-byte struct by value makes LLVM
@@ -252,11 +253,15 @@ unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
                 return;
             }
             match TRAFFIC.get_ptr_mut(key) {
-                Some(ptr) => &mut *ptr,
+                Some(ptr) => ptr,
                 None => return,
             }
         }
     };
+    // SAFETY: `ptr` comes from a successful per-CPU map lookup, so it points at this
+    // CPU's slot and stays valid for the rest of the program run; BPF programs run with
+    // migration disabled, so nothing else writes that slot meanwhile.
+    let value = unsafe { &mut *ptr };
 
     let len = ctx.len() as u64;
     if is_tx {
@@ -274,24 +279,23 @@ unsafe fn count(ctx: &TcContext, ipv4: u32, ifindex: u32, is_tx: bool) {
 fn handle_v6(ctx: &TcContext, is_tx: bool, l3_off: usize) -> i32 {
     let ip: Ipv6Hdr = match ctx.load(l3_off) {
         Ok(i) => i,
-        Err(_) => return TC_ACT_PIPE,
+        Err(_) => return TC_ACT_UNSPEC,
     };
     // The address itself is deliberately NOT part of the counter key: aggregate
     // per-TAP counting bounds map cardinality at the number of TAPs (see TRAFFIC6).
     // (The header is still validated by the load above.)
     let _ = ip;
-    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    unsafe { count6(ctx, ifindex, is_tx) };
-    TC_ACT_PIPE
+    count6(ctx, tap_ifindex(ctx), is_tx);
+    TC_ACT_UNSPEC
 }
 
 /// Accumulate byte/packet counters for one TAP's aggregate IPv6 traffic. Never fails
 /// the packet.
 #[inline(always)]
-unsafe fn count6(ctx: &TcContext, ifindex: u32, is_tx: bool) {
+fn count6(ctx: &TcContext, ifindex: u32, is_tx: bool) {
     let key = ifindex;
-    let value = match TRAFFIC6.get_ptr_mut(key) {
-        Some(ptr) => &mut *ptr,
+    let ptr = match TRAFFIC6.get_ptr_mut(key) {
+        Some(ptr) => ptr,
         None => {
             // Same E2BIG fail-open as the IPv4 path; see `count` for the `&` note.
             #[allow(clippy::needless_borrows_for_generic_args)]
@@ -311,11 +315,13 @@ unsafe fn count6(ctx: &TcContext, ifindex: u32, is_tx: bool) {
                 return;
             }
             match TRAFFIC6.get_ptr_mut(key) {
-                Some(ptr) => &mut *ptr,
+                Some(ptr) => ptr,
                 None => return,
             }
         }
     };
+    // SAFETY: per-CPU map slot from a successful lookup; see `count`.
+    let value = unsafe { &mut *ptr };
     let len = ctx.len() as u64;
     if is_tx {
         value.tx_bytes += len;
@@ -333,9 +339,11 @@ unsafe fn count6(ctx: &TcContext, ifindex: u32, is_tx: bool) {
 /// when installing the policy; until then policing cannot be proven safe, so traffic
 /// passes).
 #[inline(always)]
-unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
+fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
     let key = LimitKey::new(ipv4, direction);
-    let policy = match LIMIT_POLICIES.get(key) {
+    // SAFETY: a successful lookup returns a value that stays valid for this program run;
+    // it is copied out at once, and userspace only ever replaces whole entries.
+    let policy = match unsafe { LIMIT_POLICIES.get(key) } {
         Some(p) => *p,
         None => return false,
     };
@@ -360,28 +368,35 @@ unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
     }
 
     // Timestamp taken before the lock: the critical section holds no helper calls.
-    let now = bpf_ktime_get_ns();
+    // SAFETY: bpf_ktime_get_ns has no preconditions.
+    let now = unsafe { bpf_ktime_get_ns() };
 
-    let state = match LIMIT_STATE.get_ptr_mut(key) {
-        Some(ptr) => &mut *ptr,
-        // No runtime state: the daemon creates it together with the policy. Fail open.
-        None => return false,
+    // No runtime state: the daemon creates it together with the policy. Fail open.
+    let Some(state_ptr) = LIMIT_STATE.get_ptr_mut(key) else {
+        return false;
     };
 
-    let lock_ptr = &mut state.lock as *mut SpinLockTy;
-    bpf_spin_lock(lock_ptr);
-
-    let conform = match policy.algorithm {
-        ALGO_TOKEN_BUCKET => token_bucket(&policy, state, now, len_bytes),
-        ALGO_LEAKY_BUCKET => leaky_bucket(&policy, state, now, len_bytes),
-        ALGO_FIXED_WINDOW => fixed_window(&policy, state, now, len_bytes),
-        ALGO_SLIDING_WINDOW_COUNTER => sliding_window_counter(&policy, state, now, len_bytes),
-        ALGO_GCRA => gcra(&policy, state, now, len_bytes),
-        // Unknown algorithm: fail open.
-        _ => true,
+    // SAFETY: `state_ptr` comes from a successful lookup and stays valid for this program
+    // run. LIMIT_STATE values are shared by all CPUs, so the value is only touched with
+    // its embedded spin lock held: the lock is taken through a raw field pointer before
+    // any reference to the value exists, the critical section calls no helper and has
+    // no early exit, and the reference is dead before the lock is released.
+    let conform = unsafe {
+        let lock = &raw mut (*state_ptr).lock;
+        bpf_spin_lock(lock);
+        let state = &mut *state_ptr;
+        let conform = match policy.algorithm {
+            ALGO_TOKEN_BUCKET => token_bucket(&policy, state, now, len_bytes),
+            ALGO_LEAKY_BUCKET => leaky_bucket(&policy, state, now, len_bytes),
+            ALGO_FIXED_WINDOW => fixed_window(&policy, state, now, len_bytes),
+            ALGO_SLIDING_WINDOW_COUNTER => sliding_window_counter(&policy, state, now, len_bytes),
+            ALGO_GCRA => gcra(&policy, state, now, len_bytes),
+            // Unknown algorithm: fail open.
+            _ => true,
+        };
+        bpf_spin_unlock(lock);
+        conform
     };
-
-    bpf_spin_unlock(lock_ptr);
     record_verdict(&key, len_bytes, conform);
     !conform
 }
@@ -389,9 +404,9 @@ unsafe fn police(ipv4: u32, direction: u8, len_bytes: u64) -> bool {
 /// Count an oversized packet that skipped policing while armed. Failure to record
 /// never affects the (fail-open) verdict.
 #[inline(always)]
-unsafe fn record_oversized(direction: u8, len_bytes: u64) {
-    let stats = match OVERSIZED.get_ptr_mut(direction) {
-        Some(ptr) => &mut *ptr,
+fn record_oversized(direction: u8, len_bytes: u64) {
+    let ptr = match OVERSIZED.get_ptr_mut(direction) {
+        Some(ptr) => ptr,
         None => {
             #[allow(clippy::needless_borrows_for_generic_args)]
             if OVERSIZED
@@ -401,11 +416,13 @@ unsafe fn record_oversized(direction: u8, len_bytes: u64) {
                 return;
             }
             match OVERSIZED.get_ptr_mut(direction) {
-                Some(ptr) => &mut *ptr,
+                Some(ptr) => ptr,
                 None => return,
             }
         }
     };
+    // SAFETY: per-CPU map slot from a successful lookup; see `count`.
+    let stats = unsafe { &mut *ptr };
     stats.packets += 1;
     stats.bytes += len_bytes;
 }
@@ -413,9 +430,9 @@ unsafe fn record_oversized(direction: u8, len_bytes: u64) {
 /// Record a policer verdict (pass or drop) for a flow with an active policy.
 /// Failure to record never affects the verdict itself.
 #[inline(always)]
-unsafe fn record_verdict(key: &LimitKey, len_bytes: u64, passed: bool) {
-    let stats = match POLICER_STATS.get_ptr_mut(*key) {
-        Some(ptr) => &mut *ptr,
+fn record_verdict(key: &LimitKey, len_bytes: u64, passed: bool) {
+    let ptr = match POLICER_STATS.get_ptr_mut(*key) {
+        Some(ptr) => ptr,
         None => {
             // Map full (E2BIG) or transient failure: verdict stands, stats skipped.
             // `&` is load-bearing: passing the struct by value makes LLVM lower its
@@ -428,11 +445,13 @@ unsafe fn record_verdict(key: &LimitKey, len_bytes: u64, passed: bool) {
                 return;
             }
             match POLICER_STATS.get_ptr_mut(*key) {
-                Some(ptr) => &mut *ptr,
+                Some(ptr) => ptr,
                 None => return,
             }
         }
     };
+    // SAFETY: per-CPU map slot from a successful lookup; see `count`.
+    let stats = unsafe { &mut *ptr };
     if passed {
         stats.passed_bytes += len_bytes;
         stats.passed_packets += 1;
@@ -454,12 +473,7 @@ fn bucket_params(policy: &LimitPolicy) -> (u64, u64) {
 /// Token bucket: tokens refill at the limit rate up to `burst`, each packet spends its
 /// wire length. State: `a` = tokens (nbytes), `b` = last refill timestamp.
 #[inline(always)]
-unsafe fn token_bucket(
-    policy: &LimitPolicy,
-    state: &mut LimitStateVal,
-    now: u64,
-    len_bytes: u64,
-) -> bool {
+fn token_bucket(policy: &LimitPolicy, state: &mut LimitStateVal, now: u64, len_bytes: u64) -> bool {
     let (capacity, per_ns) = bucket_params(policy);
     let mut tokens = state.a;
     if now >= state.b {
@@ -483,9 +497,14 @@ unsafe fn token_bucket(
     if conform {
         tokens -= cost;
     }
-    // Always advance the refill timestamp so partial credit survives a drop.
     state.a = tokens;
-    state.b = now;
+    // Advance the refill timestamp even on a drop so partial credit survives it, but
+    // never move it backwards: `now` is read before the lock, so a CPU that lost the
+    // race holds an older reading than the one stored, and rewinding `b` would credit
+    // that interval a second time.
+    if now > state.b {
+        state.b = now;
+    }
     conform
 }
 
@@ -493,12 +512,7 @@ unsafe fn token_bucket(
 /// the level plus its length fits the capacity. State: `a` = level (nbytes),
 /// `b` = last drain timestamp.
 #[inline(always)]
-unsafe fn leaky_bucket(
-    policy: &LimitPolicy,
-    state: &mut LimitStateVal,
-    now: u64,
-    len_bytes: u64,
-) -> bool {
+fn leaky_bucket(policy: &LimitPolicy, state: &mut LimitStateVal, now: u64, len_bytes: u64) -> bool {
     let (capacity, per_ns) = bucket_params(policy);
     let mut level = state.a;
     if now >= state.b {
@@ -517,7 +531,11 @@ unsafe fn leaky_bucket(
         level += cost;
     }
     state.a = level;
-    state.b = now;
+    // Same monotonic rule as the token bucket: a stale `now` must not rewind the
+    // drain timestamp and drain that interval twice.
+    if now > state.b {
+        state.b = now;
+    }
     conform
 }
 
@@ -531,12 +549,7 @@ fn window_allowance(policy: &LimitPolicy) -> u64 {
 /// Fixed window counter: allow `rate × window` bytes per window, anchored at the first
 /// packet after each reset. State: `a` = used bytes, `b` = window start.
 #[inline(always)]
-unsafe fn fixed_window(
-    policy: &LimitPolicy,
-    state: &mut LimitStateVal,
-    now: u64,
-    len_bytes: u64,
-) -> bool {
+fn fixed_window(policy: &LimitPolicy, state: &mut LimitStateVal, now: u64, len_bytes: u64) -> bool {
     if policy.window_ns == 0 {
         return true;
     }
@@ -552,12 +565,12 @@ unsafe fn fixed_window(
 }
 
 /// Sliding window counter: weighted estimate `prev × (1 − elapsed/window) + curr`.
-/// Window accounting is in MiB so the weighted product stays inside `u64` under the
-/// config bounds (allowance ≤ 7.5e12 B, window ≤ 60s); that granularity can make very
-/// small allowances behave like a fixed window. State: `a` = previous window bytes,
-/// `b` = current window bytes, `c` = window start.
+/// The previous window is counted in exact bytes and weighted in whole milliseconds
+/// (see `vm_bandwidth_common::swc_carried_bytes`), which keeps the product inside `u64`
+/// under the config bounds (allowance ≤ 7.5e12 B, window ≤ 60s). State: `a` = previous
+/// window bytes, `b` = current window bytes, `c` = window start.
 #[inline(always)]
-unsafe fn sliding_window_counter(
+fn sliding_window_counter(
     policy: &LimitPolicy,
     state: &mut LimitStateVal,
     now: u64,
@@ -582,9 +595,8 @@ unsafe fn sliding_window_counter(
     }
 
     let elapsed = now.saturating_sub(state.c).min(w);
-    let prev_mib = state.a >> 20;
-    let carried = prev_mib.wrapping_mul(w - elapsed) / w;
-    let est_bytes = (carried << 20).saturating_add(state.b);
+    let carried = swc_carried_bytes(state.a, w, elapsed);
+    let est_bytes = carried.saturating_add(state.b);
 
     let conform = est_bytes.saturating_add(len_bytes) <= window_allowance(policy);
     if conform {
@@ -597,7 +609,7 @@ unsafe fn sliding_window_counter(
 /// emission time; a packet conforms while its TAT stays inside the burst tolerance.
 /// State: `a` = TAT.
 #[inline(always)]
-unsafe fn gcra(policy: &LimitPolicy, state: &mut LimitStateVal, now: u64, len_bytes: u64) -> bool {
+fn gcra(policy: &LimitPolicy, state: &mut LimitStateVal, now: u64, len_bytes: u64) -> bool {
     // Time cost of this packet: len * 8 * 1e9 / rate. The operands are bounded so the
     // products fit in u64 (MAX_POLICED_LEN * 8 * 1e9 ≈ 5.2e14 << u64::MAX); wrapping
     // arithmetic avoids any overflow-check helper calls that BPF cannot link.
@@ -625,44 +637,51 @@ unsafe fn gcra(policy: &LimitPolicy, state: &mut LimitStateVal, now: u64, len_by
 /// (timestamp, length) entries. When the ring is full the oldest entry is overwritten,
 /// so at very high packet rates the log under-counts and policing gets lenient.
 #[inline(always)]
-unsafe fn swl_police(key: &LimitKey, policy: &LimitPolicy, len_bytes: u64) -> bool {
+fn swl_police(key: &LimitKey, policy: &LimitPolicy, len_bytes: u64) -> bool {
     if policy.window_ns == 0 {
         return false;
     }
-    let ring = match SWL_LOG.get_ptr_mut(*key) {
-        Some(ptr) => &mut *ptr,
-        // No ring: the daemon creates it together with the policy. Fail open.
-        None => return false,
+    // No ring: the daemon creates it together with the policy. Fail open.
+    let Some(ring_ptr) = SWL_LOG.get_ptr_mut(*key) else {
+        return false;
     };
 
-    let now = bpf_ktime_get_ns();
-    let lock_ptr = &mut ring.lock as *mut SpinLockTy;
-    bpf_spin_lock(lock_ptr);
+    // SAFETY: bpf_ktime_get_ns has no preconditions.
+    let now = unsafe { bpf_ktime_get_ns() };
+    // SAFETY: same discipline as the LIMIT_STATE critical section in `police`: the ring
+    // is shared by all CPUs and only touched with its spin lock held, which is taken
+    // through a raw field pointer before the reference exists and released after the
+    // reference is dead; the bounded scan calls no helper and never exits early.
+    let conform = unsafe {
+        let lock = &raw mut (*ring_ptr).lock;
+        bpf_spin_lock(lock);
+        let ring = &mut *ring_ptr;
 
-    let mut used: u64 = 0;
-    let mut i = 0;
-    while i < SWL_LOG_CAP {
-        let entry = ring.entries[i];
-        // Wrapping subtraction is harmless: before the clock reaches `window` the
-        // wrapped bound is huge and no zero-initialized entry can match it.
-        if entry.ts_ns > now.wrapping_sub(policy.window_ns) {
-            used += entry.len as u64;
+        let mut used: u64 = 0;
+        let mut i = 0;
+        while i < SWL_LOG_CAP {
+            let entry = ring.entries[i];
+            // Wrapping subtraction is harmless: before the clock reaches `window` the
+            // wrapped bound is huge and no zero-initialized entry can match it.
+            if entry.ts_ns > now.wrapping_sub(policy.window_ns) {
+                used += entry.len as u64;
+            }
+            i += 1;
         }
-        i += 1;
-    }
 
-    let conform = used.saturating_add(len_bytes) <= window_allowance(policy);
-    if conform {
-        let head = (ring.head % SWL_LOG_CAP as u32) as usize;
-        ring.entries[head] = SwlEntry {
-            ts_ns: now,
-            len: len_bytes as u32,
-            _pad: 0,
-        };
-        ring.head = (head + 1) as u32;
-    }
-
-    bpf_spin_unlock(lock_ptr);
+        let conform = used.saturating_add(len_bytes) <= window_allowance(policy);
+        if conform {
+            let head = (ring.head % SWL_LOG_CAP as u32) as usize;
+            ring.entries[head] = SwlEntry {
+                ts_ns: now,
+                len: len_bytes as u32,
+                _pad: 0,
+            };
+            ring.head = (head + 1) as u32;
+        }
+        bpf_spin_unlock(lock);
+        conform
+    };
     record_verdict(key, len_bytes, conform);
     !conform
 }

@@ -4,7 +4,9 @@ use aya_build::Toolchain;
 fn toolchain() -> Toolchain<'static> {
     // eBPF bitcode must be produced by an LLVM that the installed bpf-linker can read.
     // Override with e.g. VM_BW_EBPF_TOOLCHAIN=nightly-2026-06-15 when the default nightly
-    // is ahead of the linker's LLVM.
+    // is ahead of the linker's LLVM. A different toolchain means a different object, so
+    // changing the variable must re-run this script.
+    println!("cargo:rerun-if-env-changed=VM_BW_EBPF_TOOLCHAIN");
     match std::env::var("VM_BW_EBPF_TOOLCHAIN") {
         Ok(name) => {
             let leaked: &'static str = Box::leak(name.into_boxed_str());

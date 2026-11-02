@@ -215,7 +215,7 @@ pub async fn body_capped(mut resp: reqwest::Response) -> Result<String> {
 
 /// Push one payload to `{base_url}/api/v1/import/prometheus`.
 ///
-/// Diagnostics never carry more than scheme://host[:port] of the endpoint
+/// Diagnostics never carry more than `scheme://host[:port]` of the endpoint
 /// (`safe_endpoint_display`): reqwest errors can embed the full URL, so every
 /// error leaving this function is passed through `without_url()` and the
 /// context strings use the redacted form.

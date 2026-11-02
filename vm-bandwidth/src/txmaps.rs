@@ -86,10 +86,33 @@ pub struct TxJournal {
     pub wl_removed: Vec<Cidr>,
 }
 
+/// What a failed rollback step was restoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackTarget {
+    /// One (IPv4, direction) limit flow.
+    Flow(LimitKey),
+    /// One whitelist prefix.
+    Prefix(Cidr),
+}
+
+impl std::fmt::Display for RollbackTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Flow(key) => write!(
+                f,
+                "{} dir={}",
+                std::net::Ipv4Addr::from(key.ipv4),
+                key.direction
+            ),
+            Self::Prefix(cidr) => write!(f, "whitelist prefix {}", cidr.display()),
+        }
+    }
+}
+
 /// One failed rollback step.
 #[derive(Debug)]
 pub struct RollbackFailure {
-    pub key: LimitKey,
+    pub target: RollbackTarget,
     pub op: &'static str,
     pub error: String,
 }
@@ -218,7 +241,7 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
                     // rolling back the independent records so every failure surfaces.
                     fail(
                         &mut report,
-                        rec.key,
+                        RollbackTarget::Flow(rec.key),
                         "disarm new policy (kept new policy + state)",
                         e,
                     );
@@ -228,7 +251,12 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
         }
         if let Some(algo) = rec.new_algorithm {
             if let Err(e) = m.clear_state(&rec.key, algo) {
-                fail(&mut report, rec.key, "clear new state", e);
+                fail(
+                    &mut report,
+                    RollbackTarget::Flow(rec.key),
+                    "clear new state",
+                    e,
+                );
                 ok = false;
                 // Continue: a leftover artifact is a bounded orphan; restoring the
                 // displaced policy matters more (a same-algorithm restore overwrites
@@ -248,14 +276,19 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
                 match m.write_fresh_state(&rec.key, old.algorithm) {
                     Ok(()) => {
                         if let Err(e) = m.arm_policy(&rec.key, old) {
-                            fail(&mut report, rec.key, "re-arm old policy", e);
+                            fail(
+                                &mut report,
+                                RollbackTarget::Flow(rec.key),
+                                "re-arm old policy",
+                                e,
+                            );
                             ok = false;
                         }
                     }
                     Err(e) => {
                         fail(
                             &mut report,
-                            rec.key,
+                            RollbackTarget::Flow(rec.key),
                             "restore state (flow stays unarmed)",
                             e,
                         );
@@ -282,14 +315,19 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
         match m.write_fresh_state(&rec.key, rec.old.algorithm) {
             Ok(()) => {
                 if let Err(e) = m.arm_policy(&rec.key, rec.old) {
-                    fail(&mut report, rec.key, "re-arm removed policy", e);
+                    fail(
+                        &mut report,
+                        RollbackTarget::Flow(rec.key),
+                        "re-arm removed policy",
+                        e,
+                    );
                     ok = false;
                 }
             }
             Err(e) => {
                 fail(
                     &mut report,
-                    rec.key,
+                    RollbackTarget::Flow(rec.key),
                     "restore state (flow stays unarmed)",
                     e,
                 );
@@ -306,7 +344,7 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
         if let Err(e) = w.wl_insert(c) {
             fail(
                 &mut report,
-                LimitKey::new(0, 0),
+                RollbackTarget::Prefix(*c),
                 "re-add whitelist prefix",
                 e,
             );
@@ -319,7 +357,7 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
         if let Err(e) = w.wl_remove(c) {
             fail(
                 &mut report,
-                LimitKey::new(0, 0),
+                RollbackTarget::Prefix(*c),
                 "remove whitelist prefix",
                 e,
             );
@@ -332,9 +370,14 @@ pub fn rollback_journal<M: LimitMaps, W: WhitelistOps>(
     report
 }
 
-fn fail(report: &mut RollbackReport, key: LimitKey, op: &'static str, error: anyhow::Error) {
+fn fail(
+    report: &mut RollbackReport,
+    target: RollbackTarget,
+    op: &'static str,
+    error: anyhow::Error,
+) {
     report.failures.push(RollbackFailure {
-        key,
+        target,
         op,
         error: format!("{error:#}"),
     });
@@ -778,6 +821,27 @@ mod tests {
         assert!(report.dataplane_consistent);
     }
 
+    // 10b. A whitelist step that fails during rollback names its prefix (it used to
+    //      carry a placeholder flow key and log "for 0.0.0.0").
+    #[test]
+    fn whitelist_rollback_failure_names_the_prefix() {
+        let mut m = FakeMaps::default();
+        let mut w = FakeWhitelist::default();
+        let mut j = TxJournal::default();
+        let added = cidr(0x0a00_0100);
+        assert!(apply_whitelist_additions(&mut w, &mut j, &[added]).is_ok());
+        w.fail_next("wl_remove");
+
+        let report = rollback_journal(&mut m, &mut w, &j);
+        assert!(!report.dataplane_consistent);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].target, RollbackTarget::Prefix(added));
+        assert_eq!(
+            report.failures[0].target.to_string(),
+            "whitelist prefix 10.0.1.0/24"
+        );
+    }
+
     // 11. Rollback itself hits a second error: both failures are reported and the
     //     dataplane is flagged inconsistent.
     #[test]
@@ -915,7 +979,7 @@ mod tests {
         );
         assert!(!report.dataplane_consistent);
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].key, a);
+        assert_eq!(report.failures[0].target, RollbackTarget::Flow(a));
         assert!(
             report.failures[0].op.starts_with("disarm new policy"),
             "{}",
@@ -1061,7 +1125,7 @@ mod tests {
         assert_eq!(report.attempted, 3);
         assert_eq!(report.succeeded, 2, "C no-op and B restore succeed");
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].key, a);
+        assert_eq!(report.failures[0].target, RollbackTarget::Flow(a));
         // A keeps the new pair; B is fully restored; C absent.
         assert_eq!(m.policies.get(&a).copied(), Some(a2));
         assert!(m.artifact(&a, ALGO_GCRA));
@@ -1183,7 +1247,7 @@ mod tests {
         assert_eq!(report.attempted, 1);
         assert_eq!(report.succeeded, 0);
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].key, k);
+        assert_eq!(report.failures[0].target, RollbackTarget::Flow(k));
         assert_eq!(report.failures[0].op, "re-arm old policy");
     }
 }

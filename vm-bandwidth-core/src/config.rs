@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::path::Path;
 
 use serde::Deserialize;
+use vm_bandwidth_common::MAX_POLICED_LEN;
 
 use crate::ip_range::{validate_ranges, IpRange};
 use crate::policy::{self, PolicyFields};
@@ -172,8 +173,10 @@ impl Default for MetricsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisplayConfig {
+    /// Accepted so older config files keep loading; no screen uses it.
     #[serde(default)]
     pub show_interface: bool,
+    /// Accepted so older config files keep loading; no screen uses it.
     #[serde(default)]
     pub show_packets: bool,
     /// Enumerate EVERY address of every configured range in IPC/UI, including
@@ -285,7 +288,10 @@ impl PolicyEntry {
 
 /// Map a config string to one of the `ALGO_*` constants.
 fn parse_algorithm(s: &str) -> Result<u32, String> {
-    use vm_bandwidth_common::*;
+    use vm_bandwidth_common::{
+        ALGO_FIXED_WINDOW, ALGO_GCRA, ALGO_LEAKY_BUCKET, ALGO_SLIDING_WINDOW_COUNTER,
+        ALGO_SLIDING_WINDOW_LOG, ALGO_TOKEN_BUCKET,
+    };
     Ok(match s {
         "token_bucket" => ALGO_TOKEN_BUCKET,
         "leaky_bucket" => ALGO_LEAKY_BUCKET,
@@ -343,8 +349,8 @@ impl Deref for ValidatedRange {
 /// The eBPF GCRA data path computes `burst_bytes * 8 * 1e9` in `u64`, so `burst` is
 /// capped so that product cannot wrap; rates are bounded to keep every derived number
 /// (increment, tolerance, deadline) provably inside `u64` for any packet length.
-/// The window algorithms compute in MiB and are bounded to a 60s window so their
-/// weighted estimates also stay inside `u64`.
+/// The window algorithms are bounded to a 60s window so their millisecond-weighted
+/// estimates also stay inside `u64`.
 const MIN_RATE_BPS: u64 = 100_000; // 100 Kbps
 const MAX_RATE_BPS: u64 = 1_000_000_000_000; // 1 Tbps
 const MAX_BURST_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
@@ -353,6 +359,9 @@ const MAX_LIMIT_WINDOW_SECS: u64 = 60;
 /// Sanity cap on the SWL map: 65536 rings ≈ 1 GiB of kernel memory. The value exists
 /// to catch unit typos (e.g. 256000); any real deployment needs far fewer SWL flows.
 const MAX_SWL_MAP_ENTRIES: u32 = 65536;
+/// Upper bound on the collector's tick and TAP-scan periods. Far beyond any useful
+/// value; it exists so a typo cannot overflow the engine's timer arithmetic.
+const MAX_COLLECTOR_INTERVAL_SECS: u64 = 3600;
 
 fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> {
     for (name, value) in [
@@ -380,9 +389,6 @@ fn check_policy_bounds(fields: &PolicyFields, what: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// URL policy for the metrics endpoint, enforced with a real URL parser (no string
-/// prefix guessing): https anywhere; http only for loopback hosts unless the operator
-/// explicitly accepts insecure remote transport.
 /// Log/error-safe display of a metrics endpoint URL: scheme + host (+ explicit
 /// port) only. Userinfo, path, query and fragment may carry credentials or
 /// tokens and must never reach diagnostics. IPv6 hosts keep their bracketed
@@ -402,6 +408,9 @@ pub fn safe_endpoint_display(raw: &str) -> String {
     }
 }
 
+/// URL policy for the metrics endpoint, enforced with a real URL parser (no string
+/// prefix guessing): https anywhere; http only for loopback hosts unless the operator
+/// explicitly accepts insecure remote transport.
 fn validate_metrics_url(raw: &str, allow_insecure_http: bool) -> Result<(), String> {
     use url::Host;
     let url = url::Url::parse(raw).map_err(|e| format!("metrics.url is not a valid URL: {e}"))?;
@@ -480,6 +489,46 @@ impl ValidatedConfig {
     pub fn ip_ranges(&self) -> Vec<IpRange> {
         self.ranges.iter().map(|r| r.inner.clone()).collect()
     }
+
+    /// One warning per range/override direction whose policy can never admit a frame
+    /// the data path polices whole (up to [`MAX_POLICED_LEN`], GSO/TSO aggregates
+    /// included): while LIMITED every larger frame is dropped instead of rate-limited.
+    /// Such configs stay valid for compatibility; the daemon logs these at load.
+    pub fn small_burst_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for vr in &self.ranges {
+            let range_scope = format!("range {}", vr.inner.name);
+            let mut overrides: Vec<(&u32, &PolicyFields)> = vr.overrides.iter().collect();
+            overrides.sort_unstable_by_key(|(ip, _)| **ip);
+            let override_scopes = overrides.into_iter().map(|(ip, fields)| {
+                let scope = format!("{range_scope} ip {}", std::net::Ipv4Addr::from(*ip));
+                (scope, Some(fields))
+            });
+            let scopes = std::iter::once((range_scope.clone(), None)).chain(override_scopes);
+            for (scope, override_fields) in scopes {
+                // Validated at parse time; a policy that does not resolve has no limit.
+                let Ok(eff) = policy::resolve(&vr.policy, override_fields, &scope) else {
+                    continue;
+                };
+                for (dir, dir_policy) in [("rx", eff.rx), ("tx", eff.tx)] {
+                    let Some(dir_policy) = dir_policy else {
+                        continue;
+                    };
+                    let admissible = dir_policy.max_admissible_frame_bytes();
+                    if admissible < MAX_POLICED_LEN {
+                        warnings.push(format!(
+                            "{scope}: the {dir} policy admits frames of at most {admissible} B \
+                             (burst, or limit x limit_window for window algorithms), below \
+                             the {MAX_POLICED_LEN} B the policer judges whole: while limited, \
+                             every larger frame (e.g. a GSO/TSO aggregate) is dropped instead \
+                             of rate-limited; use at least 64KiB"
+                        ));
+                    }
+                }
+            }
+        }
+        warnings
+    }
 }
 
 pub fn load(path: &Path) -> Result<ValidatedConfig, String> {
@@ -499,15 +548,22 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     // The rate limiter's rolling windows are calibrated in WHOLE tick seconds, so the
     // interval must be second-aligned (a 1500 ms interval used to silently truncate to
     // 1 s ticks and mis-measure bandwidth by 1.5x).
-    if config.collector.refresh_interval_ms < 1000
-        || !config.collector.refresh_interval_ms.is_multiple_of(1000)
+    let refresh_ms = config.collector.refresh_interval_ms;
+    if !(1000..=MAX_COLLECTOR_INTERVAL_SECS * 1000).contains(&refresh_ms)
+        || !refresh_ms.is_multiple_of(1000)
     {
-        return Err(
-            "collector.refresh_interval_ms must be a whole number of seconds (>= 1000)".to_string(),
-        );
+        return Err(format!(
+            "collector.refresh_interval_ms must be a whole number of seconds within \
+             1000..={}; got {refresh_ms}",
+            MAX_COLLECTOR_INTERVAL_SECS * 1000
+        ));
     }
-    if config.collector.interface_scan_interval_secs == 0 {
-        return Err("collector.interface_scan_interval_secs must be > 0".to_string());
+    let scan_secs = config.collector.interface_scan_interval_secs;
+    if !(1..=MAX_COLLECTOR_INTERVAL_SECS).contains(&scan_secs) {
+        return Err(format!(
+            "collector.interface_scan_interval_secs must be within \
+             1..={MAX_COLLECTOR_INTERVAL_SECS}; got {scan_secs}"
+        ));
     }
     if config.collector.map_max_entries == 0 {
         return Err("collector.map_max_entries must be > 0".to_string());
@@ -517,7 +573,8 @@ pub fn parse(text: &str) -> Result<ValidatedConfig, String> {
     }
     if config.collector.swl_map_max_entries > MAX_SWL_MAP_ENTRIES {
         return Err(format!(
-            "collector.swl_map_max_entries must be at most {MAX_SWL_MAP_ENTRIES}              (each entry preallocates ~16.4 KiB of kernel memory)"
+            "collector.swl_map_max_entries must be at most {MAX_SWL_MAP_ENTRIES} \
+             (each entry preallocates ~16.4 KiB of kernel memory)"
         ));
     }
     let default_sort = match config.display.default_sort.as_str() {
@@ -659,6 +716,80 @@ range = "10.30.9.1-10.30.9.16"
 
     fn load_str(text: &str) -> Result<ValidatedConfig, String> {
         parse(text)
+    }
+
+    #[test]
+    fn collector_intervals_are_bounded() {
+        let with = |collector: &str| {
+            format!(
+                "[network]\nbridge = \"br0\"\n[collector]\n{collector}\n\
+                 [[ip_ranges]]\nname = \"A\"\nrange = \"10.0.0.1-10.0.0.2\"\n"
+            )
+        };
+        assert!(load_str(&with("refresh_interval_ms = 3600000")).is_ok());
+        assert!(load_str(&with("interface_scan_interval_secs = 3600")).is_ok());
+        // Absurd values used to pass and then overflow `Instant + Duration` (a panic
+        // at startup, or inside the engine loop on hot reload).
+        for bad in [
+            "refresh_interval_ms = 3601000",
+            "refresh_interval_ms = 1500",
+            "refresh_interval_ms = 0",
+            "interface_scan_interval_secs = 3601",
+            "interface_scan_interval_secs = 9223372036854775807",
+            "interface_scan_interval_secs = 0",
+        ] {
+            let err = load_str(&with(bad)).expect_err(bad);
+            assert!(err.starts_with("collector."), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn policies_that_cannot_admit_policed_frames_are_warned_about() {
+        let with = |policy: &str| {
+            format!(
+                "[network]\nbridge = \"br0\"\n[[ip_ranges]]\nname = \"A\"\n\
+                 range = \"10.0.0.1-10.0.0.4\"\n[ip_ranges.policy]\n\
+                 rx_threshold = \"1Gbps\"\nrx_limit = \"100Kbps\"\nwindow = \"5m\"\n\
+                 trigger_ratio = \"80%\"\nlimit_duration = \"10m\"\n{policy}\n\
+                 [[ip_ranges.overrides]]\nip = \"10.0.0.2\"\nburst = \"1MiB\"\n"
+            )
+        };
+        let cfg = load_str(&with("burst = \"32KiB\"")).unwrap();
+        let warnings = cfg.small_burst_warnings();
+        // The range default is too small; the override's 1MiB burst is fine.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("range A: the rx policy admits frames of at most 32768 B"),
+            "{warnings:?}"
+        );
+
+        assert!(load_str(&with("burst = \"64KiB\""))
+            .unwrap()
+            .small_burst_warnings()
+            .is_empty());
+
+        // Window algorithms: 100Kbps x 1s = 12 500 B allowance, for the range default
+        // and for the override (whose burst does not apply to a window algorithm).
+        let window = "algorithm = \"fixed_window\"\nlimit_window = \"1s\"";
+        let warnings = load_str(&with(window)).unwrap().small_burst_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[1]
+                .starts_with("range A ip 10.0.0.2: the rx policy admits frames of at most 12500 B"),
+            "{warnings:?}"
+        );
+
+        // Monitoring-only configs have nothing to warn about.
+        assert!(load_str(EXAMPLE).unwrap().small_burst_warnings().is_empty());
+    }
+
+    #[test]
+    fn swl_capacity_error_reads_as_one_sentence() {
+        let text = "[network]\nbridge = \"br0\"\n[collector]\nswl_map_max_entries = 70000\n\
+                    [[ip_ranges]]\nname = \"A\"\nrange = \"10.0.0.1-10.0.0.2\"\n";
+        let err = load_str(text).unwrap_err();
+        assert!(err.contains("at most 65536 (each entry"), "{err}");
+        assert!(!err.contains("  "), "stray whitespace: {err:?}");
     }
 
     #[test]

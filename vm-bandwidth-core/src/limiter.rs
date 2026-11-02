@@ -5,7 +5,7 @@
 //! into (or remove from) the eBPF `LIMIT_POLICIES` / `LIMIT_STATE` maps. It never touches
 //! eBPF directly, so the whole state machine is unit-testable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use vm_bandwidth_common::{DIR_RX, DIR_TX};
 
@@ -107,6 +107,10 @@ pub struct Limiter {
     windows: HashMap<FlowKey, RollingWindow>,
     states: HashMap<FlowKey, DirState>,
     prev_totals: HashMap<u32, IpTotals>,
+    /// Pre-expiry state of every flow whose LIMITED phase ended during the most recent
+    /// [`Limiter::tick`]. Kept until the next tick so that a `Remove` the runtime fails
+    /// to apply can be undone (see [`Limiter::revert_failed_action`]).
+    expired: HashMap<FlowKey, DirState>,
 }
 
 impl Limiter {
@@ -118,6 +122,7 @@ impl Limiter {
             windows: HashMap::new(),
             states: HashMap::new(),
             prev_totals: HashMap::new(),
+            expired: HashMap::new(),
         }
     }
 
@@ -152,11 +157,10 @@ impl Limiter {
         Ok((ranges, overrides))
     }
 
-    /// Apply a (new) configuration, reconciling limiter state. Used at startup and on every
-    /// successful reload. Returns the map actions needed to converge (§18, §22–§27).
     /// Compute the reload change plan against the NEW config without touching any mutable
     /// state. The runtime executes `plan.actions` against the eBPF maps first; only after
-    /// every map operation succeeds does [`commit_reload`] apply the internal transitions.
+    /// every map operation succeeds does [`Limiter::commit_reload`] apply the internal
+    /// transitions.
     /// A rejected plan leaves the limiter (and the dataplane) exactly as they were.
     pub fn plan_reload(&self, cfg: &ValidatedConfig, now: u64) -> Result<ReloadPlan, String> {
         let (new_ranges, new_overrides) = Self::build_index(cfg)?;
@@ -283,7 +287,10 @@ impl Limiter {
             match dir_policy {
                 None => false,
                 Some(np) => {
-                    if np.window_secs != w.capacity_secs() {
+                    // Compare configured lengths: the ring's capacity differs from the
+                    // configured window whenever it is truncated to whole ticks or
+                    // capped at MAX_SAMPLES, which made every reload wipe such windows.
+                    if np.window_secs != w.window_secs() {
                         w.resize(np.window_secs, tick_secs);
                     }
                     true
@@ -304,12 +311,29 @@ impl Limiter {
         });
     }
 
-    /// Drop the phase state of one flow (keeps its rolling window/baseline). Used after a
-    /// failed runtime map apply so the flow re-evaluates from NORMAL instead of sitting
-    /// in a LIMITED phase the dataplane does not share.
-    pub fn reset_flow(&mut self, ip: u32, dir: u8) {
-        if let Some(s) = self.states.get_mut(&(ip, dir)) {
-            *s = DirState::default();
+    /// Reconcile one flow after the runtime failed to apply `action` (an action returned
+    /// by the latest [`Limiter::tick`]) and rolled its map writes back, so the phase the
+    /// limiter tracks matches the dataplane again:
+    ///
+    /// * A failed `Install` leaves the flow unarmed. It returns to NORMAL and keeps its
+    ///   rolling window and baseline, so the next tick re-evaluates (and retries) it.
+    /// * A failed `Remove` leaves the policy armed. The flow returns to the LIMITED state
+    ///   it just expired from, so the next tick emits the removal again instead of the
+    ///   limiter forgetting a policy the dataplane still enforces.
+    pub fn revert_failed_action(&mut self, action: &LimitAction) {
+        match *action {
+            LimitAction::Install {
+                ipv4, direction, ..
+            } => {
+                if let Some(s) = self.states.get_mut(&(ipv4, direction)) {
+                    *s = DirState::default();
+                }
+            }
+            LimitAction::Remove { ipv4, direction } => {
+                if let Some(prev) = self.expired.remove(&(ipv4, direction)) {
+                    self.states.insert((ipv4, direction), prev);
+                }
+            }
         }
     }
 
@@ -317,14 +341,20 @@ impl Limiter {
     /// runtime must apply (entering / leaving LIMITED).
     pub fn tick(&mut self, now: u64, totals: &HashMap<u32, IpTotals>) -> Vec<LimitAction> {
         let mut actions = Vec::new();
+        self.expired.clear();
 
-        // Evaluate every IP that either has traffic or is currently LIMITED.
-        let mut ips: Vec<u32> = totals.keys().copied().collect();
-        for (flow, state) in &self.states {
-            if state.phase == Phase::Limited && !ips.contains(&flow.0) {
-                ips.push(flow.0);
-            }
-        }
+        // Evaluate every IP that has traffic, is LIMITED, or already owns a rolling
+        // window. An IP drops out of `totals` once the collector evicts its idle counter
+        // keys; its windows must keep aging with zero-traffic ticks meanwhile, or the old
+        // samples would survive the idle stretch and later count as current traffic.
+        let mut ips: HashSet<u32> = totals.keys().copied().collect();
+        ips.extend(self.windows.keys().map(|&(ip, _)| ip));
+        ips.extend(
+            self.states
+                .iter()
+                .filter(|(_, s)| s.phase == Phase::Limited)
+                .map(|(&(ip, _), _)| ip),
+        );
 
         for ip in ips {
             let Some(policy) = self.effective_policy(ip) else {
@@ -390,12 +420,14 @@ impl Limiter {
             Phase::Limited => {
                 if now >= state.limited_until {
                     // Duration expired: stop policing, clear the window, re-observe (§7).
+                    // The pre-expiry state is kept until the next tick in case the
+                    // runtime cannot apply the removal.
                     actions.push(LimitAction::Remove {
                         ipv4: ip,
                         direction: dir,
                     });
                     window.reset();
-                    *state = DirState::default();
+                    self.expired.insert(flow, std::mem::take(state));
                 }
             }
         }
@@ -726,6 +758,54 @@ mod tests {
     }
 
     #[test]
+    fn reload_keeps_windows_the_ring_cannot_represent_exactly() {
+        // (window, tick): capped at MAX_SAMPLES ticks, and not a multiple of the tick.
+        for (window_secs, tick_secs) in [(7200, 1), (45, 2)] {
+            let mut pf = policy_fields();
+            pf.window_secs = Some(window_secs);
+            let cfg = cfg_from(vec![range("A", IP, IP, pf)]);
+            let mut l = Limiter::new(tick_secs);
+            let plan = l.plan_reload(&cfg, 0).unwrap();
+            l.commit_reload(plan);
+            l.tick(1, &totals(IP, BYTES_PER_TICK, 0));
+            l.tick(2, &totals(IP, BYTES_PER_TICK * 2, 0));
+            let ip = u32::from(std::net::Ipv4Addr::from(IP));
+            let before = l.window_avg_bps(ip, DIR_RX);
+            assert!(before > 0.0);
+
+            // Reloading the very same config must keep the accumulated history.
+            let plan = l.plan_reload(&cfg, 3).unwrap();
+            l.commit_reload(plan);
+            assert_eq!(
+                l.window_avg_bps(ip, DIR_RX),
+                before,
+                "window {window_secs}s @ tick {tick_secs}s"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_ips_absent_from_totals_keep_aging_their_window() {
+        let ip = u32::from(std::net::Ipv4Addr::from(IP));
+        let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
+        let mut l = Limiter::new(1);
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
+        // Heavy traffic for part of the 3s window (no trigger before it is full).
+        l.tick(1, &totals(IP, BYTES_PER_TICK, 0));
+        l.tick(2, &totals(IP, BYTES_PER_TICK * 2, 0));
+        assert!(l.window_avg_bps(ip, DIR_RX) > 0.0);
+
+        // The collector evicts the idle IP's counters: it is absent from now on.
+        let evicted = HashMap::new();
+        for t in 3..=10 {
+            assert!(l.tick(t, &evicted).is_empty());
+        }
+        // Every sample is older than the window by now; none may linger as if current.
+        assert_eq!(l.window_avg_bps(ip, DIR_RX), 0.0);
+    }
+
+    #[test]
     fn reload_plan_orders_removes_before_installs() {
         // Two flows LIMITED under cfg1; cfg2 deletes A's policy and changes B's rate.
         // The plan must execute A's Remove before B's Install: removes free map
@@ -785,5 +865,82 @@ mod tests {
             pos_remove < pos_install,
             "removes must execute before installs"
         );
+    }
+
+    #[test]
+    fn failed_install_returns_flow_to_normal_and_retries() {
+        let ip = u32::from(std::net::Ipv4Addr::from(IP));
+        let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
+        let mut l = Limiter::new(1);
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
+        let cumulative = drive_to_limited(&mut l);
+        assert!(l.is_limited(ip, DIR_RX));
+
+        // The runtime could not arm the policy: the flow must not stay LIMITED.
+        let install = LimitAction::Install {
+            ipv4: ip,
+            direction: DIR_RX,
+            rate_bps: 500_000_000,
+            burst_bytes: 1024,
+            algorithm: vm_bandwidth_common::ALGO_GCRA,
+            window_ns: 0,
+        };
+        l.revert_failed_action(&install);
+        assert!(!l.is_limited(ip, DIR_RX));
+
+        // The window survived, so the next tick retries the trigger right away.
+        let actions = l.tick(5, &totals(IP, cumulative + BYTES_PER_TICK, 0));
+        assert!(
+            matches!(actions.as_slice(), [LimitAction::Install { ipv4, .. }] if *ipv4 == ip),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn failed_removal_keeps_flow_limited_and_retries() {
+        let ip = u32::from(std::net::Ipv4Addr::from(IP));
+        let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
+        let mut l = Limiter::new(1);
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
+        let cumulative = drive_to_limited(&mut l);
+
+        // limited at t=4 with duration 10 → the removal is due at t=14.
+        let actions = l.tick(14, &totals(IP, cumulative, 0));
+        let [remove @ LimitAction::Remove { .. }] = actions.as_slice() else {
+            panic!("expected one Remove, got {actions:?}");
+        };
+        assert!(!l.is_limited(ip, DIR_RX));
+
+        // The runtime could not disarm the policy: the limiter must keep owning it.
+        l.revert_failed_action(remove);
+        assert!(l.is_limited(ip, DIR_RX));
+        assert_eq!(l.state(ip, DIR_RX).limited_since, 4);
+
+        // The next tick emits the removal again.
+        let actions = l.tick(15, &totals(IP, cumulative, 0));
+        assert!(
+            matches!(actions.as_slice(), [LimitAction::Remove { ipv4, .. }] if *ipv4 == ip),
+            "{actions:?}"
+        );
+        assert!(!l.is_limited(ip, DIR_RX));
+    }
+
+    #[test]
+    fn expired_state_is_only_kept_for_one_tick() {
+        let ip = u32::from(std::net::Ipv4Addr::from(IP));
+        let cfg = cfg_from(vec![range("A", IP, IP, policy_fields())]);
+        let mut l = Limiter::new(1);
+        let plan = l.plan_reload(&cfg, 0).unwrap();
+        l.commit_reload(plan);
+        let cumulative = drive_to_limited(&mut l);
+        let actions = l.tick(14, &totals(IP, cumulative, 0));
+        assert_eq!(actions.len(), 1, "{actions:?}");
+
+        // A later tick forgets the stash: reverting a stale removal is a no-op.
+        l.tick(15, &totals(IP, cumulative, 0));
+        l.revert_failed_action(&actions[0]);
+        assert!(!l.is_limited(ip, DIR_RX));
     }
 }

@@ -33,6 +33,12 @@ pub struct PolicerStats {
     pub dropped_packets: u64,
 }
 
+/// Largest frame the policer judges (`skb->len`, L2 header included). Larger frames
+/// pass unpoliced and are counted in `OVERSIZED`. Frames up to this size — GSO/TSO
+/// aggregates included — are judged as a whole, so a bucket or window allowance below
+/// it can never admit them; it also keeps the time-increment arithmetic inside `u64`.
+pub const MAX_POLICED_LEN: u64 = 65535;
+
 /// Direction of traffic relative to the VM. Kept as plain `u8` constants so the
 /// value is usable identically in `#![no_std]` eBPF code and userspace.
 pub const DIR_RX: u8 = 0; // packet is being received by the VM (TAP egress)
@@ -133,21 +139,31 @@ pub struct LimitState {
     pub _pad: u32,
 }
 
+// SAFETY: `repr(C)` with two `u32` fields and no padding: every bit pattern is a
+// valid value, so aya may copy it to and from kernel map memory.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficKey {}
 
+// SAFETY: `repr(C)` with only `u64` fields and no padding; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TrafficValue {}
 
+// SAFETY: `repr(C)` with only `u64` fields and no padding; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PolicerStats {}
 
+// SAFETY: `repr(C)` integers whose padding is an explicit, zeroed `_pad` field; any bit
+// pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LimitKey {}
 
+// SAFETY: `repr(C)` integers whose padding is an explicit `_pad0` field; any bit pattern
+// is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LimitPolicy {}
 
+// SAFETY: `repr(C)` integers with explicit padding (`lock` is carried as raw bytes);
+// any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LimitState {}
 
@@ -195,6 +211,8 @@ impl Default for SwlRing {
     }
 }
 
+// SAFETY: `repr(C)` integers and arrays of `repr(C)` integer structs, all padding
+// explicit; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SwlRing {}
 
@@ -209,8 +227,35 @@ pub struct OversizedStats {
     pub bytes: u64,
 }
 
+// SAFETY: `repr(C)` with two `u64` fields and no padding; any bit pattern is valid.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for OversizedStats {}
+
+// ---------------------------------------------------------------------------
+// Policer arithmetic, shared between the eBPF data path and userspace tests.
+// ---------------------------------------------------------------------------
+
+const NS_PER_MS: u64 = 1_000_000;
+
+/// Bytes the sliding window counter carries over from the previous window:
+/// `prev_bytes × (window − elapsed) / window`.
+///
+/// The weight is taken in whole milliseconds, so the product stays inside `u64` under
+/// the config bounds (`prev_bytes` ≤ the window allowance ≤ 7.5e12 B and a window of at
+/// most 60 s = 60 000 ms keep it ≤ 4.5e17) while the byte count itself stays exact.
+/// An elapsed time at or beyond the window carries nothing, and so does a window
+/// shorter than 1 ms (config validation never produces one).
+#[inline(always)]
+pub fn swc_carried_bytes(prev_bytes: u64, window_ns: u64, elapsed_ns: u64) -> u64 {
+    let window_ms = window_ns / NS_PER_MS;
+    if window_ms == 0 {
+        return 0;
+    }
+    let remaining_ms = (window_ns - elapsed_ns.min(window_ns)) / NS_PER_MS;
+    // Wrapping, not checked or saturating: those lower to helpers BPF cannot link, and
+    // the bound above keeps the product from wrapping.
+    prev_bytes.wrapping_mul(remaining_ms) / window_ms
+}
 
 // ---------------------------------------------------------------------------
 // L2 parsing, shared between the eBPF data path and userspace tests.
@@ -266,6 +311,47 @@ pub fn vlan_walk(et0: u16, et1: u16, et2: u16) -> Option<(usize, u16)> {
         }
     }
     Some((tags, et))
+}
+
+#[cfg(test)]
+mod policer_math_tests {
+    use super::*;
+
+    const SEC: u64 = 1_000_000_000;
+
+    #[test]
+    fn carry_is_linear_in_the_remaining_window() {
+        assert_eq!(swc_carried_bytes(1_000_000, SEC, 0), 1_000_000);
+        assert_eq!(swc_carried_bytes(1_000_000, SEC, SEC / 2), 500_000);
+        assert_eq!(swc_carried_bytes(1_000_000, SEC, SEC / 4), 750_000);
+        assert_eq!(swc_carried_bytes(1_000_000, SEC, SEC), 0);
+        assert_eq!(swc_carried_bytes(1_000_000, SEC, 3 * SEC), 0);
+    }
+
+    #[test]
+    fn sub_mib_previous_windows_still_carry() {
+        // 5Mbps over a 1s window allows 625 000 B, below one MiB. Truncating the
+        // previous window to whole MiB carried nothing at all here, which turned
+        // the counter into a fixed window with a 2x boundary burst.
+        assert_eq!(swc_carried_bytes(625_000, SEC, SEC / 10), 562_500);
+    }
+
+    #[test]
+    fn config_bounds_cannot_wrap() {
+        // 1Tbps for a 60s window: the largest previous window config allows.
+        let max_prev = 1_000_000_000_000 / 8 * 60;
+        assert_eq!(swc_carried_bytes(max_prev, 60 * SEC, 0), max_prev);
+        assert_eq!(
+            swc_carried_bytes(max_prev, 60 * SEC, 30 * SEC),
+            max_prev / 2
+        );
+    }
+
+    #[test]
+    fn degenerate_windows_carry_nothing() {
+        assert_eq!(swc_carried_bytes(1_000_000, 0, 0), 0);
+        assert_eq!(swc_carried_bytes(1_000_000, 999_999, 0), 0);
+    }
 }
 
 #[cfg(test)]
